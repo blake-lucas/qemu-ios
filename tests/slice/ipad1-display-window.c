@@ -8,7 +8,7 @@
  *
  * Mutation (named, must fail this test): drop the UNSCALED check in scanout_layer.
  *
- * SLICE:types hw/arm/s5l8930_display.c define (DP_LAYERS|DP_UI_BASE|DP_UI_FORMAT|DP_UI_ADDR|DP_UI_STRIDE|DP_UI_UNSCALED|DP_UI_DST_ORIGIN|DP_UI_SRC_SIZE|DP_UI_DST_END)[[:space:](]
+ * SLICE:types hw/arm/s5l8930_display.c define (DP_LAYERS|DP_UI_BASE|DP_UI_FORMAT|DP_UI_ADDR|DP_UI_STRIDE|DP_UI_UNSCALED|DP_UI_DST_ORIGIN|DP_UI_SRC_END|DP_UI_DST_END|DP_UI_FORMAT_LINEAR|DP_UI_SRC_ORIGIN)[[:space:](]
  * SLICE:types hw/arm/s5l8930_display.c typedef UILayer
  * SLICE hw/arm/s5l8930_display.c fn scanout_layer layer_row_bytes layer_fetch layers_fetch layer_row layers video_compose blend front_latch
  * PKG glib-2.0
@@ -62,7 +62,8 @@ static void swap(uint32_t base, unsigned sw, unsigned sh, bool unscaled, uint32_
 {
     ui[DP_UI_ADDR / 4] = base;
     ui[DP_UI_STRIDE / 4] = sw * 4;
-    ui[DP_UI_SRC_SIZE / 4] = sw << 16 | sh;
+    ui[DP_UI_FORMAT / 4] = DP_UI_FORMAT_LINEAR;
+    ui[DP_UI_SRC_END / 4] = sw << 16 | sh;
     ui[DP_UI_UNSCALED / 4] = unscaled;
     if (!unscaled) {
         ui[DP_UI_DST_ORIGIN / 4] = org;

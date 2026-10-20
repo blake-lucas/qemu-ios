@@ -44,12 +44,14 @@
 #define DP_FIFO_COUNT       0x1044    /* polled to 0 */
 #define DP_SWAP_DONE        0x1048    /* low 16 bits: last completed swap ID */
 #define DP_UI_BASE(l)       (0x4000 + (l) * 0x1000)
-#define DP_UI_FORMAT        0x40
+#define DP_UI_FORMAT        0x40      /* bits 8-10 the pixel format, bit 0 linear (clear: tiled) */
+#define DP_UI_FORMAT_LINEAR 1u
 #define DP_UI_ADDR          0x44
 #define DP_UI_STRIDE        0x48
 #define DP_UI_UNSCALED      0x4c      /* bit0: placed at 0,0 at its source size; DST_ORIGIN and DST_END unused */
+#define DP_UI_SRC_ORIGIN    0x50      /* x << 16 | y in the source buffer */
 #define DP_UI_DST_ORIGIN    0x54      /* x << 16 | y on the panel */
-#define DP_UI_SRC_SIZE      0x60      /* w << 16 | h of the source buffer */
+#define DP_UI_SRC_END       0x60      /* x1 << 16 | y1, the source rectangle's far corner */
 #define DP_UI_DST_END       0x64      /* x1 << 16 | y1, the destination's far corner */
 
 #define DP_IRQ_VBL          0x001
@@ -89,8 +91,8 @@ typedef struct {
 
 /* A UI layer's scanout: its buffer and where it lands on the panel. */
 typedef struct UILayer {
-    uint32_t fmt, base, stride;
-    unsigned sw, sh;                 /* source size */
+    uint32_t fmt, base, stride;      /* stride: bytes from one source row to the next */
+    unsigned sx, sy, sw, sh;         /* source rectangle */
     unsigned x0, y0, x1, y1;         /* destination rectangle, clipped to the panel */
 } UILayer;
 
@@ -212,8 +214,8 @@ static uint32_t panel_word(const DisplayPipe *p, hwaddr addr, uint32_t v)
     }
     switch (addr) {
     case DP_SIZE:
-    case DP_UI_BASE(0) + DP_UI_SRC_SIZE: case DP_UI_BASE(0) + DP_UI_DST_END:
-    case DP_UI_BASE(1) + DP_UI_SRC_SIZE: case DP_UI_BASE(1) + DP_UI_DST_END:
+    case DP_UI_BASE(0) + DP_UI_SRC_END: case DP_UI_BASE(0) + DP_UI_DST_END:
+    case DP_UI_BASE(1) + DP_UI_SRC_END: case DP_UI_BASE(1) + DP_UI_DST_END:
         return v == native ? panel : v;
     case DP_UI_BASE(0) + DP_UI_STRIDE: case DP_UI_BASE(1) + DP_UI_STRIDE:
         return (v & ~0x3fu) == nw * 4 ? w * 4 | (v & 0x3f) : v;
@@ -728,8 +730,8 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
                           UILayer *u)
 {
     uint32_t *r = s->pipe[0].regs, *ui = r + DP_UI_BASE(layer) / 4;
-    uint32_t org = ui[DP_UI_DST_ORIGIN / 4], sz = ui[DP_UI_SRC_SIZE / 4];
-    uint32_t end = ui[DP_UI_DST_END / 4];
+    uint32_t org = ui[DP_UI_DST_ORIGIN / 4], end = ui[DP_UI_DST_END / 4];
+    uint32_t sorg = ui[DP_UI_SRC_ORIGIN / 4], send = ui[DP_UI_SRC_END / 4];
 
     /*
      * 3.2's AppleDisplayPipe (7B500 0xc058d4de) programs DST_ORIGIN and DST_END only for a layer placed off 0,0 and
@@ -747,33 +749,39 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
     }
     u->base = ui[DP_UI_ADDR / 4];
     u->fmt = (ui[DP_UI_FORMAT / 4] >> 8) & 7;
-    /* Size and placement. A full-panel layer (and the boot surface, which
-     * leaves them 0) covers the panel at 0,0; 4.x CA also places partial
-     * layers, e.g. an EAGL surface as an overlay under its UI. */
-    u->sw = sz ? sz >> 16 : w;
-    u->sh = sz ? sz & 0xffff : h;
-    /* ponytail: a source over 4096 pixels wide is not scanned out. It bounds the host's row buffers
-     * (src) and no guest programs one; find the pipe's real limit if a guest ever does. */
-    if (u->sw > 4096) {
+    /*
+     * The source rectangle: SRC_ORIGIN to SRC_END, 11 bits a coordinate (5.1.1's program_hardware, 9B206
+     * 0x80878a3c). A linear layer's origin is folded into its address down to the 64 bytes the address keeps,
+     * the rest of x in SRC_ORIGIN; a tiled layer keeps the surface's address and its whole origin is there. A
+     * full-panel layer (and the boot surface, which leaves them 0) covers the panel at 0,0; 4.x CA also places
+     * partial layers, e.g. an EAGL surface as an overlay under its UI.
+     */
+    u->sx = sorg >> 16 & 0x7ff;
+    u->sy = sorg & 0x7ff;
+    if (send && ((send >> 16 & 0x7ff) <= u->sx || (send & 0x7ff) <= u->sy)) {
         return false;
     }
+    u->sw = send ? (send >> 16 & 0x7ff) - u->sx : w;
+    u->sh = send ? (send & 0x7ff) - u->sy : h;
     u->x0 = org >> 16;
     u->y0 = org & 0xffff;
     u->x1 = MIN(end ? end >> 16 : u->x0 + u->sw, w);
     u->y1 = MIN(end ? end & 0xffff : u->y0 + u->sh, h);
-    if (!u->sw || !u->sh || u->x0 >= u->x1 || u->y0 >= u->y1) {
+    if (u->x0 >= u->x1 || u->y0 >= u->y1) {
         return false;
     }
-    /* Two encodings reach this register. The 7B500 swap path writes
-     * (bytes per row << 4) | 2, e.g. (4096 << 4) | 2 for 1024x768 BGRA. The
-     * iBoot framebuffer holds plain bytes per row: AppleDisplayPipe adopts it
-     * with `stride = reg & ~0x3f` (0xc058c42a), so seeding the swap encoding
-     * gave the boot surface 64 KiB rows. A <<4 value never undershoots a row
-     * (of the layer's own width: an overlay is narrower than the panel). */
-    {
-        uint32_t v = ui[DP_UI_STRIDE / 4] & ~0x3fu;
-        unsigned row = u->sw * (u->fmt ? 2 : 4);
-        u->stride = (v >> 4) >= row ? v >> 4 : v;
+    /*
+     * FORMAT bit 0 is set for a linear layer and clear for a tiled one: program_hardware sets it from the
+     * IOSurface's tiled flag (9B206 0x80878bd6, the surface's +0x168; 7B500 0xc058d536, +0x160), and iBoot sets it
+     * for its linear framebuffer. A linear layer's STRIDE is its bytes per row; a tiled layer's is (bytes per row << 4),
+     * the bytes of a row of tiles: 16 rows, each a whole number of 256-byte tiles ("UI requires the stride to be
+     * a multiple of 256 for tiled mode"). The pipe's DART maps a tiled surface's pages contiguously (n90ap 9B206's
+     * 2560-byte rows), and its tiles hold the rows as the CPU and the GL bridge write them, so a tiled layer's row
+     * is a sixteenth of its stride from the last. The low 6 bits are flags (2).
+     */
+    u->stride = ui[DP_UI_STRIDE / 4] & ~0x3fu;
+    if (!(ui[DP_UI_FORMAT / 4] & DP_UI_FORMAT_LINEAR)) {
+        u->stride >>= 4;
     }
     return u->base != 0;
 }
@@ -791,14 +799,15 @@ static size_t layer_fetch(S5L8930DisplayState *s, const UILayer *u, size_t off)
 {
     size_t row = layer_row_bytes(u);
     unsigned rows = u->y1 - u->y0;
+    uint32_t base = u->base + u->sy * u->stride + u->sx * (u->fmt ? 2 : 4);
 
     if (u->sh == rows && u->stride == row) {
-        fb_plan(s, u->base, off, row * rows);
+        fb_plan(s, base, off, row * rows);
         return row * rows;
     }
     for (unsigned y = u->y0; y < u->y1; y++) {
         unsigned sy = (unsigned)((uint64_t)(y - u->y0) * u->sh / rows);
-        fb_plan(s, u->base + sy * u->stride, off + (y - u->y0) * row, row);
+        fb_plan(s, base + sy * u->stride, off + (y - u->y0) * row, row);
     }
     return row * rows;
 }
@@ -1334,7 +1343,9 @@ static void s5l8930_display_reset(DeviceState *dev)
          * mapping. SpringBoard died with SIGBUS (KERN_PROTECTION_FAILURE)
          * and never reached reboot2, so Hold -> slide never powered off. */
         r[(DP_UI_BASE(0) + DP_UI_STRIDE) / 4] = s->width * 4 | 2;
-        r[0x4060 / 4] = s->width << 16 | s->height;
+        /* ARGB and linear, as iBoot programs its framebuffer (iBoot-931 0x5ff01bfc: format << 8 | 1). */
+        r[(DP_UI_BASE(0) + DP_UI_FORMAT) / 4] = DP_UI_FORMAT_LINEAR;
+        r[(DP_UI_BASE(0) + DP_UI_SRC_END) / 4] = s->width << 16 | s->height;
     }
     pipes_update_irq(s);
     s->next_vbl = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VBL_PERIOD_NS(s);
