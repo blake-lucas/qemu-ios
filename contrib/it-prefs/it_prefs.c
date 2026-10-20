@@ -271,8 +271,10 @@ static int mc_never(const void *feature)
  *               running SpringBoard takes it now rather than at its next launch (the iPod's first boot
  *               is the user's: no sealing boot runs this job first).
  *   Auto-Lock   ManagedConfiguration's MCFeatureAutoLockTime when the framework exports it (4.x, 5.x),
- *               else com.apple.springboard SBAutoLockTime and SBAutoDimTime = -1 when SpringBoard names
- *               them (1.x-3.x), then GSSendAppPreferencesChanged, as Settings does, for a running SpringBoard.
+ *               and com.apple.springboard SBAutoLockTime and SBAutoDimTime = -1 when SpringBoard names
+ *               them (1.x-3.x, and 4.0 beta 1, whose SpringBoard still times the lock by them though its
+ *               ManagedConfiguration takes Never: the iPhone 3GS on 8A230m locked a minute after the last
+ *               touch), then GSSendAppPreferencesChanged, as Settings does, for a running SpringBoard.
  */
 /*
  * The second set, under its own marker (DefaultsSet2) so devices that took the first get it once too:
@@ -369,13 +371,13 @@ static unsigned defaults(void)
         }
     if (feature && *feature)
         say("MCFeatureAutoLockTime", mc_never(*feature) ? " = Never" : " not taken by ManagedConfiguration", "");
-    else if (file_has(SPRINGBOARD, autolock[0])) {
+    if (file_has(SPRINGBOARD, autolock[0])) {
         for (i = 0; i < sizeof(autolock) / sizeof(autolock[0]); i++)
             if (file_has(SPRINGBOARD, autolock[i])) {
                 set(str(autolock[i]), num(0, 3, &never), sb);   /* kCFNumberSInt32Type */
                 say(autolock[i], " = -1 (Auto-Lock Never)", "");
             }
-    } else
+    } else if (!feature || !*feature)
         say(SPRINGBOARD, " has no ", autolock[0]);
     if (!sync(sb))
         say("com.apple.springboard not saved: CFPreferencesAppSynchronize failed", "", "");
