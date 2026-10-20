@@ -248,8 +248,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchSDIOState, IPOD_TOUCH_SDIO)
 #define BSS_INFO_OFF_IE_LENGTH    0x78
 #define BSS_INFO_LEN              0x7c
 #define BSS_CAP_ESS         0x0001
-/* SSID, supported rates and DS parameter set, appended as beacon IEs. */
-#define BSS_INFO_IE_LEN     (2 + 8 + 2 + 4 + 2 + 1)
+/* SSID, supported rates, DS parameter set and country, appended as beacon IEs. */
+#define BSS_INFO_IE_LEN     (2 + 8 + 2 + 4 + 2 + 1 + 2 + 6)
 #define BSS_INFO_TOTAL      (BSS_INFO_LEN + BSS_INFO_IE_LEN)
 
 /*
@@ -371,6 +371,7 @@ typedef struct IPodTouchSDIOState
     QEMUTimer *scan_timer;   /* delays the scan-complete event */
     bool associated;         /* the association events have been pushed */
     uint8_t bssid[6];        /* the access point's; "bssid" property */
+    char country[3];         /* the access point's 802.11d country; "country" property */
     bool host_netif;         /* the host set mcast_list: its network interface is attached */
     QEMUTimer *join_timer;   /* auto-join clock, armed once the host is up and has a netif */
     unsigned tx_log;

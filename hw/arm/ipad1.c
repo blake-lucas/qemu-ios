@@ -383,6 +383,7 @@ struct IPad1MachineState {
     bool ring_silent;                    /* ring-switch: the side switch at silent (default off: ring) */
     uint8_t wifi_mac[6];                 /* BCM4329 CIS MAC (wifi-mac) */
     bool wifi_mac_explicit;
+    char *wifi_country;                  /* the access point's 802.11d country (wifi-country), NULL = the card's */
     bool iop_core;                       /* run the IOP firmware on a second core (default; off: the HLE) */
     DeviceState *iopcore;
     bool resume_boot;                    /* the next reset is the AP's power-on out of hibernate */
@@ -1539,6 +1540,9 @@ static void ipad1_init(MachineState *machine)
         /* qom-set /machine wifi-bssid aa:bb:..: a new access point for
          * locationd, which caches a position per BSSID (location.md). */
         object_property_add_alias(OBJECT(machine), "wifi-bssid", OBJECT(card), "bssid");
+        if (s->wifi_country) {
+            object_property_set_str(OBJECT(card), "country", s->wifi_country, &error_fatal);
+        }
         card->card_present = true;
         sysbus_realize_and_unref(SYS_BUS_DEVICE(card), &error_fatal);
         /* The soldered combo chip exists even with host networking disabled.
@@ -1945,6 +1949,19 @@ static void ipad1_set_wifi_mac(Object *obj, const char *value, Error **errp)
     }
     memcpy(s->wifi_mac, mac, sizeof(mac));
     s->wifi_mac_explicit = true;
+}
+
+static char *ipad1_get_wifi_country(Object *obj, Error **errp)
+{
+    return g_strdup(IPAD1_MACHINE(obj)->wifi_country ?: "");
+}
+
+static void ipad1_set_wifi_country(Object *obj, const char *value, Error **errp)
+{
+    IPad1MachineState *s = IPAD1_MACHINE(obj);
+
+    g_free(s->wifi_country);
+    s->wifi_country = g_strdup(value);
 }
 
 static char *ipad1_get_kboot(Object *obj, Error **errp)
@@ -2521,6 +2538,10 @@ static void ipad1_class_init(ObjectClass *klass, const void *data)
                                   ipad1_set_wifi_mac);
     object_class_property_set_description(klass, "wifi-mac",
         "BCM4329 card MAC (unset keeps the board's placeholder)");
+    object_class_property_add_str(klass, "wifi-country", ipad1_get_wifi_country,
+                                  ipad1_set_wifi_country);
+    object_class_property_set_description(klass, "wifi-country",
+        "The access point's 802.11d country, two letters (unset: US)");
     object_class_property_add_str(klass, "kboot", ipad1_get_kboot,
                                   ipad1_set_kboot);
     object_class_property_set_description(klass, "kboot",

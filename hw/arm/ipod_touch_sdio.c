@@ -418,7 +418,11 @@ static void fill_bss_info(IPodTouchSDIOState *s, uint8_t *bi)
      * The fixed SSID and channel fields on their own leave the driver logging
      * an empty SSID and channel 0, so the beacon object is reading the
      * information elements that follow the structure instead. Append the three
-     * a real beacon would start with.
+     * a real beacon would start with, and the 802.11d country element an access
+     * point with its regulatory domain set sends: Setup Assistant (5.x and 6.x)
+     * guesses the country, and from it the languages its first page offers
+     * over the Welcome animation, from the country of the access points a Wi-Fi
+     * scan finds (WiFiNetworkGet11dCountryCodeFromIe) where the SIM gives none.
      */
     stw_le_p(bi + BSS_INFO_OFF_IE_OFFSET, BSS_INFO_LEN);
     stl_le_p(bi + BSS_INFO_OFF_IE_LENGTH, BSS_INFO_IE_LEN);
@@ -433,6 +437,14 @@ static void fill_bss_info(IPodTouchSDIOState *s, uint8_t *bi)
     *ie++ = 0x03;                                  /* DS parameter set */
     *ie++ = 0x01;
     *ie++ = 6;                                     /* channel */
+    *ie++ = 0x07;                                  /* country */
+    *ie++ = 6;
+    *ie++ = s->country[0];
+    *ie++ = s->country[1];
+    *ie++ = ' ';                                   /* any environment */
+    *ie++ = 1;                                     /* channels 1 to 11 */
+    *ie++ = 11;
+    *ie++ = 20;                                    /* at 20 dBm */
 }
 
 /*
@@ -1489,6 +1501,26 @@ static void sdio_set_bssid(Object *obj, const char *value, Error **errp)
     }
 }
 
+/*
+ * "country": the access point's 802.11d country, two letters ("US", the
+ * default). Light Touch sets the Mac's region, where the Mac and so the
+ * network it shares are.
+ */
+static char *sdio_get_country(Object *obj, Error **errp)
+{
+    return g_strdup(IPOD_TOUCH_SDIO(obj)->country);
+}
+
+static void sdio_set_country(Object *obj, const char *value, Error **errp)
+{
+    if (strlen(value) != 2 || !g_ascii_isalpha(value[0]) || !g_ascii_isalpha(value[1])) {
+        error_setg(errp, "country must be two letters (an ISO 3166 code)");
+        return;
+    }
+    IPOD_TOUCH_SDIO(obj)->country[0] = g_ascii_toupper(value[0]);
+    IPOD_TOUCH_SDIO(obj)->country[1] = g_ascii_toupper(value[1]);
+}
+
 /* DAT1 from a card that signals its own interrupt (the Marvell): the
  * controller latches the card-interrupt status bit on the edge. */
 static void sdio_card_irq(void *opaque, int n, int level)
@@ -1519,6 +1551,8 @@ static void ipod_touch_sdio_init(Object *obj)
     s->sb_window = CHIPCOMMON_BASE;
     memcpy(s->bssid, default_bssid, sizeof(s->bssid));
     object_property_add_str(obj, "bssid", sdio_get_bssid, sdio_set_bssid);
+    memcpy(s->country, "US", 3);
+    object_property_add_str(obj, "country", sdio_get_country, sdio_set_country);
     ipod_touch_sdio_set_chip(s, &bcm4325);
 
     qdev_init_gpio_in_named(dev, sdio_card_irq, "card-irq", 1);
