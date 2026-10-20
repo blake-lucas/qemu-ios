@@ -480,18 +480,21 @@ static int roaming_step(int write)
     return 0;
 }
 
-static int as_wireless(int write)
+/* fn(arg) in a child, its result back as the exit code. Every framework call is made in a child, and the parent
+ * loads no framework: a child forked after the parent has used libdispatch inherits its queues without their
+ * threads, and on 7.x the child's next CFPreferences call faults in libdispatch (SIGSEGV at 0x10c). */
+static int in_child(int (*fn)(int), int arg)
 {
     int pid = fork(), status = 0;
     if (pid == 0)
-        _exit(roaming_step(write));
+        _exit(fn(arg));
     if (pid < 0 || waitpid(pid, &status, 0) != pid)
         return 0;
     return (status >> 8) & 0xff;
 }
 
 /* Data Roaming on through CommCenter, as Settings turns it on; 1 if CommCenter then says it is on. */
-static int roaming_through_commcenter(void)
+static int roaming_through_commcenter(int unused)
 {
     void *ct = dlopen(CORETELEPHONY, 1);
     void (*on)(unsigned char) = ct ? dlsym(ct, "CTRegistrationSetInternationalDataAccessStatus") : 0;
@@ -505,16 +508,16 @@ static int roaming_through_commcenter(void)
 
 static void roaming(void)
 {
-    if (!file_has(COMMCENTER, ROAMING) || !as_wireless(0))
+    if (!file_has(COMMCENTER, ROAMING) || !in_child(roaming_step, 0))
         return;
-    if (roaming_through_commcenter()) {
+    if (in_child(roaming_through_commcenter, 0)) {
         say(ROAMING, " = true through CommCenter (Data Roaming on for this SIM)", "");
-        as_wireless(2);
+        in_child(roaming_step, 2);
         return;
     }
     if (launchctl("unload", COMMCENTER_JOB))
         return;
-    as_wireless(1);
+    in_child(roaming_step, 1);
     say(COMMCENTER_JOB, launchctl("load", COMMCENTER_JOB) == 0 ? " reloaded" : " reload failed", "");
 }
 
