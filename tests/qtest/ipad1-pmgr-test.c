@@ -39,6 +39,31 @@ static void test_timebase(void)
     qtest_quit(qts);
 }
 
+/* iBoot's get_pll: 48 MHz * M / P / 2^S, 0 for a PLL that is off. */
+static uint32_t pll_mhz(uint32_t con0)
+{
+    return con0 >> 31 ? 48 * ((con0 >> 3) & 0x3ff) / ((con0 >> 14) & 0x3f) >> (con0 & 7) : 0;
+}
+
+/* The PLLs as each board's iBoot leaves them, slots 1-4 of clock-frequencies: the iPad's APLL at 1 GHz and its
+ * MPLL off, the iPhone 4's at 800 and 500 MHz (the real units'); EPLL 1026 MHz and VPLL 48 MHz on both. */
+static void test_plls(void)
+{
+    static const struct { const char *machine; uint32_t mhz[4]; } boards[] = {
+        { "ipad1", { 1000, 0, 1026, 48 } },
+        { "iPhone-4", { 800, 500, 1026, 48 } },
+    };
+
+    for (int b = 0; b < 2; b++) {
+        QTestState *qts = qtest_initf("-machine %s,bootrom=%s -display none -audio driver=none -nic none",
+                                      boards[b].machine, rom_path);
+        for (int i = 0; i < 4; i++) {
+            g_assert_cmpuint(pll_mhz(qtest_readl(qts, PMGR + (i < 3 ? 8 * i : 0x20))), ==, boards[b].mhz[i]);
+        }
+        qtest_quit(qts);
+    }
+}
+
 static void test_event_irq(void)
 {
     QTestState *qts = start_board();
@@ -147,6 +172,7 @@ int main(int argc, char **argv)
     g_assert_true(g_file_set_contents(rom_path, rom, 65536, NULL));
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/ipad1/pmgr/timebase-gates", test_timebase);
+    qtest_add_func("/ipad1/pmgr/plls", test_plls);
     qtest_add_func("/ipad1/pmgr/event-vic-irq", test_event_irq);
     qtest_add_func("/ipad1/pmgr/watchdog-reset", test_watchdog_reset);
     qtest_add_func("/ipad1/pmgr/watchdog-disable", test_watchdog_disable);

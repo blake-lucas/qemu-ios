@@ -83,6 +83,7 @@ struct S5L8930PMGRState {
     uint32_t regs[S5L8930_PMGR_SIZE / 4];
     uint8_t security_epoch;     /* POWER_ID[31:24] LLB would latch; 0 = measured */
     uint8_t board_id;           /* POWER_ID[23:16], the board straps */
+    uint32_t apll, mpll;        /* the board's APLL and MPLL CON0 as iBoot leaves them */
     int64_t tick_base_ns;
     uint64_t lo_ticks;          /* the last TICKS_LO read's sample, for the TICKS_HI read right after it */
     bool lo_pending;
@@ -94,17 +95,21 @@ struct S5L8930PMGRState {
 
 /*
  * Reset values stand in for iBoot's state, since the kernel is booted
- * without it. PLLs are iEmu's (APLL 1000 MHz, EPLL 1026 MHz, VPLL 48 MHz;
- * IEMU/s5l8930.c:388-398), except MPLL, which iEmu leaves off: 400 MHz here
- * (M=100 P=3 S=2), since the A4's memory clock comes from somewhere.
+ * without it. A PLL's CON0 is enable (31), locked (29), P (19:14), M (12:3)
+ * and S (2:0), running at 48 MHz * M / P / 2^S (iBoot's get_pll, which is
+ * what fills clock-frequencies slots 1-4). APLL (0x00) and MPLL (0x08) are
+ * the board's ("apll" and "mpll"): the iPad's clock-frequencies have APLL at
+ * 1 GHz and MPLL off (slot 2 is 0), the iPhone 4's 800 and 500 MHz. EPLL
+ * (1026 MHz) and VPLL (48 MHz) are iEmu's (IEMU/s5l8930.c:388-398), and the
+ * same on both units.
  * POWER_ID: epoch 1, board-id 2, read from a real K48AP (iEmu had epoch 2).
  */
 static const struct {
     hwaddr off;
     uint32_t val;
 } pmgr_defaults[] = {
-    { 0x00, 0xA00187D1 }, { 0x04, 0x00380960 },
-    { 0x08, 0xA000C322 }, { 0x0C, 0x00380960 },
+    { 0x04, 0x00380960 },
+    { 0x0C, 0x00380960 },
     { 0x10, 0xA0010559 }, { 0x14, 0x00380960 },
     { 0x20, 0xA0008205 }, { 0x24, 0x00380960 },
     /* Clock muxes/dividers reconstructed from the real K48 clock-frequencies
@@ -466,6 +471,8 @@ static void s5l8930_pmgr_reset(DeviceState *dev)
     for (i = 0; i < ARRAY_SIZE(pmgr_defaults); i++) {
         s->regs[pmgr_defaults[i].off / 4] = pmgr_defaults[i].val;
     }
+    s->regs[0x00 / 4] = s->apll;
+    s->regs[0x08 / 4] = s->mpll;
     s->regs[PMGR_POWER_ID / 4] |= (uint32_t)s->board_id << 16;
     /* iboot= skips LLB, which writes the boot epoch here on hardware; the
      * machine hands over what that LLB would write (it_iboot_find_miu_epoch). */
@@ -594,6 +601,8 @@ static const VMStateDescription vmstate_s5l8930_pmgr = {
 static const Property s5l8930_pmgr_props[] = {
     DEFINE_PROP_UINT8("security-epoch", S5L8930PMGRState, security_epoch, 0),
     DEFINE_PROP_UINT8("board-id", S5L8930PMGRState, board_id, 0x02),   /* K48 */
+    DEFINE_PROP_UINT32("apll", S5L8930PMGRState, apll, 0xA00187D1),     /* K48: 1 GHz (P 6, M 250, S 1) */
+    DEFINE_PROP_UINT32("mpll", S5L8930PMGRState, mpll, 0),              /* K48: off */
 };
 
 static void s5l8930_pmgr_class_init(ObjectClass *klass, const void *data)

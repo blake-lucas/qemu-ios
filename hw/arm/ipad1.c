@@ -94,6 +94,7 @@ typedef struct A4Board {
     uint64_t dram_size;                  /* also mirrored right above itself (iBoot) */
     uint32_t chipid[2];                  /* ChipID fuse words 0-1 */
     uint8_t board_id;                    /* PMGR POWER_ID[23:16] */
+    uint32_t apll, mpll;                 /* PMGR APLL and MPLL CON0 as iBoot leaves them; 0, 0: the iPad's (N81 too) */
     const uint8_t *product_id;           /* /product product-id (20 bytes) as iBoot fills it; NULL: left zero */
     /* Panel: scan-out size, the DSI ID read, lanes. */
     uint16_t width, height;
@@ -288,6 +289,8 @@ static const A4Board a4_n90 = {
     .dram_size = 0x20000000,
     .chipid = { 0x31800387, 0x80758000 },    /* same die as K48 */
     .board_id = 0x00,
+    /* The real unit's clock-frequencies: APLL 800 MHz (P 6, M 200, S 1), MPLL 500 MHz (P 3, M 125, S 2). */
+    .apll = 0xA0018641, .mpll = 0xA000C3EA,
     .product_id = a4_n90_product_id,
     .width = 640, .height = 960,
     .panel_id = 0x0969e5a1,                  /* ponytail: K48's, as N81's */
@@ -1448,6 +1451,10 @@ static void ipad1_init(MachineState *machine)
         }
     }
     qdev_prop_set_uint8(dev, "board-id", s->board->board_id);
+    if (s->board->apll) {
+        qdev_prop_set_uint32(dev, "apll", s->board->apll);
+        qdev_prop_set_uint32(dev, "mpll", s->board->mpll);
+    }
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, S5L8930_PMGR_BASE);
     sysbus_connect_irq(sbd, 0, ipad1_irq(s, S5L8930_IRQ_TIMER0));
