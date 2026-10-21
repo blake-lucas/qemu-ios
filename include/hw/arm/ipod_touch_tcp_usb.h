@@ -118,6 +118,8 @@ typedef struct _tcp_usb_state
 	tcp_usb_header_t *header;
 	char *buffer;
 	size_t amount_done;
+	/* tcp_usb_request's payload size: the most a response may write into the caller's buffer. */
+	size_t request_len;
 
 	/* True while header/buffer are owned by us and must be freed. */
 	bool owns_packet;

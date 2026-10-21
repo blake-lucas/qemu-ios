@@ -689,6 +689,9 @@ static void ios_capture(DisplaySurface *surface)
     int next, y;
     uint8_t *dst;
 
+    if (surface_bits_per_pixel(surface) != 32 || stride < w * 4) {
+        return;     /* the copies below read 4 bytes a pixel */
+    }
     /*
      * The compare and copy run without the BQL (two passes over 2.4 MiB at 640x960): the surface
      * belongs to the main loop, which is running this, and the buffers to frame_lock.

@@ -41,6 +41,8 @@ static int qrpc(uint32_t op, const void *payload, uint32_t length,
         qio(fd, response, sizeof(response), 0)) goto done;
     if (response[1] > capacity) goto done;
     if (qio(fd, reply, response[1], 0)) goto done;
+    /* a count is never more than the bytes that came back (or went out) */
+    if ((int32_t)response[0] > (int64_t)(reply ? response[1] : length)) goto done;
     result = (int32_t)response[0];
 done:
     close(fd);
