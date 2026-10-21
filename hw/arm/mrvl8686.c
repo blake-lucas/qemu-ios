@@ -646,7 +646,9 @@ static int mrvl8686_post_load(void *opaque, int version_id)
     Mrvl8686Card *c = &s->card;
     if (c->stage > MRVL_STAGE_FIRMWARE || c->upq_head >= MRVL_UPQ_SLOTS ||
         c->upq_count > MRVL_UPQ_SLOTS || c->getmem_off > MRVL_EEPROM_SIZE ||
-        c->getmem_len > MRVL_EEPROM_SIZE - c->getmem_off) {
+        c->getmem_len > MRVL_EEPROM_SIZE - c->getmem_off ||
+        /* the awaited block's length, its CRC at rd_base - 4 (mrvl_helper_request's bound) */
+        (c->fw_want_data && (c->rd_base < 4 || c->rd_base > 0x800))) {
         return -EINVAL;
     }
     for (unsigned i = 0; i < MRVL_UPQ_SLOTS; i++) {

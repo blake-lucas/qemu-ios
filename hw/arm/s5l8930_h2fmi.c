@@ -1019,8 +1019,14 @@ static int h2fmi_post_load(void *opaque, int version_id)
         }
         if (b->data_len > sizeof(b->data) || b->meta_len > sizeof(b->meta) ||
             b->wdata_len > sizeof(b->wdata) || b->wmeta_len > sizeof(b->wmeta) ||
-            b->ecc_n > H2FMI_QUEUE || b->pending_n > ARRAY_SIZE(b->pending_ce)) {
+            b->ecc_n > H2FMI_QUEUE || b->pending_n > ARRAY_SIZE(b->pending_ce) ||
+            b->stride > H2FMI_BUF) {                /* a raw read copies stride bytes of page[] */
             return -EINVAL;
+        }
+        for (unsigned ce = 0; ce < ARRAY_SIZE(b->wpage_len); ce++) {
+            if (b->wpage_len[ce] > H2FMI_BUF) {     /* programmed from wpage[ce] */
+                return -EINVAL;
+            }
         }
     }
     return 0;

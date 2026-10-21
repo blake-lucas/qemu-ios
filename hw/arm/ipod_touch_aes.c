@@ -905,6 +905,9 @@ static void ipod_touch_aes_reset(DeviceState *dev)
 static int aes_post_load(void *opaque, int version_id)
 {
     IPodTouchAESState *s = opaque;
+    if (s->in_fill > sizeof(s->in_blk) || s->out_left > sizeof(s->out_blk)) {
+        return -EINVAL;
+    }
     if (s->streaming) {
         aes_custom_load(s);             /* the schedule is derived state */
     }

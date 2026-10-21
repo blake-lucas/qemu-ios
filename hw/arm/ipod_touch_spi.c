@@ -393,6 +393,11 @@ static int ipod_touch_spi_post_load(void *opaque, int version_id)
 {
     IPodTouchSPIState *s = opaque;
 
+    /* Fifo8's own VMState takes head and num as they come. */
+    if (s->rx_fifo.head >= s->rx_fifo.capacity || s->rx_fifo.num > s->rx_fifo.capacity ||
+        s->tx_fifo.head >= s->tx_fifo.capacity || s->tx_fifo.num > s->tx_fifo.capacity) {
+        return -EINVAL;
+    }
     qemu_set_irq(s->irq, s->last_irq);
     return 0;
 }

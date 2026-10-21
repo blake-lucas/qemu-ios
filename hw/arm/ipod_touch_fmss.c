@@ -2002,6 +2002,7 @@ static int fmss_post_load(void *opaque, int version_id)
     IPodTouchFMSSState *s = opaque;
     bool invalid = false;
     g_tree_foreach(s->phys_pages, fmss_invalid_page, &invalid);
+    invalid |= s->total_blocks > NAND_MAX_TOTAL_BLOCKS;      /* fmss_total_blocks' own bound */
     if (!invalid) {
         g_tree_foreach(s->erased_blocks, fmss_invalid_marker, &invalid);
     }

@@ -472,6 +472,23 @@ static int pl192_post_load(void *opaque, int version_id)
 {
     PL192State *s = PL192(opaque);
 
+    /* The priorities index prio_irq[], stack_i the two stacks, and a stacked
+     * source comes back as current: reject what no guest can write. */
+    if (s->daisy_priority >= PL192_PRIO_LEVELS || s->current > PL192_NO_IRQ ||
+        s->stack_i < 0 || s->stack_i > PL192_PRIO_LEVELS) {
+        return -EINVAL;
+    }
+    for (int i = 0; i < PL192_INT_SOURCES; i++) {
+        if (s->vect_priority[i] >= PL192_PRIO_LEVELS) {
+            return -EINVAL;
+        }
+    }
+    for (int i = 0; i <= PL192_PRIO_LEVELS; i++) {
+        if (s->irq_stack[i] > PL192_NO_IRQ) {
+            return -EINVAL;
+        }
+    }
+
     /*
      * daisy_callback (the child whose interrupt the parent is serving) is a
      * pointer set when the child first raises, so it doesn't travel. A chain

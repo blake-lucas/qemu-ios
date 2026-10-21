@@ -192,9 +192,17 @@ static void s5l8930_i2c_init(Object *obj)
     s->bus = i2c_init_bus(DEVICE(obj), "i2c");
 }
 
+static int s5l8930_i2c_post_load(void *opaque, int version_id)
+{
+    S5L8930I2CState *s = opaque;
+    return s->tx_len <= I2C_FIFO_DEPTH && s->rx_len <= I2C_FIFO_DEPTH && s->rx_pos <= s->rx_len ?
+           0 : -EINVAL;
+}
+
 static const VMStateDescription vmstate_s5l8930_i2c = {
     .name = TYPE_S5L8930_I2C,
     .version_id = 1,
+    .post_load = s5l8930_i2c_post_load,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(addr, S5L8930I2CState),
@@ -1480,6 +1488,9 @@ static void l3g_realize(DeviceState *dev, Error **errp)
 
 static int l3g_post_load(void *opaque, int version_id)
 {
+    if (((S5L8930L3GState *)opaque)->level > L3G_FIFO_SLOTS) {
+        return -EINVAL;                         /* l3g_pop moves level slots of fifo[] */
+    }
     l3g_schedule(opaque);
     return 0;
 }

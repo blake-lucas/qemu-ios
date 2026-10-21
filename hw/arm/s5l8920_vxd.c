@@ -627,10 +627,17 @@ static void vxd_reset(DeviceState *dev)
  * version 2 the renders still decoding: the host decoder starts over, so a restored device decodes again from the
  * stream's next IDR. MTX RAM is left out: only a firmware upload's read-back looks at it.
  */
+static int vxd_post_load(void *opaque, int version_id)
+{
+    S5L8920VXDState *s = opaque;
+    return s->pending <= VXD_PENDING ? 0 : -EINVAL;    /* counts fence[] and due[] */
+}
+
 static const VMStateDescription vxd_vmstate = {
     .name = TYPE_S5L8920_VXD,
     .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = vxd_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, S5L8920VXDState, 0x1000 / 4),
         VMSTATE_UINT32_ARRAY(comms, S5L8920VXDState, 0x1000 / 4),

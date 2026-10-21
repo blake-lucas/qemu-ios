@@ -372,14 +372,42 @@ static void s5l8930_sdio_reset(DeviceState *dev)
     qemu_irq_lower(s->irq);
 }
 
+/* The buffer is the one this stream allocates, or none (fifo_len 0). */
+static int s5l8930_sdio_pre_load(void *opaque)
+{
+    sdhc_fifo_clear(opaque);
+    return 0;
+}
+
+/* Runs between fifo_len and the buffer it sizes: sdhc_issue's bound. */
+static bool s5l8930_sdio_fifo_len_ok(void *opaque, int version_id)
+{
+    return ((S5L8930SDIOState *)opaque)->fifo_len <= SDHC_FIFO_MAX;
+}
+
+/* The card moves blksize * blkcount bytes through the buffer when the port fills or drains. */
+static int s5l8930_sdio_post_load(void *opaque, int version_id)
+{
+    S5L8930SDIOState *s = opaque;
+    if (s->fifo_pos > s->fifo_len ||
+        (s->fifo_len && (s->blksize > 0xfff || s->blkcount > 0xffff ||
+                         s->blksize * s->blkcount != s->fifo_len))) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_s5l8930_sdio = {
     .name = TYPE_S5L8930_SDIO,
     .version_id = 2,
     .minimum_version_id = 1,
+    .pre_load = s5l8930_sdio_pre_load,
+    .post_load = s5l8930_sdio_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(regs, S5L8930SDIOState, SDHC_SIZE),
         /* 2: a CMD53 waiting at the data port (between the command and its CDMA chain) */
         VMSTATE_UINT32_V(fifo_len, S5L8930SDIOState, 2),
+        VMSTATE_VALIDATE("fifo_len", s5l8930_sdio_fifo_len_ok),
         VMSTATE_VBUFFER_ALLOC_UINT32(fifo, S5L8930SDIOState, 2, NULL, fifo_len),
         VMSTATE_UINT32_V(fifo_pos, S5L8930SDIOState, 2),
         VMSTATE_BOOL_V(fifo_write, S5L8930SDIOState, 2),

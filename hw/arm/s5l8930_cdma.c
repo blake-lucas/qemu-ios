@@ -1181,6 +1181,13 @@ static const VMStateDescription vmstate_aes_context = {
     }
 };
 
+/* Runs between fifo_len and the buffer it sizes, so a bad length fails
+ * before anything is allocated. */
+static bool cdma_fifo_len_ok(void *opaque, int version_id)
+{
+    return ((S5L8930CDMAState *)opaque)->fifo_len <= CDMA_MAX_SEGMENT;
+}
+
 static int cdma_pre_save(void *opaque)
 {
     S5L8930CDMAState *s = opaque;
@@ -1188,7 +1195,7 @@ static int cdma_pre_save(void *opaque)
     for (int ch = 0; ch < CDMA_CHANNELS; ch++) {
         s->in_seg_mig[ch] = s->ch[ch].in_seg;
     }
-    return 0;
+    return cdma_fifo_len_ok(s, 0) ? 0 : -E2BIG;  /* what a load would refuse (and VALIDATE asserts on) */
 }
 
 static int cdma_pre_load(void *opaque)
@@ -1205,6 +1212,12 @@ static int cdma_post_load(void *opaque, int version_id)
     S5L8930CDMAState *s = opaque;
 
     for (int ch = 0; ch < CDMA_CHANNELS; ch++) {
+        /* A stalled segment resumes with remain as its length (cdma_run's
+         * bound); a paced chain divides by its rate. */
+        if ((s->in_seg_mig[ch] && s->ch[ch].remain > CDMA_MAX_SEGMENT) ||
+            (s->paced[ch] && !s->paced_bps[ch])) {
+            return -EINVAL;
+        }
         s->ch[ch].in_seg = s->in_seg_mig[ch];
     }
     return 0;
@@ -1220,6 +1233,7 @@ static const VMStateDescription vmstate_s5l8930_cdma = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(enabled, S5L8930CDMAState, 2),
         VMSTATE_UINT32(fifo_len, S5L8930CDMAState),
+        VMSTATE_VALIDATE("fifo_len", cdma_fifo_len_ok),
         VMSTATE_VBUFFER_ALLOC_UINT32(fifo, S5L8930CDMAState, 0, NULL, fifo_len),
         VMSTATE_STRUCT_ARRAY(ch, S5L8930CDMAState, CDMA_CHANNELS, 1,
                              vmstate_cdma_channel, CDMAChannel),

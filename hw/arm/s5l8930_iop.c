@@ -1956,6 +1956,12 @@ static int iop_post_load(void *opaque, int version)
         error_report("s5l8930-iop: snapshot NAND storage format mismatch");
         return -EINVAL;
     }
+    for (int bus = 0; bus < NAND_BUSES; bus++) {     /* fmi_set_config's bounds: the page buffers */
+        if (!s->bytes_per_page[bus] || s->bytes_per_page[bus] > FMI_MAX_PAGE ||
+            s->bytes_per_spare[bus] > FMI_MAX_PAGE) {
+            return -EINVAL;
+        }
+    }
     return 0;
 }
 

@@ -317,10 +317,17 @@ static const Property bbspi_props[] = {
     DEFINE_PROP_UINT32("base", IosBbSpiState, base, 0),
 };
 
+static int bbspi_post_load(void *opaque, int version_id)
+{
+    IosBbSpiState *s = opaque;
+    return s->tx_len <= FRAME_MAX && s->rx_len <= FRAME_MAX && s->rx_pos <= s->rx_len ? 0 : -EINVAL;
+}
+
 static const VMStateDescription bbspi_vmstate = {
     .name = "ios-baseband-spi",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = bbspi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, IosBbSpiState, 0x100 / 4),
         VMSTATE_UINT8_ARRAY(tx, IosBbSpiState, FRAME_MAX),
