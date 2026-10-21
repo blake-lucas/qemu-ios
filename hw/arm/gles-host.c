@@ -4963,9 +4963,15 @@ static unsigned gles_surface_map(CPUState *cpu, uint32_t base, unsigned n, ram_a
  * only the last was mapped), so every attach faulted a 4 MiB surface in page
  * by page, one trapped call per page: ~900 calls, most of 4.2.1's app-close
  * delay. So the pages are found once per surface, carried across those
- * faults, and kept: a surface's memory does not move while it lives. Its last
- * page, which the shim's touch leaves mapped, is checked on every attach, so
- * a reused ID or re-populated purgeable memory starts over.
+ * faults, and kept: a surface's memory does not move while it lives. An ID
+ * names a live surface only: 1.x's CoreSurface IDs are kernel addresses, used
+ * again as soon as a buffer is freed, and the next buffer under one can share
+ * none, some or all of the old one's pages. So every page the process maps at
+ * an attach is checked against the kept one (4.x's unmapped pages are left as
+ * kept), and any other memory starts over. Checking only the last page kept a
+ * 1.x label's three pages when that page was not mapped: its texture showed
+ * whatever had taken the other two (a bar of noise in place of a table row's
+ * text, issue 109).
  */
 typedef struct {
     uint32_t offset, npages, resolved;
@@ -4974,20 +4980,31 @@ typedef struct {
 static GHashTable *gles_surface_ids;
 
 /* 0: s->pages filled; 1: not RAM, untracked; -1: a page fault is raised, the call comes back. */
+/* Whether a page the calling process maps now is other memory than the one kept for it. */
+static bool gles_surface_pages_moved(CPUState *cpu, uint32_t base, const GLESSurfacePages *e)
+{
+    ram_addr_t now;
+
+    for (unsigned i = 0; i < e->resolved; i++) {
+        if (gles_page_ram(cpu, (base & TARGET_PAGE_MASK) + (vaddr)i * TARGET_PAGE_SIZE, &now) &&
+            now != e->pages[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int gles_surface_resolve(CPUState *cpu, uint32_t id, GLESSurface *s)
 {
-    unsigned n = s->npages, last = n - 1;
+    unsigned n = s->npages;
     GLESSurfacePages *e;
-    ram_addr_t now;
     uint8_t byte;
 
     if (!id) return gles_surface_map(cpu, s->base, n, s->pages, 0) == n ? 0 : 1;
     if (!gles_surface_ids) gles_surface_ids = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
     e = g_hash_table_lookup(gles_surface_ids, GUINT_TO_POINTER(id));
     if (e && (e->offset != (s->base & ~TARGET_PAGE_MASK) || e->npages != n ||
-              (e->resolved == n &&
-               gles_page_ram(cpu, (s->base & TARGET_PAGE_MASK) + (vaddr)last * TARGET_PAGE_SIZE, &now) &&
-               now != e->pages[last]))) {
+              gles_surface_pages_moved(cpu, s->base, e))) {
         e = NULL;                               /* other memory under the same ID */
     }
     if (!e) {

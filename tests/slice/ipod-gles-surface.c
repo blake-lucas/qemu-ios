@@ -42,8 +42,13 @@ static MemoryRegion fake_ram;
 static uint8_t seen[sizeof(ram)];
 static unsigned dirty_clears;
 static vaddr unmapped_lo, unmapped_hi;      /* pages the process no longer maps */
+static vaddr moved_lo, moved_hi;            /* pages the process maps to other memory, MOVED_BY on */
+#define MOVED_BY 0x20000
 static hwaddr cpu_get_phys_page_attrs_debug(CPUState *c, vaddr va, MemTxAttrs *attrs)
-{ return va >= 0x10000000 && va < 0x10000000 + sizeof(ram) && !(va >= unmapped_lo && va < unmapped_hi) ? va : (hwaddr)-1; }
+{
+    if (va < 0x10000000 || va >= 0x10000000 + sizeof(ram) || (va >= unmapped_lo && va < unmapped_hi)) return -1;
+    return va >= moved_lo && va < moved_hi ? va + MOVED_BY : va;
+}
 static int cpu_asidx_from_attrs(CPUState *c, MemTxAttrs attrs) { return 0; }
 /* the caller's MMU: pages in [kernel_lo, kernel_hi) are mapped but not readable at its privilege */
 typedef int MMUAccessType;
@@ -376,6 +381,21 @@ int main(void)
         assert(got[0] == 0x44 && got[16] == 0x44);
         assert(!g_hash_table_lookup(gh.surfaces, GUINT_TO_POINTER(third)));
         unmapped_lo = unmapped_hi = 0;
+        /* An ID names a live surface only: 1.x's CoreSurface IDs are kernel addresses, used again
+         * once a buffer is freed, and the next buffer under one shares some of its pages or none
+         * (issue 109). An attach under a known ID reads the pages the process maps now: here
+         * the first is other memory and the last the same, so checking the last alone kept the
+         * old first page. */
+        glBindTexture(GL_TEXTURE_RECTANGLE_ARB, third);
+        memset(ram + 8192, 0x66, 8192);
+        assert(!gles_bind_surface(NULL, c, 78));
+        assert(!gles_bind_surface(NULL, none, 0)); gles_surface_forget(GL_TEXTURE_RECTANGLE_ARB);
+        memset(ram + 8192 + MOVED_BY, 0x77, 4096);
+        moved_lo = 0x10000000 + 8192; moved_hi = moved_lo + 4096;
+        assert(!gles_bind_surface(NULL, c, 78));
+        glGetTexImage(GL_TEXTURE_RECTANGLE_ARB,0,GL_BGRA,GL_UNSIGNED_BYTE,got);
+        assert(got[0] == 0x77 && got[16] == 0x66);
+        moved_lo = moved_hi = 0;
         glDisable(GL_TEXTURE_RECTANGLE_ARB);
     }
     munmap(fault_pages,16384);
@@ -388,5 +408,5 @@ int main(void)
         assert(!gles_page_ram(NULL, 0x10004000, &at) && gles_page_ram(NULL, 0x10003000, &at) && at == 0x3000);
         kernel_lo = kernel_hi = 0;
     }
-    puts("PASS: IOSurface page faults and ABI, native textured draw, NV12 ranges, deferred FBO writeback, ES 2.0 refresh and bounds, dirty-page refresh, detached copies, IOSurface page records, unmapped surfaces keep their pixels, unreadable pages are not surfaces");
+    puts("PASS: IOSurface page faults and ABI, native textured draw, NV12 ranges, deferred FBO writeback, ES 2.0 refresh and bounds, dirty-page refresh, detached copies, IOSurface page records, unmapped surfaces keep their pixels, unreadable pages are not surfaces, a reused ID's moved pages");
 }
