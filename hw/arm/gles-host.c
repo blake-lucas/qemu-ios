@@ -4876,7 +4876,8 @@ static unsigned gles_surface_bpp(uint32_t fmt)
     case GLES_SURFACE_ARGB32: case GLES_SURFACE_ABGR32:     return 4;
     case GLES_SURFACE_RGB565: case GLES_SURFACE_RGB555:
     case GLES_SURFACE_RGBA4444: case GLES_SURFACE_RGBA5551:
-    case GLES_SURFACE_LA88: case GLES_SURFACE_LA88_IOS7:    return 2;
+    case GLES_SURFACE_LA88: case GLES_SURFACE_LA88_IOS7:
+    case GLES_SURFACE_ARGB1555: case GLES_SURFACE_ARGB1555_TWIDDLED: return 2;
     case GLES_SURFACE_A8: case GLES_SURFACE_L8:             return 1;
     default:                                                return 0;
     }
@@ -5112,6 +5113,28 @@ static int gles_surface_upload(GLESSurface *s, uint32_t fmt, uint8_t *pixels)
             pixels[i * 4 + 3] = 255;
         }
         break;
+    case GLES_SURFACE_ARGB1555:
+    case GLES_SURFACE_ARGB1555_TWIDDLED: {
+        /* Into rows of BGRA bytes (the ES 2.0 host has no 1_5_5_5_REV type). The bind checked a
+         * twiddled surface square, a power of two and its memory one run of w * h pixels. */
+        g_autofree uint8_t *in = g_memdup2(pixels, (size_t)w * h * 2);
+        for (unsigned y = 0; y < h; y++) {
+            for (unsigned x = 0; x < w; x++) {
+                size_t t = fmt == GLES_SURFACE_ARGB1555 ? (size_t)y * w + x : 0;
+                for (unsigned b = 0; fmt != GLES_SURFACE_ARGB1555 && (1u << b) < w; b++) {
+                    t |= (size_t)((y >> b) & 1) << (2 * b) | (size_t)((x >> b) & 1) << (2 * b + 1);
+                }
+                unsigned value = in[t * 2] | (in[t * 2 + 1] << 8);
+                uint8_t *p = pixels + ((size_t)y * w + x) * 4;
+                for (unsigned c = 0; c < 3; c++) {
+                    unsigned component = (value >> (c * 5)) & 31;
+                    p[c] = (component << 3) | (component >> 2);
+                }
+                p[3] = value & 0x8000 ? 255 : 0;
+            }
+        }
+        break;
+    }
     case GLES_SURFACE_RGB565:   glfmt = GL_RGB;  type = GL_UNSIGNED_SHORT_5_6_5;   break;
     case GLES_SURFACE_RGBA4444: glfmt = GL_RGBA; type = GL_UNSIGNED_SHORT_4_4_4_4; break;
     case GLES_SURFACE_RGBA5551: glfmt = GL_RGBA; type = GL_UNSIGNED_SHORT_5_5_5_1; break;
@@ -5342,6 +5365,12 @@ static int64_t gles_bind_surface(CPUState *cpu, const uint32_t *a, uint32_t id)
     }
     if (window && nv12) {
         gles_refuse("surface:window:%s", gles_fourcc(fmt, fourcc));
+        return -1;
+    }
+    /* ponytail: square twiddled surfaces only, the ones seen; a rectangle's order is unconfirmed */
+    if (fmt == GLES_SURFACE_ARGB1555_TWIDDLED && (window || w != h || (w & (w - 1)) || a[2] != w * 2)) {
+        gles_refuse("surface:%s:%ux%u/%u", gles_fourcc(fmt, fourcc), w, h, a[2]);
+        gles_debug_texture(target);
         return -1;
     }
     if (gles_surface_flush(cpu, a[1])) return -1;     /* a rendered alias: its pixels are on the host */

@@ -273,11 +273,19 @@ static void import_artwork(const char *folder, unsigned identifier) {
     int (*process)(ID,ID,ID,ID) = cache ? dlsym(cache,"ArtworkCache_ProcessArtworkData") : NULL;
     ID *albums = cache ? dlsym(cache,"kArtworkCacheCategory_Albums") : NULL;
     if (!process || !albums || !*albums || !data) fail("artwork service unavailable");
-    if (mkdir(MEDIA "Purchases",0755) && errno != EEXIST) fail("cannot create purchase artwork folder");
-    regular_path(MEDIA "Purchases",1);
-    if (mkdir(MEDIA "Purchases/MobileArtworkDB",0755) && errno != EEXIST) fail("cannot create artwork cache folder");
-    regular_path(MEDIA "Purchases/MobileArtworkDB",1);
-    ID url = m1(getclass("NSURL"),"fileURLWithPath:",string(MEDIA "Purchases/MobileArtworkDB"));
+    /* 3.x reads a purchase's cover from the one cache in Purchases; 4.x (8C148 -[MLTrack
+     * mobileArtworkCacheFolder]) from a MobileArtworkDB beside the purchase's own media. */
+    ID track = getclass("MLTrack");
+    if (track && CALL(int,(ID,ID,ID))(track,selector("instancesRespondToSelector:"),selector("mobileArtworkCacheFolder")))
+        snprintf(path,sizeof(path),MEDIA "%s/MobileArtworkDB",folder);
+    else {
+        if (mkdir(MEDIA "Purchases",0755) && errno != EEXIST) fail("cannot create purchase artwork folder");
+        regular_path(MEDIA "Purchases",1);
+        snprintf(path,sizeof(path),MEDIA "Purchases/MobileArtworkDB");
+    }
+    if (mkdir(path,0755) && errno != EEXIST) fail("cannot create artwork cache folder");
+    regular_path(path,1);
+    ID url = m1(getclass("NSURL"),"fileURLWithPath:",string(path));
     snprintf(key,sizeof(key),"%u",identifier);
     if (!process(url,string(key),*albums,data)) fail("artwork processing failed; retain staging for reconciliation");
 }

@@ -1796,9 +1796,9 @@ __attribute__((visibility("default")))
                     width:(NSUInteger)width height:(NSUInteger)height format:(NSUInteger)format type:(NSUInteger)type
                     plane:(NSUInteger)plane invert:(BOOL)invert
 {
-    (void)ifmt; (void)width; (void)height; (void)plane; (void)invert;
+    (void)ifmt; (void)width; (void)height; (void)invert;
     fe_ca_path("texImageIOSurface:");
-    return GLESBindCoreSurfaceAs(_private->gc, target, surface, fe_gl_fourcc(format, type)) != 0;
+    return GLESBindCoreSurfaceAs(_private->gc, target, surface, fe_gl_fourcc(format, type), (int)plane) != 0;
 }
 
 - (void)swapNotification:(void *)fb forTransaction:(unsigned)transaction onLayer:(unsigned)layer

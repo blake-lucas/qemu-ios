@@ -115,6 +115,8 @@ static void *p_IOSurfaceGetBaseAddressOfPlane(void *s, unsigned plane)
 { surface_arg(s); return (void *)(uintptr_t)(0x10000000 + plane * 256); }
 static unsigned p_IOSurfaceGetBytesPerRowOfPlane(void *s, unsigned plane)
 { surface_arg(s); return 2; }
+static unsigned p_IOSurfaceGetWidthOfPlane(void *s, unsigned plane) { surface_arg(s); return plane ? 1 : 2; }
+static unsigned p_IOSurfaceGetHeightOfPlane(void *s, unsigned plane) { surface_arg(s); return plane ? 1 : 2; }
 static long long qc(unsigned op, void *gc, unsigned argc, const unsigned *a)
 { if(op==89) { assert(!argc); abi_finished++; return 0; } assert(op==GLES_OP_BIND_SURFACE && (argc==8 || argc==9)); memset(abi_args,0,sizeof(abi_args)); memcpy(abi_args,a,argc*4); return 0; }
 
@@ -146,6 +148,14 @@ int main(void)
     assert(GLESBindCoreSurface(NULL, 0x84f5, (void *)0x1234));
     assert(abi_args[0]==0x84f5 && abi_args[1]==0x10000000 && abi_args[6]==0x10000100 && abi_args[8]==4242);
     assert(!abi_locks);
+    /* One plane of a 4:2:0 surface, as 5.x+ CoreAnimation asks for each (texImageIOSurface's plane): the luma as
+     * L008, the Cb/Cr plane as 2C08 at half the size, neither with a second plane. */
+    assert(GLESBindCoreSurfaceAs(NULL, 0x84f5, (void *)0x1234, GLES_SURFACE_L8, 0));
+    assert(abi_args[1]==0x10000000 && abi_args[2]==2 && abi_args[3]==2 && abi_args[4]==2 &&
+           abi_args[5]==GLES_SURFACE_L8 && !abi_args[6] && !abi_args[7]);
+    assert(GLESBindCoreSurfaceAs(NULL, 0x84f5, (void *)0x1234, GLES_SURFACE_LA88, 1));
+    assert(abi_args[1]==0x10000100 && abi_args[2]==2 && abi_args[3]==1 && abi_args[4]==1 &&
+           abi_args[5]==GLES_SURFACE_LA88 && !abi_args[6] && !abi_args[7] && !abi_locks);
     abi_format=GLES_SURFACE_RGB555;
     assert(GLESBindCoreSurface(NULL,0x84f5,(void *)0x1234));
     assert(abi_args[2]==16 && abi_args[5]==GLES_SURFACE_RGB555 && !abi_args[6] && !abi_locks);
@@ -243,7 +253,7 @@ int main(void)
     for(int i=0;i<4;i++) assert(!memcmp(got+i*4,"\0\0\0\xff",4));
     a[3]=3;assert(gles_bind_surface(NULL,a,0)==-1);
     /* The rest of what QuartzCore and IOSurface name, one 2x1 surface each, read back as BGRA bytes:
-     * A008 and L008 sample (0,0,0,a) and (l,l,l,1); 4444 and 1555 are GL's own packed orders; ARGB and
+     * A008 and L008 sample (0,0,0,a) and (l,l,l,1); 4444 and 1555 are GL's own packed orders, 5551 A1R5G5B5; ARGB and
      * ABGR are the 32-bit orders byte-reversed. */
     {
         struct { uint32_t fmt, stride; uint8_t in[8]; uint8_t out[8]; } cases[] = {
@@ -251,6 +261,7 @@ int main(void)
             { GLES_SURFACE_L8,       2, {0x40,0xff},            {0x40,0x40,0x40,0xff, 0xff,0xff,0xff,0xff} },
             { GLES_SURFACE_RGBA4444, 4, {0x0f,0xf0, 0xf0,0x0f}, {0,0,0xff,0xff, 0xff,0xff,0,0} },   /* 0xf00f: R=f A=f; 0x0ff0: G=f B=f */
             { GLES_SURFACE_RGBA5551, 4, {0x01,0xf8, 0x3f,0x00}, {0,0,0xff,0xff, 0xff,0,0,0xff} },   /* 0xf801 red, 0x003f blue */
+            { GLES_SURFACE_ARGB1555, 4, {0x00,0xfc, 0x1f,0x00}, {0,0,0xff,0xff, 0xff,0,0,0} },      /* 0xfc00 red, 0x001f blue, clear */
             { GLES_SURFACE_ARGB32,   8, {0x80,1,2,3, 0xff,9,8,7}, {3,2,1,0x80, 7,8,9,0xff} },
             { GLES_SURFACE_ABGR32,   8, {0x80,1,2,3, 0xff,9,8,7}, {1,2,3,0x80, 9,8,7,0xff} },
         };
@@ -266,6 +277,26 @@ int main(void)
         assert(gles_bind_surface(NULL,b,0) == -1);
         char *rejects = gles_host_rejects();
         assert(strstr(rejects, "surface:XYZ0\t1\n"));
+        free(rejects);
+    }
+    /* Cover Flow's twiddled A1R5G5B5 ('s551'): a 4x4 whose pixel at memory index i is blue i (alpha set but at i = 15),
+     * read back in rows, where each row's indices interleave y's bits (even) with x's (odd). */
+    {
+        static const uint8_t index[16] = { 0,2,8,10, 1,3,9,11, 4,6,12,14, 5,7,13,15 };
+        uint8_t texels[64];
+        uint32_t b[] = { GL_TEXTURE_RECTANGLE_ARB, 0x10000000, 8, 4, 4, GLES_SURFACE_ARGB1555_TWIDDLED, 0, 0 };
+        for (unsigned i = 0; i < 16; i++) { ram[i * 2] = i; ram[i * 2 + 1] = i == 15 ? 0 : 0x80; }
+        assert(!gles_bind_surface(NULL,b,0));
+        glGetTexImage(GL_TEXTURE_RECTANGLE_ARB, 0, GL_BGRA, GL_UNSIGNED_BYTE, texels);
+        for (unsigned p = 0; p < 16; p++) {
+            unsigned i = index[p];
+            assert(texels[p * 4] == ((i << 3) | (i >> 2)) && !texels[p * 4 + 1] && !texels[p * 4 + 2]);
+            assert(texels[p * 4 + 3] == (i == 15 ? 0 : 255));
+        }
+        b[3] = 8; b[2] = 16;                            /* not square: refused, counted */
+        assert(gles_bind_surface(NULL,b,0) == -1);
+        char *rejects = gles_host_rejects();
+        assert(strstr(rejects, "surface:s551:8x4/16\t1\n"));
         free(rejects);
     }
     /* Photos thumbnail rows use opaque RGB555, with padded guest rows. */

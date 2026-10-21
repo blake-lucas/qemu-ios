@@ -1168,6 +1168,8 @@ static unsigned (*p_IOSurfaceGetBytesPerElement)(void *);
 static unsigned (*p_IOSurfaceGetPlaneCount)(void *);
 static void *(*p_IOSurfaceGetBaseAddressOfPlane)(void *, unsigned);
 static unsigned (*p_IOSurfaceGetBytesPerRowOfPlane)(void *, unsigned);
+static unsigned (*p_IOSurfaceGetWidthOfPlane)(void *, unsigned);
+static unsigned (*p_IOSurfaceGetHeightOfPlane)(void *, unsigned);
 static int (*p_IOSurfaceLock)(void *, unsigned, unsigned *);
 static int (*p_IOSurfaceUnlock)(void *, unsigned, unsigned *);
 static unsigned long (*p_IOSurfaceGetTypeID)(void);
@@ -1238,6 +1240,8 @@ static void iosurface_init(void)
     p_IOSurfaceGetPlaneCount = surface_sym(pre, "GetPlaneCount");
     p_IOSurfaceGetBaseAddressOfPlane = surface_sym(pre, "GetBaseAddressOfPlane");
     p_IOSurfaceGetBytesPerRowOfPlane = surface_sym(pre, "GetBytesPerRowOfPlane");
+    p_IOSurfaceGetWidthOfPlane = surface_sym(pre, "GetWidthOfPlane");
+    p_IOSurfaceGetHeightOfPlane = surface_sym(pre, "GetHeightOfPlane");
     p_IOSurfaceLock           = surface_sym(pre, "Lock");
     p_IOSurfaceUnlock         = surface_sym(pre, "Unlock");
     p_IOSurfaceGetTypeID      = surface_sym(pre, "GetTypeID");
@@ -1608,15 +1612,16 @@ static int surface_fault_read(unsigned long base, unsigned stride, unsigned rows
 /* 7E18's engine at 0xd918 takes (gc, GL target, IOSurface), not
  * (gc, IOSurface, ...). The target is 0x84f5 or 0x8d41; treating it as a
  * surface pointer crashes the compositor. Texture bindings never own a view. */
-static int GLESBindCoreSurfaceAs(void *gc, unsigned target, void *surface, unsigned gl_format);
+static int GLESBindCoreSurfaceAs(void *gc, unsigned target, void *surface, unsigned gl_format, int plane);
 static int GLESBindCoreSurface(void *gc, unsigned target, void *surface)
 {
-    return GLESBindCoreSurfaceAs(gc, target, surface, 0);
+    return GLESBindCoreSurfaceAs(gc, target, surface, 0, -1);
 }
 
 /* gl_format: the layout the caller's GL arguments give the surface (glishim's 0x38E
- * attach), used when the IOSurface carries no pixel format; 0 = none. */
-static int GLESBindCoreSurfaceAs(void *gc, unsigned target, void *surface, unsigned gl_format)
+ * attach), used when the IOSurface carries no pixel format; 0 = none. plane: the plane of a
+ * two-plane surface the caller asked for, or -1 for the whole surface. */
+static int GLESBindCoreSurfaceAs(void *gc, unsigned target, void *surface, unsigned gl_format, int plane)
 {
     unsigned base, stride, width, height, format, uv = 0, uvstride = 0;
     int result;
@@ -1642,6 +1647,19 @@ static int GLESBindCoreSurfaceAs(void *gc, unsigned target, void *surface, unsig
         stride = p_IOSurfaceGetBytesPerRowOfPlane(surface, 0);
         uv = (unsigned)p_IOSurfaceGetBaseAddressOfPlane(surface, 1);
         uvstride = p_IOSurfaceGetBytesPerRowOfPlane(surface, 1);
+        /* One plane as its own texture, as 5.x on CoreAnimation draws a 4:2:0 surface (Cover Flow's covers from
+         * the JPEG block): its luma as GL_LUMINANCE, its Cb/Cr as GL_LUMINANCE_ALPHA, converted by its own
+         * shader. Converting the whole surface for each of the two made it convert RGB as YCbCr. */
+        if ((plane == 0 || plane == 1) && (gl_format == 0x4c303038 || gl_format == 0x32433038)) {
+            base = plane ? uv : base;
+            stride = plane ? uvstride : stride;
+            width = p_IOSurfaceGetWidthOfPlane ? p_IOSurfaceGetWidthOfPlane(surface, plane)
+                  : plane ? (width + 1) / 2 : width;
+            height = p_IOSurfaceGetHeightOfPlane ? p_IOSurfaceGetHeightOfPlane(surface, plane)
+                   : plane ? (height + 1) / 2 : height;
+            format = gl_format;
+            uv = uvstride = 0;
+        }
     }
     /* The format is the host's to judge (gles_bind_surface takes what the firmwares'
      * QuartzCore produces, counts what it refuses, and under gles-debug paints it
