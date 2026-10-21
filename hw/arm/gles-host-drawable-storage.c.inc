@@ -77,6 +77,7 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
         g_free(gh.readback);
         gh.tex = color; gh.depth = depth; gh.stencil = stencil; gh.fbo = fbo;
         gh.readback = readback;
+        gh.readback_size = (size_t)width * height * 4;
         gh.drawable_width = width; gh.drawable_height = height;
         /* The portable readback path handles resized layers on both hosts.
          * The platform's original IOSurface remains owned by its context;

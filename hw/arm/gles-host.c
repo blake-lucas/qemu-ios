@@ -36,6 +36,9 @@ extern bool it_profile_on;
 #include "qapi/error.h"
 #include "cpu.h"
 #include "exec/target_page.h"
+#include "accel/tcg/probe.h"
+#include "accel/tcg/cpu-mmu-index.h"
+#include "exec/tlb-flags.h"
 #include "system/ram_addr.h"
 #include "system/physmem.h"
 #include "system/tcg.h"
@@ -245,6 +248,38 @@ static unsigned gles_fb_w = 320, gles_fb_h = 480;   /* the iPod panel: lcd->pw/p
  * both far above anything this device does. */
 #define GLES_MAX_TEX_BYTES ((size_t)4096 * 4096 * 4)
 #define GLES_MAX_NAMES     65536u
+/* Every grow-and-keep scratch buffer (client arrays, indices, texels), every
+ * buffer object's bytes taken together, and the native contexts and share
+ * groups a guest may hold: a guest can only make the host allocate this much. */
+#define GLES_MAX_SCRATCH      GLES_MAX_TEX_BYTES
+#define GLES_MAX_BUFFER_TOTAL ((size_t)512 * 1024 * 1024)
+#define GLES_MAX_CONTEXTS     256u
+
+/* [off, off + len) lies inside a `size`-byte buffer. Every buffer-object, index
+ * and client-array range check goes through here, so none of them can wrap. */
+static inline bool gles_range_ok(uint64_t off, uint64_t len, uint64_t size)
+{
+    return off <= size && len <= size - off;
+}
+
+/*
+ * The bytes elements [first, first + count) of an array at `ptr` occupy, as
+ * [*off, *off + *len): the last element takes esz bytes, not a full stride.
+ * False (and nothing to read) when that range does not lie in [0, limit).
+ * count > 0.
+ */
+static inline bool gles_array_range(uint64_t ptr, uint64_t stride, uint64_t esz,
+                                    uint64_t first, uint64_t count, uint64_t limit,
+                                    uint64_t *off, uint64_t *len)
+{
+    uint64_t skip, tail;
+
+    return !__builtin_mul_overflow(stride, first, &skip) &&
+           !__builtin_add_overflow(ptr, skip, off) &&
+           !__builtin_mul_overflow(stride, count - 1, &tail) &&
+           !__builtin_add_overflow(tail, esz, len) &&
+           gles_range_ok(*off, *len, limit);
+}
 
 /*
  * Texture units modeled. ES 1.1 requires at least 2 and the MBX has exactly 2;
@@ -269,6 +304,38 @@ static float gles_x(uint32_t value);
 static bool gles_refuse(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 static void gles_debug_mark(void);
 static void gles_debug_texture(GLenum target);
+
+/* Bytes held by every buffer object of every context, against GLES_MAX_BUFFER_TOTAL. */
+static size_t gles_buffer_bytes;
+
+/*
+ * Grow-and-keep scratch of at least n bytes in *buf, or NULL past
+ * GLES_MAX_SCRATCH: a guest size never decides a host allocation unchecked.
+ */
+static void *gles_scratch(void *buf, size_t *size, size_t n, const char *who)
+{
+    void **p = buf;
+
+    if (n > GLES_MAX_SCRATCH) {
+        if (gles_refuse("cap:%s", who)) {
+            fprintf(stderr, "[gles] %s: %zu bytes of scratch exceeds the cap; dropped\n", who, n);
+        }
+        return NULL;
+    }
+    if (n > *size) {
+        *p = g_realloc(*p, n);
+        *size = n;
+    }
+    return *p;
+}
+
+/* Host unpack state for pixels the bridge built itself, tightly packed. */
+static inline void gles_unpack_tight(void)
+{
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+}
+
 
 /* Guest vertex/texcoord array state. The guest hands us a pointer into its own
  * address space; nothing is read from it until a draw call, exactly as GL
@@ -314,7 +381,7 @@ typedef struct {
     size_t buf_size;
     /* Second scratch, used only to widen GL_FIXED to float. */
     float *fbuf;
-    size_t fbuf_count;
+    size_t fbuf_size;
 
     /* Which client-state enum turns this array on, e.g. GL_VERTEX_ARRAY. */
     GLenum client_state;
@@ -455,6 +522,7 @@ typedef struct {
     uint8_t *readback;  /* drawable_width * drawable_height * 4 */
     uint8_t *wb_scratch;  /* surface writebacks' read, kept (LT_WRITEBACK_SCRATCH) */
     size_t wb_scratch_len;
+    size_t readback_size;
 
     /*
      * Framebuffer objects, wired to real host FBOs -- with ONE exception.
@@ -938,6 +1006,27 @@ static GLuint gles_private_name(GLboolean (*in_use)(GLuint))
     return name;
 }
 
+/* The guest never names the private range: a texture, renderbuffer or
+ * framebuffer name there is refused (or, in a delete, skipped), so the guest
+ * cannot bind, redefine or delete the drawable's own objects. */
+static bool gles_guest_name_ok(uint32_t name)
+{
+    return name < GLES_PRIVATE_NAME;
+}
+
+static bool gles_guest_names(GLuint *ids, uint32_t n)
+{
+    bool ok = true;
+
+    for (uint32_t i = 0; i < n; i++) {
+        if (!gles_guest_name_ok(ids[i])) {
+            ids[i] = 0;
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static bool gles_is_drawable(uint32_t name)
 {
     return !name || g_hash_table_contains(gh.fbo_drawable,
@@ -1180,6 +1269,11 @@ static bool gles_host_init(void)
      * A guest that truly never sets a projection now gets clip coordinates,
      * which is what it would get on the device.
      */
+    /* A new context has texture and renderbuffer 0 bound, as ES gives one: the
+     * guest never reads back (and binds again) the drawable's private names. */
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, 0);
+
     glViewport(0, 0, GLES_FB_WIDTH, GLES_FB_HEIGHT);
     if (gh.api_version != 2) {
         glMatrixMode(GL_PROJECTION);
@@ -1201,7 +1295,8 @@ static bool gles_host_init(void)
 
     gh.drawable_width = GLES_FB_WIDTH;
     gh.drawable_height = GLES_FB_HEIGHT;
-    gh.readback = g_malloc0((size_t)GLES_FB_WIDTH * GLES_FB_HEIGHT * 4);
+    gh.readback_size = (size_t)GLES_FB_WIDTH * GLES_FB_HEIGHT * 4;
+    gh.readback = g_malloc0(gh.readback_size);
     gh.inited = true;
     if (trace_event_get_state_backends(TRACE_GLES_CONTEXT_LOG)) TRACE_PRINTF(trace_gles_context_log, "[gles-context] initialized %p legacy=%d\n", (void *)gh_current, gh_current == &gh_legacy);
 
@@ -1444,11 +1539,44 @@ static void gles_draw_pool_record(uint64_t va, size_t bytes, uint8_t *host)
     }
 }
 
+static int64_t gles_reject(GLenum error);
+static void gles_buffer_bind(GLESBuffer **slot, GLESBuffer *b);
+
+/* A layout gl*Pointer and glVertexAttribPointer accept: 1 to 4 components of a
+ * type the bridge sizes, and a stride that is a non-negative GLsizei. */
+static bool gles_array_layout_ok(uint32_t size, uint32_t type, uint32_t stride)
+{
+    return size >= 1 && size <= 4 && gles_type_size(type) && stride <= INT32_MAX;
+}
+
+/*
+ * The one setter for every client and attribute array, ES 1.1's and ES 2.0's.
+ * It captures the ARRAY_BUFFER binding in force now, because that is when GL
+ * decides what the pointer means: with a buffer bound it is an offset into it,
+ * without one a guest virtual address. A layout GL would refuse leaves the
+ * array as it was, as GL does, so the draw path only ever sees sizes, types and
+ * strides it can size from and the host accepts.
+ */
+static int64_t gles_set_pointer(GLESArray *a, uint32_t size, uint32_t type,
+                                uint32_t stride, uint32_t ptr)
+{
+    if (!gles_array_layout_ok(size, type, stride)) {
+        gles_refuse("pointer:layout");
+        return gles_reject(gles_type_size(type) ? GL_INVALID_VALUE : GL_INVALID_ENUM);
+    }
+    a->size = size;
+    a->type = type;
+    a->stride = stride;
+    a->ptr = ptr;
+    gles_buffer_bind(&a->vbo, gh.array_buffer);
+    return 0;
+}
+
 static bool gles_bind_array(CPUState *cpu, GLESArray *a, uint32_t first,
                             uint32_t count)
 {
     uint32_t esz, stride;
-    size_t need, off;
+    uint64_t need, off;
     const uint8_t *base;
     const void *data;
     GLenum type;
@@ -1464,9 +1592,6 @@ static bool gles_bind_array(CPUState *cpu, GLESArray *a, uint32_t first,
         return false;
     }
     stride = a->stride ? a->stride : esz;
-    /* Last element still only occupies esz bytes, not a full stride. */
-    need = (size_t)stride * (count - 1) + esz;
-    off = (size_t)stride * first;
 
     if (a->vbo) {
         /*
@@ -1475,20 +1600,27 @@ static bool gles_bind_array(CPUState *cpu, GLESArray *a, uint32_t first,
          * is the only branch in the draw path that VBO support adds; the
          * guest-VA case below is untouched.
          */
-        if (a->ptr + off + need > a->vbo->size) {
+        if (!gles_array_range(a->ptr, stride, esz, first, count, a->vbo->size, &off, &need)) {
             if (gles_refuse("vbo-overrun:%s", gles_array_name(a->client_state))) {
                 fprintf(stderr, "[gles] %s array reads past its buffer "
-                        "(offset %u + %zu, buffer %zu bytes); array disabled\n",
-                        gles_array_name(a->client_state), a->ptr, off + need,
-                        a->vbo->size);
+                        "(offset %u, buffer %zu bytes); array disabled\n",
+                        gles_array_name(a->client_state), a->ptr, a->vbo->size);
             }
             gles_debug_mark();
             return false;
         }
-        base = a->vbo->data + a->ptr + off;
+        base = a->vbo->data + off;
     } else {
-        uint64_t want = (uint64_t)a->ptr + off;
-        const uint8_t *pooled = gles_draw_pool_find(want, need);
+        /* gles_array_range checked the range (overflow, the 32-bit guest space); off is the guest address. */
+        uint64_t want;
+        const uint8_t *pooled;
+
+        if (!gles_array_range(a->ptr, stride, esz, first, count, UINT64_C(1) << 32, &off, &need)) {
+            gles_debug_mark();
+            return false;
+        }
+        want = off;
+        pooled = gles_draw_pool_find(want, need);
 
         if (pooled) {
             base = pooled;
@@ -1496,9 +1628,9 @@ static bool gles_bind_array(CPUState *cpu, GLESArray *a, uint32_t first,
             uint8_t *dst = gles_draw_pool_take(need);
 
             if (!dst) {
-                if (need > a->buf_size) {
-                    a->buf = g_realloc(a->buf, need);
-                    a->buf_size = need;
+                if (!gles_scratch(&a->buf, &a->buf_size, need, "array")) {
+                    gles_debug_mark();
+                    return false;
                 }
                 dst = a->buf;
             }
@@ -1509,7 +1641,7 @@ static bool gles_bind_array(CPUState *cpu, GLESArray *a, uint32_t first,
                 if (rc != 0) {
                     if (!gles_guest_fault_pending() &&  /* else it is reissued */
                         gles_refuse("guest-read:array")) {
-                        fprintf(stderr, "[gles] failed to read %zu bytes of array data "
+                        fprintf(stderr, "[gles] failed to read %" PRIu64 " bytes of array data "
                                 "at guest 0x%08x\n", need, a->ptr);
                     }
                     return false;
@@ -1527,12 +1659,10 @@ static bool gles_bind_array(CPUState *cpu, GLESArray *a, uint32_t first,
 
     /* Convert the types the host would refuse. See gles_needs_widen. */
     if (gles_needs_widen(a->client_state, type)) {
-        size_t n = (size_t)count * a->size;
         uint32_t i, c;
 
-        if (n > a->fbuf_count) {
-            a->fbuf = g_realloc(a->fbuf, n * sizeof(float));
-            a->fbuf_count = n;
+        if (!gles_scratch(&a->fbuf, &a->fbuf_size, (size_t)count * a->size * sizeof(float), "array")) {
+            return false;
         }
         for (i = 0; i < count; i++) {
             const uint8_t *row = base + (size_t)stride * i;
@@ -1664,7 +1794,7 @@ static void gles_draw_sized_points(CPUState *cpu, uint32_t first,
 {
     GLESArray *a = &gh.pointsize;
     uint32_t stride = a->stride ? a->stride : 4;
-    size_t off = (size_t)stride * first, need = (size_t)stride * count;
+    uint64_t off, need;
     const uint8_t *base;
     GLfloat saved = 1.0f;
     uint32_t i;
@@ -1674,18 +1804,20 @@ static void gles_draw_sized_points(CPUState *cpu, uint32_t first,
         glDrawArrays(GL_POINTS, 0, count);
         return;
     }
+    /* Each point's size is 4 bytes, whatever the stride. */
     if (a->vbo) {
-        if (a->ptr + off + need > a->vbo->size) {
+        if (!gles_array_range(a->ptr, stride, 4, first, count, a->vbo->size, &off, &need)) {
             glDrawArrays(GL_POINTS, 0, count);
             return;
         }
-        base = a->vbo->data + a->ptr + off;
+        base = a->vbo->data + off;
     } else {
-        if (need > a->buf_size) {
-            a->buf = g_realloc(a->buf, need);
-            a->buf_size = need;
+        if (!gles_array_range(a->ptr, stride, 4, first, count, UINT64_C(1) << 32, &off, &need) ||
+            !gles_scratch(&a->buf, &a->buf_size, need, "pointsize")) {
+            glDrawArrays(GL_POINTS, 0, count);
+            return;
         }
-        if (gles_guest_rw(cpu, a->ptr + (hwaddr)off, a->buf, need, 0)) {
+        if (gles_guest_rw(cpu, off, a->buf, need, 0)) {
             if (!gles_guest_fault_pending()) {
                 glDrawArrays(GL_POINTS, 0, count);
             }
@@ -1959,30 +2091,34 @@ static size_t gles_image_bytes(uint32_t w, uint32_t h, size_t bpp,
                                size_t align);
 
 /*
- * Guest bytes of a w*h upload under the guest's unpack state, and the host
- * GL_UNPACK_ROW_LENGTH that reproduces its row stride (0 = alignment rules).
- * CoreAnimation uploads CGImage backing stores with the Apple row-bytes
- * extension; ignoring it rejected the upload and left the texture black.
+ * A w*h upload as the guest's unpack state lays it out: the guest bytes it
+ * covers, and the host unpack state that reads exactly those bytes. Staging --
+ * guest texels or, for NULL pixels, zeros -- is sized from `bytes`, and the
+ * host is given this alignment and row length right before the upload, so the
+ * two can never disagree about how much the host reads. CoreAnimation uploads
+ * CGImage backing stores with the Apple row-bytes extension; ignoring it
+ * rejected the upload and left the texture black.
  */
-static size_t gles_unpack_bytes(uint32_t w, uint32_t h, size_t bpp,
-                                GLint *row_length)
+typedef struct {
+    size_t bytes;
+    GLint alignment, row_length;    /* row_length 0: alignment rules */
+} GLESUnpack;
+
+static GLESUnpack gles_unpack_layout(uint32_t w, uint32_t h, size_t bpp)
 {
     uint32_t rb = gh.unpack_row_bytes;
 
-    *row_length = 0;
     if (rb && w && h && bpp && rb % bpp == 0 && rb >= w * bpp &&
         h <= GLES_MAX_TEX_BYTES / rb) {
-        *row_length = rb / bpp;
-        return (size_t)rb * (h - 1) + (size_t)w * bpp;
+        return (GLESUnpack){ (size_t)rb * (h - 1) + (size_t)w * bpp, 1, rb / bpp };
     }
-    return gles_image_bytes(w, h, bpp, gles_unpack());
+    return (GLESUnpack){ gles_image_bytes(w, h, bpp, gles_unpack()), gles_unpack(), 0 };
 }
 
-/* Host unpack state for an upload staged by gles_unpack_bytes. */
-static void gles_unpack_apply(GLint row_length)
+static void gles_unpack_apply(const GLESUnpack *u)
 {
-    glPixelStorei(GL_UNPACK_ALIGNMENT, row_length ? 1 : gles_unpack());
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, u->alignment);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, u->row_length);
 }
 
 static size_t gles_image_bytes(uint32_t w, uint32_t h, size_t bpp,
@@ -2032,6 +2168,10 @@ static bool gles_reject_note(const char *name, uint64_t n, bool at_least)
     QEMU_LOCK_GUARD(&gles_rejects_lock);
     if (!gles_rejects) {
         gles_rejects = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    }
+    /* Names carry guest values: past this many, the rest count under one. */
+    if (g_hash_table_size(gles_rejects) >= 1024 && !g_hash_table_contains(gles_rejects, name)) {
+        name = "refusals:more";
     }
     count = g_hash_table_lookup(gles_rejects, name);
     if (count) {
@@ -2541,11 +2681,7 @@ static uint8_t *gles_decode_buf(size_t n)
     if (n > GLES_MAX_TEX_BYTES) {
         return NULL;
     }
-    if (n > gh.decbuf_size) {
-        gh.decbuf = g_realloc(gh.decbuf, n);
-        gh.decbuf_size = n;
-    }
-    return gh.decbuf;
+    return gles_scratch(&gh.decbuf, &gh.decbuf_size, n, "decode");
 }
 
 /*
@@ -2586,9 +2722,8 @@ static const uint8_t *gles_zeroed(size_t n)
         }
         return NULL;
     }
-    if (n > gh.zerobuf_size) {
-        gh.zerobuf = g_realloc(gh.zerobuf, n);
-        gh.zerobuf_size = n;
+    if (!gles_scratch(&gh.zerobuf, &gh.zerobuf_size, n, "zero-fill")) {
+        return NULL;
     }
     memset(gh.zerobuf, 0, n);
     return gh.zerobuf;
@@ -2603,9 +2738,8 @@ static const uint8_t *gles_fetch_texels(CPUState *cpu, uint32_t pixels,
         }
         return NULL;
     }
-    if (n > gh.txbuf_size) {
-        gh.txbuf = g_realloc(gh.txbuf, n);
-        gh.txbuf_size = n;
+    if (!gles_scratch(&gh.txbuf, &gh.txbuf_size, n, who)) {
+        return NULL;
     }
     if (gles_guest_rw(cpu, pixels, gh.txbuf, n, 0) != 0) {
         if (!gles_guest_fault_pending() && gles_refuse("guest-read:%s", who)) {
@@ -2873,13 +3007,13 @@ static void gles_trace_vertices(void)
     fprintf(stderr, "[gles]     positions type=0x%x size=%u stride=%u ptr=0x%08x:",
             a->type, a->size, a->stride, a->ptr);
     for (i = 0; i < n; i++) {
-        uint32_t stride = a->stride ? a->stride
-                                    : gles_type_size(a->type) * a->size;
+        uint32_t esz = gles_type_size(a->type) * a->size;
+        uint32_t stride = a->stride ? a->stride : esz;
         const uint8_t *src = a->vbo ? a->vbo->data + a->ptr : a->buf;
         size_t avail = a->vbo ? a->vbo->size - a->ptr : a->buf_size;
         const uint8_t *row = src + (size_t)stride * i;
 
-        if ((size_t)stride * i + stride > avail) {
+        if (!esz || !gles_range_ok((uint64_t)stride * i, esz, avail)) {
             break;
         }
         fprintf(stderr, " (");
@@ -3327,6 +3461,31 @@ static void gles_report_frame_pixels(const uint8_t *frame, size_t stride,
 static inline void gles_present_async_settle(void) {}
 #endif
 
+/*
+ * glReadPixels of a w x h block into `dst`, which holds `room` bytes, with rows
+ * padded to `align`. The host is given that alignment first, and nothing is read
+ * when the rows would not fit: every readback into a host buffer comes through
+ * here, so the buffer's size is checked where the host writes into it.
+ */
+static bool gles_read_pixels(GLint x, GLint y, uint32_t w, uint32_t h, GLenum fmt,
+                             GLenum type, size_t bpp, size_t align, void *dst, size_t room)
+{
+    size_t n = gles_image_bytes(w, h, bpp, align);
+
+    if (!dst || n > room) {
+        if (gles_refuse("readback:size")) {
+            fprintf(stderr, "[gles] readback of %ux%u does not fit its %zu-byte buffer; dropped\n",
+                    w, h, room);
+        }
+        return false;
+    }
+    if (n) {
+        glPixelStorei(GL_PACK_ALIGNMENT, align);
+        glReadPixels(x, y, w, h, fmt, type, dst);
+    }
+    return true;
+}
+
 static void gles_present_to_panel(void)
 {
     IPodTouchMachineState *nms;
@@ -3379,10 +3538,13 @@ static void gles_present_to_panel(void)
      * texture scanned out to the panel. */
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gh.fbo);
     glFinish();
-    glReadPixels(0, 0, GLES_FB_WIDTH, GLES_FB_HEIGHT, GL_RGBA,
-                 GL_UNSIGNED_BYTE, gh.readback);
+    bool read = gles_read_pixels(0, 0, GLES_FB_WIDTH, GLES_FB_HEIGHT, GL_RGBA,
+                                 GL_UNSIGNED_BYTE, 4, 1, gh.readback, gh.readback_size);
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,
                          gles_host_fbo(gh.bound_framebuffer));
+    if (!read) {
+        return;
+    }
 
     for (y = 0; y < GLES_FB_HEIGHT; y++) {
         uint8_t row[GLES_FB_MAX * 4];
@@ -4177,7 +4339,7 @@ static int gles_present_to_surface_impl(CPUState *cpu, uint32_t base, uint32_t s
                 const char *e = getenv("IT_GLES_PRESENT_TEST");
                 t = e ? atoi(e) : 0;
             }
-            if (t) {
+            if (t && (size_t)rw * rh * 2 <= gh.readback_size) {
                 if (sample) {
                     sample->path = 3;
                 }
@@ -4215,21 +4377,23 @@ static int gles_present_to_surface_impl(CPUState *cpu, uint32_t base, uint32_t s
          * row copy below becomes a memcpy. The swizzle loop was the largest
          * single item in the frame's host time.
          */
-        GLint pack_alignment;
-        glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
-        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        bool read;
         if (bpp == 2) {
             /* GL packs 565 itself, so there is no conversion loop here: the
              * result already matches CA's little-endian 'L565' layout. */
-            glReadPixels(0, 0, rw, rh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5,
-                         gh.readback);
+            read = gles_read_pixels(0, 0, rw, rh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5,
+                                    2, 1, gh.readback, gh.readback_size);
         } else if (bgra && !gles_swizzle) {
-            glReadPixels(0, 0, rw, rh, GL_BGRA,
-                         GLES_BGRA_READ_TYPE, gh.readback);
+            read = gles_read_pixels(0, 0, rw, rh, GL_BGRA, GLES_BGRA_READ_TYPE,
+                                    4, 1, gh.readback, gh.readback_size);
         } else {
-            glReadPixels(0, 0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, gh.readback);
+            read = gles_read_pixels(0, 0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE,
+                                    4, 1, gh.readback, gh.readback_size);
         }
-        glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
+        if (!read) {
+            glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gles_host_fbo(gh.bound_framebuffer));
+            return -1;
+        }
         gles_present_mark(sample, PRESENT_READBACK);
         /*
          * The old path, kept switchable so the two can be compared inside one
@@ -4329,6 +4493,7 @@ static void gles_buffer_destroy(gpointer p)
     GLESBuffer *b = p;
 
     if (b && !--b->refs) {
+        gles_buffer_bytes -= b->size;
         g_free(b->data);
         g_free(b);
     }
@@ -4607,7 +4772,7 @@ static int64_t gles_pvrtc_upload(CPUState *cpu, uint32_t target, uint32_t level,
     }
     gles_report_decode(format, w, h, dst);
     gles_texture_begin();
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    gles_unpack_tight();
     if (replace) {
         glTexSubImage2D(target, level, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, dst);
     } else {
@@ -4735,14 +4900,22 @@ static size_t gles_page_gen_len;
 /* GL calls run without the BQL, so the LCD's read can race the array growing. */
 static QemuSpin gles_page_gen_lock;              /* zero is unlocked */
 
-/* The RAM offset of the page at `va` as the calling process maps it now. */
+/* The RAM offset of the page at `va` as the calling process maps it now, and
+ * may read it: the page walk alone would hand an unprivileged caller kernel
+ * pages. (Not write: the SGX writes surfaces a process maps read-only.) */
 static bool gles_page_ram(CPUState *cpu, vaddr va, ram_addr_t *ram)
 {
     static MemoryRegion *logged[4];
     MemTxAttrs attrs = {};
-    hwaddr pa = cpu_get_phys_page_attrs_debug(cpu, va, &attrs), xlat, len = TARGET_PAGE_SIZE;
+    hwaddr pa, xlat, len = TARGET_PAGE_SIZE;
     MemoryRegion *mr;
+    void *host;
 
+    if (probe_access_flags(cpu_env(cpu), va, 0, MMU_DATA_LOAD, cpu_mmu_index(cpu, false),
+                           true, &host, 0) & TLB_INVALID_MASK) {
+        return false;
+    }
+    pa = cpu_get_phys_page_attrs_debug(cpu, va, &attrs);
     if (pa == -1) return false;
     WITH_RCU_READ_LOCK_GUARD() {
         mr = address_space_translate(cpu_get_address_space(cpu, cpu_asidx_from_attrs(cpu, attrs)),
@@ -4898,7 +5071,6 @@ static int gles_surface_upload(GLESSurface *s, uint32_t fmt, uint8_t *pixels)
 {
     unsigned target = s->target, w = s->width, h = s->height;
     GLenum glfmt = GL_BGRA, type = GL_UNSIGNED_BYTE;
-    GLint unpack;
     char fourcc[12];
 
     if (s->window) {                            /* rows reversed: the texture's first is memory's last */
@@ -4951,11 +5123,9 @@ static int gles_surface_upload(GLESSurface *s, uint32_t fmt, uint8_t *pixels)
         break;
     default:                    break;                  /* 'BGRA', and NV12 already converted to it */
     }
-    glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    gles_unpack_tight();
     gles_texture_begin();
     glTexImage2D(target, 0, GL_RGBA, w, h, 0, glfmt, type, pixels);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, unpack);
     if (gles_texture_end(target, 0, (GLESPVRTCLevel){0})) {
         gles_refuse("surface:upload:%s", gles_fourcc(s->format, fourcc));
         gles_debug_texture(target);
@@ -5372,7 +5542,7 @@ static bool gles_finish_flush(void)
 /* Texture `texture`'s pixels into its surface's guest memory. */
 static int gles_surface_writeback(CPUState *cpu, GLuint texture, GLESSurface *s)
 {
-    GLint pack = 4, framebuffer = 0;
+    GLint framebuffer = 0;
     bool rgb555 = s->format == GLES_SURFACE_RGB555;
     unsigned bpp = (s->format == GLES_SURFACE_RGB565 || rgb555) ? 2 : 4;
     size_t need = (size_t)s->width * s->height * 4;
@@ -5396,12 +5566,10 @@ static int gles_surface_writeback(CPUState *cpu, GLuint texture, GLESSurface *s)
     if (!gh.sync_fbo) gh.sync_fbo = gles_private_name(glIsFramebufferEXT);
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gh.sync_fbo);
     glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, s->target, texture, 0);
-    glGetIntegerv(GL_PACK_ALIGNMENT, &pack);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, s->width, s->height,
+    gles_read_pixels(0, 0, s->width, s->height,
         bpp == 2 && !rgb555 ? GL_RGB : s->format == GLES_SURFACE_RGBA32 ? GL_RGBA : GL_BGRA,
-        bpp == 2 && !rgb555 ? GL_UNSIGNED_SHORT_5_6_5 : GL_UNSIGNED_BYTE, pixels);
-    glPixelStorei(GL_PACK_ALIGNMENT, pack);
+        bpp == 2 && !rgb555 ? GL_UNSIGNED_SHORT_5_6_5 : GL_UNSIGNED_BYTE,
+        bpp == 2 && !rgb555 ? 2 : 4, 1, pixels, (size_t)s->width * s->height * 4);
     glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, s->target, 0, 0);
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, framebuffer);
     if (glGetError() != GL_NO_ERROR) {
@@ -5652,7 +5820,7 @@ static bool gles_es2_write(CPUState *cpu, uint32_t ptr, const void *data, size_t
 }
 
 /* Guest array of `n` 32-bit values; NULL if unreadable or absurd. */
-static void *gles_es2_fetch(CPUState *cpu, uint32_t ptr, uint32_t n)
+static void *gles_es2_fetch(CPUState *cpu, uint32_t ptr, uint64_t n)
 {
     void *buf;
 
@@ -5673,7 +5841,7 @@ static bool gles_es2_bind_attr(CPUState *cpu, unsigned i, uint32_t first,
 {
     GLESArray *a = &gh.attr[i];
     uint32_t esz = gles_type_size(a->type) * a->size, stride, c, k;
-    size_t need, off;
+    uint64_t need, off;
     const uint8_t *base;
     GLenum type = a->type;
 
@@ -5686,30 +5854,28 @@ static bool gles_es2_bind_attr(CPUState *cpu, unsigned i, uint32_t first,
         return false;
     }
     stride = a->stride ? a->stride : esz;
-    need = (size_t)stride * (count - 1) + esz;
-    off = (size_t)stride * first;
     if (a->vbo) {
-        if (a->ptr + off + need > a->vbo->size) {
+        if (!gles_array_range(a->ptr, stride, esz, first, count, a->vbo->size, &off, &need)) {
             gles_refuse("vbo-overrun:attrib%u", i);
             gles_debug_mark();
             return false;
         }
-        base = a->vbo->data + a->ptr + off;
+        base = a->vbo->data + off;
     } else {
-        if (need > a->buf_size) {
-            a->buf = g_realloc(a->buf, need);
-            a->buf_size = need;
+        if (!gles_array_range(a->ptr, stride, esz, first, count, UINT64_C(1) << 32, &off, &need) ||
+            !gles_scratch(&a->buf, &a->buf_size, need, "attrib")) {
+            gles_debug_mark();
+            return false;
         }
-        if (gles_guest_rw(cpu, a->ptr + (hwaddr)off, a->buf, need, 0)) {
+        if (gles_guest_rw(cpu, off, a->buf, need, 0)) {
             if (!gles_guest_fault_pending()) gles_refuse("guest-read:attrib");
             return false;
         }
         base = a->buf;
     }
     if (type == GLES_FIXED) {                   /* no desktop equivalent */
-        if ((size_t)count * a->size > a->fbuf_count) {
-            a->fbuf_count = (size_t)count * a->size;
-            a->fbuf = g_realloc(a->fbuf, a->fbuf_count * sizeof(float));
+        if (!gles_scratch(&a->fbuf, &a->fbuf_size, (size_t)count * a->size * sizeof(float), "attrib")) {
+            return false;
         }
         for (c = 0; c < count; c++) {
             for (k = 0; k < a->size; k++) {
@@ -5721,8 +5887,20 @@ static bool gles_es2_bind_attr(CPUState *cpu, unsigned i, uint32_t first,
         type = GL_FLOAT;
         stride = 0;
     }
-    glEnableVertexAttribArray(i);
+    /* The pointer first, and the array on only once the host has taken it: an
+     * enabled array the host refused keeps its previous pointer, which may be
+     * scratch this very call reallocated. */
+    if (gles_strict) {
+        while (glGetError() != GL_NO_ERROR) {
+        }
+    }
     glVertexAttribPointer(i, a->size, type, gh.attr_normalized[i], stride, base);
+    if (gles_strict && glGetError() != GL_NO_ERROR) {
+        gles_refuse("pointer-host:attrib:%u:0x%x", a->size, type);
+        gles_debug_mark();
+        return false;
+    }
+    glEnableVertexAttribArray(i);
     return true;
 }
 
@@ -5760,9 +5938,8 @@ static const uint8_t *gles_rebase_indices(const uint8_t *idx, uint32_t count,
     if (!lo) {
         return idx;
     }
-    if (idx != gh.ibuf && need > gh.ibuf_size) {
-        gh.ibuf = g_realloc(gh.ibuf, need);
-        gh.ibuf_size = need;
+    if (idx != gh.ibuf && !gles_scratch(&gh.ibuf, &gh.ibuf_size, need, "index")) {
+        return NULL;
     }
     for (i = 0; i < count; i++) {
         if (isz == 1) {
@@ -5795,16 +5972,15 @@ static int64_t gles_es2_draw(CPUState *cpu, bool elements, const uint32_t *a)
         }
         need = (size_t)count * isz;
         if (gh.element_buffer) {
-            if (iptr + need > gh.element_buffer->size) {
+            if (!gles_range_ok(iptr, need, gh.element_buffer->size)) {
                 gles_refuse("vbo-overrun:index");
                 gles_debug_mark();
                 return -1;
             }
             idx = gh.element_buffer->data + iptr;
         } else {
-            if (need > gh.ibuf_size) {
-                gh.ibuf = g_realloc(gh.ibuf, need);
-                gh.ibuf_size = need;
+            if (!gles_scratch(&gh.ibuf, &gh.ibuf_size, need, "index")) {
+                return -1;
             }
             if (!iptr || gles_guest_rw(cpu, iptr, gh.ibuf, need, 0)) {
                 if (!gles_guest_fault_pending()) gles_refuse("guest-read:index");
@@ -5813,6 +5989,9 @@ static int64_t gles_es2_draw(CPUState *cpu, bool elements, const uint32_t *a)
             idx = gh.ibuf;
         }
         idx = gles_rebase_indices(idx, count, isz, &first, &nverts);
+        if (!idx) {
+            return -1;
+        }
     } else {
         first = a[1];
         count = nverts = a[2];
@@ -6027,13 +6206,9 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
         break;
     }
     case 511:                                   /* index, size, type, norm, stride, ptr */
-        if (a[0] >= GLES_MAX_ATTRIBS) { *r = -1; break; }
-        gh.attr[a[0]].size = a[1];
-        gh.attr[a[0]].type = a[2];
-        gh.attr_normalized[a[0]] = a[3] != 0;
-        gh.attr[a[0]].stride = a[4];
-        gh.attr[a[0]].ptr = a[5];
-        gles_buffer_bind(&gh.attr[a[0]].vbo, gh.array_buffer);
+        if (a[0] >= GLES_MAX_ATTRIBS) { *r = gles_reject(GL_INVALID_VALUE); break; }
+        *r = gles_set_pointer(&gh.attr[a[0]], a[1], a[2], a[4], a[5]);
+        if (!*r) gh.attr_normalized[a[0]] = a[3] != 0;
         break;
     case 512: case 513:
         if (a[0] < GLES_MAX_ATTRIBS) gh.attr[a[0]].enabled = slot == 512;
@@ -6076,9 +6251,10 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
         g_autofree char *glsl = NULL;
         const char *p;
 
-        for (i = 0; strs && i < a[1]; i++) {
+        /* GLES_MAX_STRING bounds the whole source, not each of its parts. */
+        for (i = 0; strs && i < a[1] && src->len < GLES_MAX_STRING; i++) {
             g_autofree char *part = gles_es2_string(cpu, strs[i], lens ? lens[i] : -1);
-            g_string_append(src, part);
+            g_string_append_len(src, part, MIN(strlen(part), GLES_MAX_STRING - src->len));
         }
         glsl = gles_es2_glsl(src->str);
         g_string_free(src, true);
@@ -6128,7 +6304,8 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
     case 609: glUniform4i(a[0], a[1], a[2], a[3], a[4]); break;
     case 610 ... 617: {                         /* location, count, value* */
         unsigned n = vec_n[(slot - 610) % 4];
-        if (!(v = gles_es2_fetch(cpu, a[2], a[1] * n))) { *r = -1; break; }
+        /* count * n in 64 bits: the host reads count elements of what was fetched */
+        if (!(v = gles_es2_fetch(cpu, a[2], (uint64_t)a[1] * n))) { *r = -1; break; }
         switch (slot) {
         case 610: glUniform1fv(a[0], a[1], v); break;
         case 611: glUniform2fv(a[0], a[1], v); break;
@@ -6143,7 +6320,7 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
     }
     case 618 ... 620: {                         /* location, count, transpose, value* */
         unsigned n = slot == 618 ? 4 : slot == 619 ? 9 : 16;
-        if (!(v = gles_es2_fetch(cpu, a[3], a[1] * n))) { *r = -1; break; }
+        if (!(v = gles_es2_fetch(cpu, a[3], (uint64_t)a[1] * n))) { *r = -1; break; }
         if (slot == 618) glUniformMatrix2fv(a[0], a[1], a[2], v);
         if (slot == 619) glUniformMatrix3fv(a[0], a[1], a[2], v);
         if (slot == 620) glUniformMatrix4fv(a[0], a[1], a[2], v);
@@ -6375,43 +6552,19 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
      * keeps the draw path's cost at a single null check.
      */
     case GLES_SLOT_VERTEX_POINTER:              /* size,type,stride,ptr */
-        gh.vertex.size = a[0];
-        gh.vertex.type = a[1];
-        gh.vertex.stride = a[2];
-        gh.vertex.ptr = a[3];
-        gles_buffer_bind(&gh.vertex.vbo, gh.array_buffer);
-        return 0;
+        return gles_set_pointer(&gh.vertex, a[0], a[1], a[2], a[3]);
 
     case GLES_SLOT_POINT_SIZE_POINTER_OES:      /* type,stride,ptr */
-        gh.pointsize.type = a[0];
-        gh.pointsize.stride = a[1];
-        gh.pointsize.ptr = a[2];
-        gles_buffer_bind(&gh.pointsize.vbo, gh.array_buffer);
-        return 0;
+        return gles_set_pointer(&gh.pointsize, 1, a[0], a[1], a[2]);
 
     case GLES_SLOT_TEXCOORD_POINTER:
-        gh.texcoord[gh.client_active_unit].size = a[0];
-        gh.texcoord[gh.client_active_unit].type = a[1];
-        gh.texcoord[gh.client_active_unit].stride = a[2];
-        gh.texcoord[gh.client_active_unit].ptr = a[3];
-        gles_buffer_bind(&gh.texcoord[gh.client_active_unit].vbo, gh.array_buffer);
-        return 0;
+        return gles_set_pointer(&gh.texcoord[gh.client_active_unit], a[0], a[1], a[2], a[3]);
 
     case GLES_SLOT_COLOR_POINTER:               /* size,type,stride,ptr */
-        gh.color.size = a[0];
-        gh.color.type = a[1];
-        gh.color.stride = a[2];
-        gh.color.ptr = a[3];
-        gles_buffer_bind(&gh.color.vbo, gh.array_buffer);
-        return 0;
+        return gles_set_pointer(&gh.color, a[0], a[1], a[2], a[3]);
 
     case GLES_SLOT_NORMAL_POINTER:              /* type,stride,ptr */
-        gh.normal.size = 3;                     /* always, per GL */
-        gh.normal.type = a[0];
-        gh.normal.stride = a[1];
-        gh.normal.ptr = a[2];
-        gles_buffer_bind(&gh.normal.vbo, gh.array_buffer);
-        return 0;
+        return gles_set_pointer(&gh.normal, 3, a[0], a[1], a[2]);  /* always 3, per GL */
 
     case GLES_SLOT_DRAW_ARRAYS: {               /* mode, first, count */
         uint32_t mode = a[0], first = a[1], count = a[2];
@@ -6473,7 +6626,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
 
         need = (size_t)count * isz;
         if (gh.element_buffer) {
-            if (iptr + need > gh.element_buffer->size) {
+            if (!gles_range_ok(iptr, need, gh.element_buffer->size)) {
                 if (gles_refuse("vbo-overrun:index")) {
                     fprintf(stderr, "[gles] glDrawElements: %zu index bytes at "
                             "offset %u overrun a %zu-byte buffer\n", need, iptr,
@@ -6484,9 +6637,8 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             }
             idx = gh.element_buffer->data + iptr;
         } else {
-            if (need > gh.ibuf_size) {
-                gh.ibuf = g_realloc(gh.ibuf, need);
-                gh.ibuf_size = need;
+            if (!gles_scratch(&gh.ibuf, &gh.ibuf_size, need, "index")) {
+                return -1;
             }
             if (gles_guest_rw(cpu, iptr, gh.ibuf, need, 0) != 0) {
                 if (!gles_guest_fault_pending() && gles_refuse("guest-read:index")) {
@@ -6499,6 +6651,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         }
 
         idx = gles_rebase_indices(idx, count, isz, &minidx, &nverts);
+        if (!idx) {
+            return -1;
+        }
 
         if (!gles_refresh_surfaces(cpu)) return -1;
         bound = gles_bind_all_arrays(cpu, minidx, nverts);
@@ -6530,6 +6685,10 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
     }
 
     case GLES_SLOT_BIND_TEXTURE:                /* target, texture */
+        if (!gles_guest_name_ok(a[1])) {
+            gles_refuse("name:private:%u", slot);
+            return gles_reject(GL_INVALID_OPERATION);
+        }
         glBindTexture(a[0], a[1]);
         return 0;
 
@@ -6624,14 +6783,15 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         uint32_t fmt = a[6], type = a[7], pixels = a[8];
         size_t bpp = gles_texel_bytes(fmt, type), n;
         const uint8_t *px = NULL;   /* borrowed: points into gh.txbuf */
-        GLint row_length;
+        GLESUnpack unpack;
 
         if (!bpp) {
             gles_refuse("teximage:0x%x/0x%x", fmt, type);
             gles_debug_texture(target);
             return gles_reject(GL_INVALID_ENUM);
         }
-        n = gles_unpack_bytes(w, h, bpp, &row_length);
+        unpack = gles_unpack_layout(w, h, bpp);
+        n = unpack.bytes;
         if (n > GLES_MAX_TEX_BYTES) {
             gles_refuse("cap:glTexImage2D");
             gles_debug_texture(target);
@@ -6661,9 +6821,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
                 return -1;
             }
         }
-        /* The staging buffer reproduces the guest's row padding verbatim, so
-         * the host must unpack with the guest's alignment, not its own. */
-        gles_unpack_apply(pixels ? row_length : 0);
+        /* The staging buffer, guest texels or zeros, reproduces the guest's
+         * row layout verbatim, so the host unpacks it with that layout. */
+        gles_unpack_apply(&unpack);
         gles_texture_begin();
         glTexImage2D(target, level, ifmt == GL_BGRA ? GL_RGBA : ifmt, w, h,
                      border, fmt, gles_host_type(type), px);
@@ -6757,14 +6917,15 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         uint32_t w = a[4], h = a[5], fmt = a[6], type = a[7], pixels = a[8];
         size_t bpp = gles_texel_bytes(fmt, type), n;
         const uint8_t *px = NULL;   /* borrowed: points into gh.txbuf */
-        GLint row_length;
+        GLESUnpack unpack;
 
         if (!bpp) {
             gles_refuse("texsubimage:0x%x/0x%x", fmt, type);
             gles_debug_texture(target);
             return gles_reject(GL_INVALID_ENUM);
         }
-        n = gles_unpack_bytes(w, h, bpp, &row_length);
+        unpack = gles_unpack_layout(w, h, bpp);
+        n = unpack.bytes;
         if (n > GLES_MAX_TEX_BYTES) {
             gles_refuse("cap:glTexSubImage2D");
             gles_debug_texture(target);
@@ -6777,7 +6938,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         if (!px) {
             return -1;
         }
-        gles_unpack_apply(row_length);
+        gles_unpack_apply(&unpack);
         gles_texture_begin();
         glTexSubImage2D(target, level, xoff, yoff, w, h, fmt, gles_host_type(type), px);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
@@ -6807,7 +6968,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         }
         /* Decoded output is always tightly packed RGBA8, whatever the guest's
          * GL_UNPACK_ALIGNMENT says about its own compressed bytes. */
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        gles_unpack_tight();
 
         if (gles_is_paletted(ifmt)) {
             unsigned idx_bits, entry_bytes;
@@ -6906,6 +7067,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
                                 n * sizeof(GLuint), 0) != 0) {
             return -1;
         }
+        if (!gles_guest_names(ids, n)) {
+            gles_refuse("name:private:%u", slot);
+        }
         if (gh.surfaces) {
             for (unsigned i = 0; i < n; i++) {
                 g_hash_table_remove(gh.surfaces, GUINT_TO_POINTER(ids[i]));
@@ -6993,11 +7157,13 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             gles_refuse("buffer:unbound:0x%x", a[0]);
             return -1;
         }
-        if (n > GLES_MAX_BUFFER_BYTES) {
+        if (n > GLES_MAX_BUFFER_BYTES ||
+            gles_buffer_bytes - b->size + n > GLES_MAX_BUFFER_TOTAL) {
             gles_refuse("cap:glBufferData");
-            return -1;
+            return gles_reject(GL_OUT_OF_MEMORY);
         }
         b->data = g_realloc(b->data, n ? n : 1);
+        gles_buffer_bytes += n - b->size;
         b->size = n;
         b->usage = a[3];
         b->map_va = b->map_size = 0;        /* new storage ends a mapping */
@@ -7464,7 +7630,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
     case GLES_SLOT_IS_ENABLED:
         return glIsEnabled(a[0]);
     case GLES_SLOT_IS_TEXTURE:
-        return glIsTexture(a[0]);
+        return gles_guest_name_ok(a[0]) && glIsTexture(a[0]);
     case GLES_SLOT_LIGHT_MODELF:                /* pname, param */
         glLightModelf(a[0], gles_f(a[1]));
         return 0;
@@ -7805,14 +7971,12 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             gles_refuse("cap:glReadPixels");
             return gles_reject(GL_INVALID_VALUE);
         }
-        if (n > gh.txbuf_size) {
-            gh.txbuf = g_realloc(gh.txbuf, n);
-            gh.txbuf_size = n;
+        if (!gles_scratch(&gh.txbuf, &gh.txbuf_size, n, "glReadPixels")) {
+            return gles_reject(GL_OUT_OF_MEMORY);
         }
         /* Padding and failed host reads must not expose a previous upload. */
         memset(gh.txbuf, 0, n);
-        glPixelStorei(GL_PACK_ALIGNMENT, (GLint)align);
-        glReadPixels(x, y, w, h, fmt, gles_host_type(type), gh.txbuf);
+        gles_read_pixels(x, y, w, h, fmt, gles_host_type(type), px, align, gh.txbuf, n);
         gles_guest_rw(cpu, dst, gh.txbuf, n, 1);
         return 0;
     }
@@ -7973,10 +8137,11 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
 
     /* Object predicates must distinguish generated names from bound objects. */
     case GLES_SLOT_IS_RENDERBUFFER:
-        return glIsRenderbufferEXT(a[0]);
+        return gles_guest_name_ok(a[0]) && glIsRenderbufferEXT(a[0]);
     case GLES_SLOT_IS_FRAMEBUFFER:
         /* Zero is the default drawable, not a framebuffer object. */
-        return a[0] && (gles_is_drawable(a[0]) || glIsFramebufferEXT(a[0]));
+        return a[0] && gles_guest_name_ok(a[0]) &&
+               (gles_is_drawable(a[0]) || glIsFramebufferEXT(a[0]));
     case GLES_SLOT_GENERATE_MIPMAP:
         return gles_generate_mipmap(a[0]);
     case GLES_SLOT_COLOR_MASK:
@@ -8008,11 +8173,19 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
     }
 
     case GLES_SLOT_BIND_RENDERBUFFER:    /* target, renderbuffer */
+        if (!gles_guest_name_ok(a[1])) {
+            gles_refuse("name:private:%u", slot);
+            return gles_reject(GL_INVALID_OPERATION);
+        }
         gh.bound_renderbuffer = a[1];
         glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, a[1]);
         return 0;
 
     case GLES_SLOT_BIND_FRAMEBUFFER:     /* target, framebuffer */
+        if (!gles_guest_name_ok(a[1])) {
+            gles_refuse("name:private:%u", slot);
+            return gles_reject(GL_INVALID_OPERATION);
+        }
         if (gles_sync_surface(cpu)) return -1;
         /* Back to the default framebuffer: the offscreen passes are done. 3.1.3's
          * CoreAnimation never flushes (it double-buffers its display surfaces and
@@ -8051,7 +8224,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             if (fw > 1024) { fw = 1024; }
             if (fh > 1024) { fh = 1024; }
             px = g_malloc0((size_t)fw * fh * 4);
-            glReadPixels(0, 0, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            gles_read_pixels(0, 0, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE, 4, 1, px, (size_t)fw * fh * 4);
             cnt = (unsigned)(fw * fh);
             for (i = 0; i < cnt; i++) {
                 r += px[i * 4]; g += px[i * 4 + 1];
@@ -8119,6 +8292,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         }
         ids = g_new0(GLuint, n);
         gles_guest_rw(cpu, a[1], (uint8_t *)ids, n * sizeof(GLuint), 0);
+        if (!gles_guest_names(ids, n)) {
+            gles_refuse("name:private:%u", slot);
+        }
         if (slot == GLES_SLOT_DELETE_RENDERBUFFERS) {
             for (i = 0; i < n; i++) {
                 g_hash_table_remove(gh.rb_sized, GUINT_TO_POINTER(ids[i]));
@@ -8306,7 +8482,8 @@ static int64_t gles_context_operation(unsigned slot, unsigned ctx, unsigned argc
         gles_groups = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
     if (slot == GLES_OP_NEW_SHAREGROUP) {
-        if (argc || gles_handle == UINT32_MAX) return -1;
+        if (argc || gles_handle == UINT32_MAX ||
+            g_hash_table_size(gles_groups) >= GLES_MAX_CONTEXTS) return -1;
         GLESGroup *group = g_new0(GLESGroup, 1);
         group->refs = 1;
         group->buffers = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, gles_buffer_destroy);
@@ -8318,7 +8495,8 @@ static int64_t gles_context_operation(unsigned slot, unsigned ctx, unsigned argc
         return handle;
     }
     if (slot == GLES_OP_NEW_CONTEXT) {
-        if ((argc != 1 && argc != 2) || gles_handle == UINT32_MAX) return -1;
+        if ((argc != 1 && argc != 2) || gles_handle == UINT32_MAX ||
+            g_hash_table_size(gles_contexts) >= GLES_MAX_CONTEXTS) return -1;
         if (argc == 2 && args[1] != 1 && args[1] != 2) return -1;
 #ifdef GLES_HOST_ANGLE
         if (argc == 2 && args[1] != 1) {

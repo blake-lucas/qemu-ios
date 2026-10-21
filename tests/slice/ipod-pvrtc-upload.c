@@ -4,6 +4,8 @@
  *
  * SLICE:types hw/arm/gles-host.c range } GLESSurface; | typedef struct {\n#if
  * SLICE hw/arm/gles-host.c range #define PVRTC_RGB_4BPP | /*\n * The paletted formats:
+ * SLICE hw/arm/gles-host.c define GLES_PRIVATE_NAME
+ * SLICE hw/arm/gles-host.c fn gles_unpack_tight gles_guest_name_ok gles_guest_names
  * SLICE hw/arm/gles-host.c range static GLESPVRTC *gles_pvrtc_texture( | /* IOSurface-backed textures
  * SLICE:cases hw/arm/gles-host.c range case GLES_SLOT_COMPRESSED_TEX_SUB_IMAGE_2D: | case GLES_SLOT_ALPHA_FUNC:
  * PKG glib-2.0

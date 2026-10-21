@@ -111,7 +111,10 @@ int gles_guest_rw(CPUState *cpu, vaddr va, void *buf, size_t len, bool write)
     if (len && !gf.pending && guest_rw_ram(cpu, va, buf, len, write)) {
         return 0;
     }
-    if (gf.armed && len) {
+    /* The debug access below ignores protection, so every page is probed at the
+     * caller's privilege first, armed or not: an unarmed call (a batch) fails
+     * where the guest's own access would fault rather than raise it. */
+    if (len) {
         CPUArchState *env = cpu_env(cpu);
         MMUAccessType type = write ? MMU_DATA_STORE : MMU_DATA_LOAD;
         int idx = cpu_mmu_index(cpu, false);
@@ -124,6 +127,9 @@ int gles_guest_rw(CPUState *cpu, vaddr va, void *buf, size_t len, bool write)
         for (;;) {
             if (probe_access_flags(env, p, 0, type, idx, true, &host, 0) &
                 TLB_INVALID_MASK) {
+                if (!gf.armed) {
+                    return -1;
+                }
                 gf.pending = true;
                 gf.va = p;
                 gf.type = type;
@@ -195,7 +201,7 @@ static int64_t gles_run_batch(CPUState *cpu, qc_gles_args_t *a)
     uint32_t n = a->args[1], i = 0;
 
     if (a->argc != 2 || n > GLES_BATCH_MAX_WORDS ||
-        cpu_memory_rw_debug(cpu, a->args[0], (uint8_t *)buf, n * 4, 0) != 0) {
+        gles_guest_rw(cpu, a->args[0], (uint8_t *)buf, n * 4, 0) != 0) {
         gles_bad_slots++;
         gles_host_refuse("bad-call:batch");
         return -1;

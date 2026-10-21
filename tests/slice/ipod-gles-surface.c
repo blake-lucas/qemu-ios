@@ -7,6 +7,7 @@
  * SLICE hw/arm/gles-host.c fn gles_reject
  * SLICE hw/arm/gles-host.c range #define GLES_PRIVATE_NAME | static bool gles_is_drawable(
  * SLICE hw/arm/gles-host.c range static GLESPVRTC *gles_pvrtc_texture( | static int64_t gles_generate_mipmap(
+ * SLICE:helpers hw/arm/gles-host.c fn gles_image_bytes gles_read_pixels
  * SLICE:helpers hw/arm/gles-host.c range static bool gles_surface_range( | /* ------------------------------------------------------------ ES 2.0
  * SLICE:shim contrib/it-gles/mbxshim.c range static char *put_dec( | /* A stub that IS the implementation
  * SLICE:shim contrib/it-gles/mbxshim.c range static int guest_fault_read( | static unsigned texture_bytes(
@@ -44,6 +45,16 @@ static vaddr unmapped_lo, unmapped_hi;      /* pages the process no longer maps 
 static hwaddr cpu_get_phys_page_attrs_debug(CPUState *c, vaddr va, MemTxAttrs *attrs)
 { return va >= 0x10000000 && va < 0x10000000 + sizeof(ram) && !(va >= unmapped_lo && va < unmapped_hi) ? va : (hwaddr)-1; }
 static int cpu_asidx_from_attrs(CPUState *c, MemTxAttrs attrs) { return 0; }
+/* the caller's MMU: pages in [kernel_lo, kernel_hi) are mapped but not readable at its privilege */
+typedef int MMUAccessType;
+enum { MMU_DATA_LOAD, MMU_DATA_STORE };
+#define TLB_INVALID_MASK 1
+static vaddr kernel_lo, kernel_hi;
+static void *cpu_env(CPUState *c) { return NULL; }
+static int cpu_mmu_index(CPUState *c, bool ifetch) { return 0; }
+static int probe_access_flags(void *env, vaddr va, int size, MMUAccessType type, int idx, bool nonfault,
+                              void **host, uintptr_t ra)
+{ return va >= kernel_lo && va < kernel_hi ? TLB_INVALID_MASK : 0; }
 static AddressSpace *cpu_get_address_space(CPUState *c, int i) { return NULL; }
 static MemoryRegion *address_space_translate(AddressSpace *as, hwaddr pa, hwaddr *xlat, hwaddr *len,
                                              bool w, MemTxAttrs attrs)
@@ -370,5 +381,12 @@ int main(void)
     munmap(fault_pages,16384);
     g_hash_table_destroy(gh.surfaces);
     CGLSetCurrentContext(NULL);CGLDestroyContext(context);
-    puts("PASS: IOSurface page faults and ABI, native textured draw, NV12 ranges, deferred FBO writeback, ES 2.0 refresh and bounds, dirty-page refresh, detached copies, IOSurface page records, unmapped surfaces keep their pixels");
+    /* A surface page the caller may not read (a kernel page under a user process) is not found by its page walk. */
+    {
+        ram_addr_t at;
+        kernel_lo = 0x10004000; kernel_hi = 0x10005000;
+        assert(!gles_page_ram(NULL, 0x10004000, &at) && gles_page_ram(NULL, 0x10003000, &at) && at == 0x3000);
+        kernel_lo = kernel_hi = 0;
+    }
+    puts("PASS: IOSurface page faults and ABI, native textured draw, NV12 ranges, deferred FBO writeback, ES 2.0 refresh and bounds, dirty-page refresh, detached copies, IOSurface page records, unmapped surfaces keep their pixels, unreadable pages are not surfaces");
 }
