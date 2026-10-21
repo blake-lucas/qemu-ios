@@ -467,15 +467,6 @@ static qemu_irq ipad1_irq(IPad1MachineState *s, int irq)
  * keyboard services are replaced by the USB keyboard here
  * (docs/ipad1/guest-services.md).
  */
-static int ipad1_agent_copy(void *opaque, uint32_t address, uint8_t *data,
-                            size_t length, bool write)
-{
-    if (length && length - 1 > UINT32_MAX - address) {
-        return -1;
-    }
-    return cpu_memory_rw_debug(opaque, address, data, length, write);
-}
-
 static void ipad1_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
@@ -518,7 +509,7 @@ static void ipad1_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri,
                                    q.args.ag.buffer_guest_ptr, q.args.ag.offset,
                                    q.args.ag.length,
                                    qemu_clock_get_ms(QEMU_CLOCK_REALTIME),
-                                   candidate, ipad1_agent_copy, cs);
+                                   candidate, guest_copy, cs);
         err = q.retval < 0 ? EINVAL : 0;
         break;
     }

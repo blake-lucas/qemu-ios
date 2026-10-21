@@ -143,7 +143,10 @@ int64_t guest_pkg_op(GuestPackage *p, unsigned op, uint64_t token,
         return window(p->offer, p->offer_len, address, offset, length,
                       copy, opaque);
     case QC_PKG_READ:
-        if (!p->offer || token >= GUEST_PKG_ENTRIES || !p->paths[token]) {
+        if (token >= GUEST_PKG_ENTRIES) {
+            return -1;
+        }
+        if (!p->offer || !p->paths[token]) {
             return -1;
         }
         if (p->file_idx != (int)token) {
@@ -243,14 +246,6 @@ char *guest_pkg_status(void)
 }
 
 #ifndef GUEST_PKG_CORE_ONLY
-static int pkg_copy(void *opaque, uint32_t address, uint8_t *data, size_t len,
-                    bool write)
-{
-    if (len && len - 1 > UINT32_MAX - address) {
-        return -1;
-    }
-    return cpu_memory_rw_debug(opaque, address, data, len, write);
-}
 
 bool guest_pkg_call(GuestPackage *p, CPUState *cpu, qemu_call_t *q,
                     int32_t *err)
@@ -266,7 +261,7 @@ bool guest_pkg_call(GuestPackage *p, CPUState *cpu, qemu_call_t *q,
     }
     q->retval = guest_pkg_op(p, q->call_number, q->args.ag.token,
                              q->args.ag.buffer_guest_ptr, q->args.ag.offset,
-                             q->args.ag.length, pkg_copy, cpu);
+                             q->args.ag.length, guest_copy, cpu);
     *err = q->retval < 0 ? EINVAL : 0;
     return true;
 }

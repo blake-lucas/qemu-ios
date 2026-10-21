@@ -609,14 +609,6 @@ static void s5l8920_i2c_create(S5L8920MachineState *s, int n)
  * (contrib/gles-public) uses, as ipad1's: GLES, guest packages (which also
  * answer the shim's hello), the pasteboard and the guest agent (it_agent).
  */
-static int s5l8920_agent_copy(void *opaque, uint32_t address, uint8_t *data, size_t length, bool write)
-{
-    if (length && length - 1 > UINT32_MAX - address) {
-        return -1;
-    }
-    return cpu_memory_rw_debug(opaque, address, data, length, write);
-}
-
 static void s5l8920_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
 {
     CPUState *cs = env_cpu(env);
@@ -656,7 +648,7 @@ static void s5l8920_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t
         }
         q.retval = ipod_agent_call(s->agent, q.call_number, q.args.ag.token, q.args.ag.buffer_guest_ptr,
                                    q.args.ag.offset, q.args.ag.length, qemu_clock_get_ms(QEMU_CLOCK_REALTIME),
-                                   candidate, s5l8920_agent_copy, cs);
+                                   candidate, guest_copy, cs);
         err = q.retval < 0 ? EINVAL : 0;
         break;
     }
