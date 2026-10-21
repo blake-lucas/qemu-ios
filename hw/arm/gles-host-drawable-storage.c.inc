@@ -15,6 +15,7 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
 #ifdef GLES_HOST_AHB
     GLESAhb ahb = { .image = EGL_NO_IMAGE_KHR };
 #endif
+    uint64_t charged;
 
     if (!width || !height || width > 2048 || height > 2048) {
         gles_refuse("drawable:size:%ux%u", width, height);
@@ -22,8 +23,12 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
     }
     gh.drawable_announced = true;
     if (width == gh.drawable_width && height == gh.drawable_height) return 0;
+    if (!gles_charge_drawable(width, height, &charged)) {
+        return gles_reject(GL_OUT_OF_MEMORY);
+    }
     readback = g_try_malloc0_n((size_t)width * height, 4);
     if (!readback) {
+        gles_charge(gles_charge_table(true), gles_charge_key(GLES_CHARGE_DRAWABLE, 0, 0, 0), charged, NULL);
         gles_refuse("drawable:memory");
         return gles_reject(GL_OUT_OF_MEMORY);
     }
@@ -97,6 +102,7 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
         gles_drawable_depth_delete(depth, stencil);
         glDeleteFramebuffersEXT(1, &fbo);
         g_free(readback);
+        gles_charge(gles_charge_table(true), gles_charge_key(GLES_CHARGE_DRAWABLE, 0, 0, 0), charged, NULL);
     }
     glBindTexture(GL_TEXTURE_2D, texture);
     glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, renderbuffer);
