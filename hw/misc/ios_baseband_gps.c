@@ -132,7 +132,7 @@ bool ios_bb_gps_command(IosBbGps *g, int64_t now_ms, int ch, const char *cmd)
             f = f ? f + 1 : NULL;
         }
         if (f) {
-            interval = atoi(f);
+            interval = MIN(atoi(f), 86400);     /* a day at most: * 1000 can't wrap */
         }
         g->ch = ch;
         g->interval_ms = (interval > 0 ? interval : 1) * 1000;

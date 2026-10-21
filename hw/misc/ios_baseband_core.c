@@ -732,7 +732,7 @@ static void chan_printf(IosBbCore *bb, int ch, const char *fmt, ...)
     if (n < 0) {
         return;
     }
-    chan_write(bb, ch, buf, n);
+    chan_write(bb, ch, buf, MIN(n, (int)sizeof(buf) - 1));     /* n is the untruncated length */
 }
 
 /* ------------------------------------------------------------------------ GSM 03.38 */
@@ -824,7 +824,7 @@ static bool gsm7_encodable(const char *s)
  * Septets form a bit stream, least-significant bit first, into bytes the same
  * way: "Hi" -> C8 34, "Hello" -> C8 32 9B FD 06 (verified against
  * CommCenter's own packer, see the calls-sms doc). */
-static unsigned gsm7_pack(const char *s, uint8_t *out, unsigned max)
+static unsigned gsm7_pack(const char *s, uint8_t *out, unsigned max, unsigned *nsept)
 {
     uint16_t septets[512];
     unsigned ns = 0, bitpos = 0, no = 0;
@@ -844,6 +844,7 @@ static unsigned gsm7_pack(const char *s, uint8_t *out, unsigned max)
         }
         s += n;
     }
+    *nsept = ns;                    /* an escaped character is two */
     memset(out, 0, max);
     for (unsigned i = 0; i < ns; i++) {
         for (unsigned b = 0; b < 7; b++) {
@@ -908,6 +909,8 @@ static unsigned utf8_to_ucs2be(const char *s, uint8_t *out, unsigned max)
         unsigned c = (unsigned char)*s++;
         if (c < 0x80) {
             /* plain */
+        } else if (!s[0] || ((c & 0xf0) == 0xe0 && !s[1])) {
+            break;                  /* a sequence cut short by the string's end */
         } else if ((c & 0xe0) == 0xc0) {
             c = ((c & 0x1f) << 6) | (*s++ & 0x3f);
         } else if ((c & 0xf0) == 0xe0) {
@@ -1122,11 +1125,14 @@ static unsigned sms_build_deliver(IosBbCore *bb, const char *number, const char 
     } else {
         uint8_t ud[180];
 
-        unsigned un = gsm7_pack(text, ud, sizeof(ud));
-        if (strlen(text) > 160) {
+        unsigned nsept;
+        unsigned un = gsm7_pack(text, ud, sizeof(ud), &nsept);
+        /* 160 septets (140 octets) is one SMS; escapes count twice, so the
+         * character count alone could overrun oct[]. */
+        if (nsept > 160 || un > 140) {
             return 0;
         }
-        oct[n++] = (uint8_t)strlen(text);        /* septets */
+        oct[n++] = nsept;                        /* septets */
         memcpy(oct + n, ud, un);
         n += un;
     }
@@ -1186,7 +1192,8 @@ static void sms_parse_submit(IosBbCore *bb, const uint8_t *p, unsigned n)
 
     switch ((dcs >> 2) & 0x3) {
     case 0:                                      /* GSM 7-bit */
-        gsm7_unpack(p + pos, udl, bb->last_mo_text, sizeof(bb->last_mo_text));
+        /* the guest's UDL counts septets: no more than the octets it sent hold */
+        gsm7_unpack(p + pos, MIN(udl, udoct * 8 / 7), bb->last_mo_text, sizeof(bb->last_mo_text));
         break;
     case 1:                                      /* 8-bit */
         udoct = udl < udoct ? udl : udoct;
@@ -1976,7 +1983,7 @@ static void radio_nvram_block(IosBbCore *bb, int ch, int block)
     char hex[2 * IOS_BB_NVRAM_BLOCK + 1], line[sizeof(hex) + 48];
     int n;
 
-    if (block < 0 || (block + 1) * IOS_BB_NVRAM_BLOCK > IOS_BB_NVRAM_SIZE) {
+    if (block < 0 || block >= IOS_BB_NVRAM_SIZE / IOS_BB_NVRAM_BLOCK) {   /* no product to overflow */
         chan_printf(bb, ch, "\r\n+XDRV: 9,1,1,%d,\r\n\r\nOK\r\n", block);
         return;
     }
@@ -2249,7 +2256,7 @@ static void at_command_line(IosBbCore *bb, int ch, const char *line)
         fprintf(stderr, "%" PRId64 " ios-bb: ch%d > at%s\n", bb->now_ms, ch, line);
     }
     /* iBoot ends its commands with ';' ("at+cgsn;"); only a dial string needs one. */
-    if (n && line[n - 1] == ';' && line[0] != 'd') {
+    if (n && line[n - 1] == ';' && line[0] != 'd') {     /* bounded: n is strlen(line), nonzero */
         n--;
     }
     n = MIN(n, sizeof(buf) - 1);
@@ -2356,7 +2363,7 @@ static void at_command_line(IosBbCore *bb, int ch, const char *line)
          * period + 20 s and resets the baseband ("modem reset: temperature update
          * timeout") unless +XDRVI: 5,17 keeps arriving. The iPhone 4 sends 5,16,0 (off).
          */
-        int n = atoi(arg);
+        int n = MIN(atoi(arg), 86400);           /* a day at most: n * 1000 can't wrap */
 
         bb->temp_period_ms = n > 0 ? n * 1000 : 0;
         bb->temp_ch = ch;

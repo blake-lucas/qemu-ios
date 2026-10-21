@@ -560,7 +560,7 @@ void mrvl8686_writeb(Mrvl8686State *s, uint32_t addr, uint8_t val)
 void mrvl8686_read(Mrvl8686State *s, uint32_t addr, uint8_t *buf, uint32_t len)
 {
     if (addr != MRVL_IOPORT) {
-        memset(buf, 0, len);
+        memset(buf, 0, len);        /* bounded: len is the caller's buffer, buf's size */
         return;
     }
     mrvl_card_read(&s->card, buf, len);

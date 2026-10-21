@@ -31,6 +31,7 @@
 
 #define ISP_CPU_SIZE    0x1000
 #define ISP_SIZE        0xd6000
+#define ISP_OUT_MAX     4096        /* output width and height */
 
 /* ISP CPU block */
 #define CPU_CONTROL     0x100       /* 0x10 at ISP_ARMReset */
@@ -149,7 +150,7 @@ static void isp_mailbox(S5L8930ISPState *s)
             continue;
         }
         uint32_t w = s->cpu[CPU_MBX0 / 4 + i];
-        uint8_t cat = w >> 16, reg = w >> 8, val = w;
+        uint8_t cat = (w >> 16) & 0xff, reg = (w >> 8) & 0xff, val = w;   /* file[] is 256 x 256 */
 
         if (write) {
             s->file[cat][reg] = val;
@@ -302,7 +303,8 @@ static void isp_frame(void *opaque)
     if (!r[ISP_OUT_ENABLE / 4] || !y) {
         return;     /* stopped: no buffer, no frame */
     }
-    if (w && h && y > 0x1000) {
+    /* The size is mailbox bytes the guest wrote: no larger than a sensor (5 MP) makes. */
+    if (w && h && w <= ISP_OUT_MAX && h <= ISP_OUT_MAX && y > 0x1000) {
         if (need > s->pic_size) {
             s->pic = g_realloc(s->pic, need);
             s->pic_size = need;

@@ -300,13 +300,16 @@ static void pl192_write(void *opaque, hwaddr offset, uint64_t value, unsigned si
                 pc, s->rawintr, s->current, s->current_highest, s->priority,
                 s->stack_i, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
+    /* A guest write must not end the process: log and drop it. */
     if (offset & 3) {
-        hw_error("pl192: bad write offset (1) " HWADDR_FMT_plx "\n", offset);
+        qemu_log_mask(LOG_GUEST_ERROR, "pl192: bad write offset " HWADDR_FMT_plx "\n", offset);
+        return;
     }
 
     if (offset >= 0xfe0 && offset < 0x1000) {
-        hw_error("pl192: attempt to write to a read-only register (offset = "
-                 HWADDR_FMT_plx ")\n", offset);
+        qemu_log_mask(LOG_GUEST_ERROR, "pl192: write to read-only register " HWADDR_FMT_plx "\n",
+                      offset);
+        return;
     }
     if (offset >= 0x100 && offset < 0x180) {
         s->vect_addr[(offset - 0x100) >> 2] = value;
@@ -326,8 +329,8 @@ static void pl192_write(void *opaque, hwaddr offset, uint64_t value, unsigned si
             return;
         case PL192_FIQSTATUS:
         case PL192_RAWINTR:
-            hw_error("pl192: attempt to write to a read-only register (offset = "
-                     HWADDR_FMT_plx ")\n", offset);
+            qemu_log_mask(LOG_GUEST_ERROR, "pl192: write to read-only register " HWADDR_FMT_plx "\n",
+                          offset);
             break;
         case PL192_INTSELECT:
             s->intselect = value;

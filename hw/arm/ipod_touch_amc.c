@@ -118,6 +118,7 @@
  */
 
 #include "hw/arm/ipod_touch_amc.h"
+#include "hw/arm/ipod_touch_guard.h"
 #include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
 #include "hw/core/cpu.h"
@@ -469,6 +470,7 @@ static bool amc_decode_dma(IPodTouchAMCState *s, uint32_t head)
             /* The HE-AAC program's rate is the core's; SBR doubles it. The
              * raw FIL elements carry SBR side data. Any other program has
              * AAC-LC's output contract, so it gets the core alone. */
+            /* bounded: amc_aac_rate returns -1 (refused above) or an amc_rates index */
             d->rate = amc_rates[frequency] * (program == AMC_HEAAC ? 2 : 1);
             unsigned config_size = program == AMC_HEAAC ? 7 : 5;
             d->codec->extradata = av_mallocz(config_size + AV_INPUT_BUFFER_PADDING_SIZE);
@@ -1302,6 +1304,12 @@ static bool amc_engine0(IPodTouchAMCState *s, uint32_t head)
         }
         switch ((control >> 2) & 3) {
         case 2:     /* AMC register */
+            /* Inside the register file, and never the list's own head: a link
+             * that wrote AMC_E0_HEAD would run a list from inside this one. */
+            if (!IT_RANGE("amc", dst, bytes, sizeof(s->regs)) || (dst & 3) ||
+                dst == AMC_E0_HEAD) {
+                return false;
+            }
             for (unsigned i = 0; i < bytes; i += 4) {
                 ipod_touch_amc_write(s, dst + i, ldl_le_p(data + i), 4);
             }

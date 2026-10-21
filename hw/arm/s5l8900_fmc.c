@@ -391,6 +391,15 @@ static void s5l8900_fmc_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             }
             return;
         }
+        /* FMDNUM is the guest's: a count outside the page, or a page past the
+         * queued list, ends the program instead of indexing past the buffer. */
+        if (s->fmdnum == 0 || s->fmdnum > FMC_BYTES_PER_PAGE || (s->fmdnum & 3) ||
+            s->prog_index >= MIN(s->prog_count, FMC_MAX_LIST)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "[fmc] program word with FMDNUM %u, page %u of %u\n",
+                          s->fmdnum, s->prog_index, s->prog_count);
+            s->is_writing = false;
+            return;
+        }
         ((uint32_t *)s->page_buffer)[(FMC_BYTES_PER_PAGE - s->fmdnum) / 4] = val;
         s->fmdnum -= 4;
         if (s->fmdnum == 0) {

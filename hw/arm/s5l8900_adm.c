@@ -118,8 +118,9 @@ static void adm_run_command(S5L8900ADMState *s)
         fmc->reading_multiple_pages = true;
         for (unsigned op = 0; op < num_pages / nb; op++, page++) {
             for (unsigned i = 0; i < nb; i++) {
+                /* bounded: op * nb + i < num_pages <= FMC_MAX_LIST */
                 fmc->pages_to_read[op * nb + i] = page;
-                fmc->banks_to_read[op * nb + i] = i;
+                fmc->banks_to_read[op * nb + i] = i;  /* bounded: as above */
             }
         }
         fmc->fmdnum = num_pages * FMC_BYTES_PER_PAGE;

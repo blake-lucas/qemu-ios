@@ -418,6 +418,7 @@ bool ipod_touch_aes_set_gid_blobs(const uint8_t *data, size_t size)
     }
     g_free(it_gid_extra);
     it_gid_extra_count = size / (2 * IT_AES_GID_BLOB_SIZE);
+    /* bounded: the host's gid-blobs file, not the guest; one entry per 2 blobs of it */
     it_gid_extra = g_malloc(it_gid_extra_count * sizeof(ITGidBlob));
     for (size_t i = 0; i < it_gid_extra_count; i++) {
         it_gid_extra[i].name = "gid-blobs";
@@ -752,15 +753,16 @@ static void ipod_touch_aes_write(void *opaque, hwaddr offset, uint64_t value, un
                     error_report("This firmware image is not in the built-in GID "
                                  "blob table or the gid-blobs file; a device made "
                                  "by firmwarekit create ships gid-blobs.bin.");
-                    exit(1);
-                }
-
-                if (it_aes_debug()) {
+                } else if (it_aes_debug()) {
                     TRACE_PRINTF(trace_ipod_touch_aes_log, "ipodtouch.aes: GID KBAG matched \"%s\"\n", blob->name);
                 }
 
+                /* An unknown KBAG decrypts to zeros, which the boot stage reading it then
+                 * refuses: the guest picks the input, so it must not end the process. */
                 memset(buf, 0, IT_AES_DMA_CHUNK);
-                memcpy(buf, blob->plain, MIN(aesop->insize, (uint32_t)IT_AES_GID_BLOB_SIZE));
+                if (blob) {
+                    memcpy(buf, blob->plain, MIN(aesop->insize, (uint32_t)IT_AES_GID_BLOB_SIZE));
+                }
             }
             else {
                 aes_legacy_dma(aesop, AES_DECRYPT);

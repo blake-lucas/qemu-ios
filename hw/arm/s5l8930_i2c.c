@@ -556,7 +556,7 @@ static int d1815_event(I2CSlave *i2c, enum i2c_event event)
 static uint8_t d1815_recv(I2CSlave *i2c)
 {
     S5L8930D1815State *s = S5L8930_D1815(i2c);
-    uint8_t reg = s->reg++;
+    uint8_t reg = s->reg++ & 0xff;          /* regs[] covers every uint8_t */
     uint8_t v = s->regs[reg];
 
     switch (reg) {
@@ -589,7 +589,7 @@ static int d1815_send(I2CSlave *i2c, uint8_t data)
         s->reg = data;
         return 0;
     }
-    reg = s->reg++;
+    reg = s->reg++ & 0xff;                  /* regs[] covers every uint8_t */
     switch (reg) {
     case PMU_EVENT ... PMU_EVENT + PMU_EVENT_COUNT - 1:
     case PMU_STATUS ... PMU_STATUS + 4:
@@ -1050,7 +1050,7 @@ static int ak8973_event(I2CSlave *i2c, enum i2c_event event)
 static uint8_t ak8973_recv(I2CSlave *i2c)
 {
     S5L8930AK8973State *s = S5L8930_AK8973(i2c);
-    uint8_t v = s->regs[s->reg];
+    uint8_t v = s->regs[s->reg];            /* bounded: uint8_t reg, regs[256] */
 
     if (s->reg == AK_H1X + 2) {
         s->regs[AK_ST] &= ~AK_ST_INT;       /* data read out */
@@ -1185,7 +1185,7 @@ static void ak8975_measure(S5L8930AK8973State *s)
 static uint8_t ak8975_recv(I2CSlave *i2c)
 {
     S5L8930AK8973State *s = S5L8930_AK8973(i2c);
-    uint8_t v = s->regs[s->reg];
+    uint8_t v = s->regs[s->reg];            /* bounded: uint8_t reg, regs[256] */
 
     if (s->reg >= AK75_HXL && s->reg <= AK75_ST2) {
         s->regs[AK75_ST1] = 0;              /* data read out */
@@ -1373,7 +1373,7 @@ static void l3g_schedule(S5L8930L3GState *s)
 
     if (s->regs[L3G_CTRL1] & 0x08) {
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NANOSECONDS_PER_SECOND / hz[s->regs[L3G_CTRL1] >> 6]);
+                  NANOSECONDS_PER_SECOND / hz[(s->regs[L3G_CTRL1] >> 6) & 3]);
     } else {
         timer_del(s->timer);
     }

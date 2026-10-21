@@ -24,6 +24,7 @@
  * so a device-FIFO channel tries to AES its data (both directions) -- the
  * asymmetric-remount bug.
  *
+ * SLICE include/hw/arm/ipod_touch_guard.h range static inline uint64_t it_guard_idx | #endif /* HW_ARM_IPOD_TOUCH_GUARD_H
  * SLICE hw/arm/s5l8930_cdma.c range #define CDMA_CHANNELS  | /* Per-IPSW GID stand-in
  * SLICE hw/arm/s5l8930_cdma.c define GID_|CDMA_PACED_[A-Z_]+_NS
  * SLICE hw/arm/s5l8930_cdma.c fn gid_lookup aes_apply fifo_push aes_feed aes_for_channel cdma_bulk_enabled cdma_is_memory cdma_src cdma_fifo_fed cdma_update_irq fifo_pop cdma_waits_for_uart cdma_fifo_xfer cdma_run cdma_is_paced cdma_paced_advance cdma_paced_pos cdma_pace_arm cdma_pace_tick cdma_paced_stop cdma_start_paced cdma_read cdma_write s5l8930_cdma_sink_done s5l8930_cdma_set_source s5l8930_cdma_kick
@@ -32,6 +33,7 @@
 #define trace_event_get_state_backends(id) 0
 #define s5l8930_ioprof_add(...) ((void)0)   /* LT_NAND_PROF counters */
 #define TRACE_PRINTF(fn, ...) do { if (0) printf(__VA_ARGS__); } while (0)
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>

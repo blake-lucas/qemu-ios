@@ -314,6 +314,7 @@ int nand_image_read(NANDImage *n, unsigned chip, uint32_t page, uint8_t *record)
     if (nand_image_bad(n, chip, page)) {
         return -EINVAL;
     }
+    /* bounded: nand_image_bad checked chip */
     result = n->disk ? nand_disk_read(n->disk, nand_disk_record(n->disk, chip, page), n->stride, record)
                      : blk_pread(n->chip[chip], (int64_t)page * n->stride, n->stride, record, 0);
     if (result < 0) {
@@ -329,6 +330,7 @@ int nand_image_write(NANDImage *n, unsigned chip, uint32_t page, const uint8_t *
         return -EINVAL;
     }
     nand_image_xor(n, n->buffer, record);
+    /* bounded: nand_image_bad checked chip */
     if (n->disk) {
         return nand_disk_write(n->disk, nand_disk_record(n->disk, chip, page), n->stride, n->buffer);
     }
@@ -337,15 +339,16 @@ int nand_image_write(NANDImage *n, unsigned chip, uint32_t page, const uint8_t *
 
 int nand_image_erase(NANDImage *n, unsigned chip, uint32_t block)
 {
-    uint32_t first = block * n->geo.pages_per_block;
+    uint64_t first = (uint64_t)block * n->geo.pages_per_block;   /* 32 bits would wrap */
 
-    if (nand_image_bad(n, chip, first)) {
+    if (first > UINT32_MAX || nand_image_bad(n, chip, first)) {
         return -EINVAL;
     }
     if (n->disk) {
         return nand_disk_erase(n->disk, chip, block);
     }
     /* Zeros read as blank whether the host unmaps the range or writes them. */
+    /* bounded: nand_image_bad checked chip */
     return blk_pwrite_zeroes(n->chip[chip], (int64_t)first * n->stride,
                              (int64_t)n->geo.pages_per_block * n->stride, BDRV_REQ_MAY_UNMAP);
 }

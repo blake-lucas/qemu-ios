@@ -230,13 +230,21 @@ typedef struct H264References {
     unsigned list[16];
 } H264References;
 
+/* The picture's width and height in macroblocks are the guest's: 1..128 each
+ * (2048 pixels), so every size computed from them stays far from wrapping. */
+static bool h264_size_ok(IPodH264State *s)
+{
+    unsigned mw = s->regs[0x1030 / 4], mh = s->regs[0x1034 / 4];
+    return mw && mw <= 128 && mh && mh <= 128;
+}
+
 static bool h264_references(IPodH264State *s, H264References *refs)
 {
     uint32_t y[16], uv[16];
     unsigned active = s->regs[0x1040 / 4] + 1;
     unsigned bytes = s->regs[0x1030 / 4] * s->regs[0x1034 / 4] * 256;
     refs->count = 0;
-    if (!active || active > 16) return false;
+    if (!active || active > 16 || !h264_size_ok(s)) return false;
     for (unsigned i = 0; i < active; i++) {
         uint32_t ry, ruv;
         if (!h264_planes(s, s->regs[0x100 / 4 + i], bytes, &ry, &ruv)) return false;
@@ -402,7 +410,10 @@ static bool h264_slice_nals(IPodH264State *s, GByteArray **sps,
 static GByteArray *h264_reference_pixels(IPodH264State *s, uint32_t y,
                                         uint32_t uv, unsigned frame)
 {
-    unsigned width = s->regs[0x1030 / 4] * 16, height = s->regs[0x1034 / 4] * 16;
+    if (!h264_size_ok(s)) {
+        return NULL;
+    }
+    unsigned width = MIN(s->regs[0x1030 / 4], 128) * 16, height = MIN(s->regs[0x1034 / 4], 128) * 16;
     unsigned bytes = width * height;
     g_autofree uint8_t *pixels = g_malloc(bytes * 3 / 2);
     if (address_space_read(&address_space_memory, y, MEMTXATTRS_UNSPECIFIED, pixels, bytes) ||

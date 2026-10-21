@@ -1,5 +1,7 @@
 /* Full-width SHA DMA hashes restore-sized messages with bounded host storage.
  *
+ * SLICE include/hw/arm/ipod_touch_guard.h range static inline uint64_t it_guard_idx | #endif /* HW_ARM_IPOD_TOUCH_GUARD_H
+ * SLICE hw/arm/ipod_touch_sha1.c define IT_SHA1_MAX_JOB
  * SLICE include/hw/arm/sha1_compress.h file
  * SLICE include/hw/arm/ipod_touch_sha1.h define SHA_
  * SLICE include/hw/arm/ipod_touch_sha1.h typedef IPodTouchSHA1State
@@ -15,6 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <CommonCrypto/CommonDigest.h>
+#include <inttypes.h>
+#define LOG_GUEST_ERROR 2
+#define qemu_log_mask(...) ((void)0)
 typedef int SysBusDevice, MemoryRegion, qemu_irq;
 typedef uint64_t hwaddr;
 #define MIN(a,b) ((a)<(b)?(a):(b))

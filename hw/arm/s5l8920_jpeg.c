@@ -140,8 +140,9 @@ static void huff_build(JpegHuff *h)
     memset(h->len, 0, sizeof(h->len));
     for (unsigned l = 1; l <= 16; l++) {
         for (unsigned i = 0; i < h->bits[l - 1] && k < h->nvals; i++, k++) {
+            /* bounded: vals[] is uint8_t, code[] and len[] have 256 entries */
             h->code[h->vals[k]] = code++;
-            h->len[h->vals[k]] = l;
+            h->len[h->vals[k]] = l;     /* bounded: as above */
         }
         code <<= 1;
     }
@@ -385,7 +386,8 @@ static void jpeg_start(S5L8920JPEGState *s)
         timer_mod(s->done, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS);
         return;
     }
-    if ((mode == 1 || mode == 2) && w && h && w <= 8192 && h <= 8192 && cap) {
+    /* Packed 4:2:2 pairs pixels: an odd width would read the last pair's chroma past the row. */
+    if ((mode == 1 || mode == 2) && w && !(w & 1) && h && w <= 8192 && h <= 8192 && cap) {
         g_autofree uint8_t *src = g_malloc(in);
         g_autofree uint8_t *dst = g_malloc(cap);
 

@@ -196,7 +196,7 @@ static void bbspi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case R_TXDATA:
         t = MIN(s->regs[R_TXCNT / 4] * bbspi_ws(s), FRAME_MAX);
         for (unsigned i = 0; i < bbspi_ws(s) && s->tx_len < t; i++) {
-            s->tx[s->tx_len++] = val >> (8 * i);
+            s->tx[s->tx_len++] = val >> (8 * i);   /* bounded: the loop's tx_len < t <= FRAME_MAX */
         }
         if (t && s->tx_len == t && s->modem) {
             TRACE("MOSI hdr %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",

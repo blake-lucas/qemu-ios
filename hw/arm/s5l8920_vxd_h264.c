@@ -458,6 +458,9 @@ int vxd_h264_decode(VXDH264 *h, const VXDSlice *sl, VXDPicture *pic)
         rbsp[n++] = sl->nal[i];
         zeros = sl->nal[i] ? 0 : zeros + 1;
     }
+    if (n < 2) {                 /* a NAL header and at least a byte of slice header */
+        return -1;
+    }
     VXDSlice rs = *sl;
     rs.sr_bit = sr_bit;
 

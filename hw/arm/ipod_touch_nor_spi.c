@@ -341,7 +341,7 @@ static uint32_t ipod_touch_nor_spi_transfer(SSIPeripheral *dev, uint32_t value)
         if (s->cur_cmd == NOR_WRITE_DATA_CMD) {
             /* The last byte clocked into each page-buffer position wins; only
              * CS release ANDs that final buffer into the flash array. */
-            s->page[s->page_offset++] = value;
+            s->page[s->page_offset++] = value;  /* bounded: uint8_t page_offset, 256-byte page */
             if (s->data_count < NOR_PAGE_SIZE) {
                 s->data_count++;
             }

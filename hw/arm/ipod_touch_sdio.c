@@ -161,6 +161,14 @@ static uint8_t *backplane_page(IPodTouchSDIOState *s, uint32_t sb_addr)
     gpointer key = GUINT_TO_POINTER(sb_addr >> BACKPLANE_PAGE_BITS);
     uint8_t *page = g_hash_table_lookup(s->backplane, key);
 
+    if (!page && g_hash_table_size(s->backplane) >= BACKPLANE_MAX_PAGES) {
+        /* Past the cap every new page shares one scratch page. */
+        qemu_log_mask(LOG_GUEST_ERROR, "[SDIO] backplane store full at 0x%08x\n", sb_addr);
+        if (!s->backplane_spill) {
+            s->backplane_spill = g_malloc0(BACKPLANE_PAGE_SIZE);
+        }
+        return s->backplane_spill;
+    }
     if (!page) {
         page = g_malloc0(BACKPLANE_PAGE_SIZE);
         g_hash_table_insert(s->backplane, key, page);
@@ -267,7 +275,15 @@ static void sdpcm_announce_ready(IPodTouchSDIOState *s)
 
 static void sdpcm_queue_frame(IPodTouchSDIOState *s, uint8_t *data, uint32_t len)
 {
-    SDPCMFrame *f = g_new0(SDPCMFrame, 1);
+    SDPCMFrame *f;
+
+    /* Replies and events the host never reads would queue without end. */
+    if (g_queue_get_length(s->rx_fifo) >= SDPCM_RX_MAX) {
+        qemu_log_mask(LOG_GUEST_ERROR, "[SDIO] host queue full, frame dropped\n");
+        g_free(data);
+        return;
+    }
+    f = g_new0(SDPCMFrame, 1);
     f->data = data;
     f->len = len;
     g_queue_push_tail(s->rx_fifo, f);
@@ -824,7 +840,7 @@ static void backplane_store(IPodTouchSDIOState *s, uint32_t sb_addr,
 
     if (sb_addr == CHIPCOMMON_CORECTL) {
         sdpcm_announce_ready(s);
-    } else if (in_core && off == SDPCM_HOSTINTMASK) {
+    } else if (in_core && off == SDPCM_HOSTINTMASK && len >= 4) {
         /* The mask arrives after the core is started, so re-evaluate. */
         sdpcm_announce_ready(s);
         sdpcm_raise(s, sdpcm_reg_read(s, SDPCM_INTSTATUS) & ldl_le_p(buf));

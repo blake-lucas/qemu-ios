@@ -1405,7 +1405,8 @@ static void iop_run(S5L8930IOPState *s)
     uint32_t end = iop_ldl(s->fw_base + FW_HDR_BSS_END);
 
     s->fw_config = 0;
-    if (!iop_config(s) || bss >= end || end > s->fw_size) {
+    /* The header and FW_SIZE are the guest's: the zeroed bss stays inside an image of a sane size. */
+    if (!iop_config(s) || bss >= end || end > MIN(s->fw_size, 16u << 20)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: no 'cnfg' block / bss [0x%x, 0x%x) in firmware at 0x%08x+0x%x\n",
                       __func__, bss, end, s->fw_base, s->fw_size);

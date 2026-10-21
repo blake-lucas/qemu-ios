@@ -353,8 +353,7 @@ static void ipod_touch_i2c_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
 
-    char bus_name[5];
-    sprintf(bus_name, "i2c%d", i2c_index);
+    g_autofree char *bus_name = g_strdup_printf("i2c%d", i2c_index);
 
     s->bus = i2c_init_bus(dev, bus_name);
     i2c_index += 1;

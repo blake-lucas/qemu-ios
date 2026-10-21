@@ -90,6 +90,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchSDIOState, IPOD_TOUCH_SDIO)
 
 #define BACKPLANE_PAGE_BITS 12
 #define BACKPLANE_PAGE_SIZE (1u << BACKPLANE_PAGE_BITS)
+/* The firmware image and the core registers touch a few hundred pages; the
+ * guest picks the addresses, so the store stops at 16 MiB. */
+#define BACKPLANE_MAX_PAGES 4096
+/* Frames the dongle has for the host and the host hasn't read. */
+#define SDPCM_RX_MAX        256
 
 /* Where the window points out of reset: the chipcommon core. */
 #define CHIPCOMMON_BASE     0x18000000
@@ -362,6 +367,7 @@ typedef struct IPodTouchSDIOState
     unsigned cdc_hdrlen;   /* 12 or 16, latched from the first control frame */
     unsigned bdc_hdrlen;   /* 6 or 4, decided by the same build generation */
     GHashTable *backplane;
+    uint8_t *backplane_spill;  /* every page past BACKPLANE_MAX_PAGES */
 
     /* The 802.3 side: channel 2 frames are bridged to a QEMU network
      * backend, so slirp/vmnet/etc supply DHCP, DNS and NAT. */
