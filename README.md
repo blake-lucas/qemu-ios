@@ -1,6 +1,6 @@
 # QEMU-iOS
 
-Built with use from agentic coding products.
+Built with use from agentic coding products.ю
 
 QEMU-iOS emulates legacy Apple devices well enough to run their stock firmware: from the boot ROM or a
 kernel bundle to the home screen, with touch, buttons, display, audio, Wi-Fi, USB (usbmux/AFC through
