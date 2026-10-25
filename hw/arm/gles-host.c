@@ -1357,6 +1357,75 @@ static void gles_array_enable(GLESArray *a, bool enabled)
     }
 }
 
+/*
+ * One fetch per draw can serve the arrays that live inside it.
+ *
+ * Guest geometry is usually interleaved -- position, normal, colour and texture coordinates in one
+ * struct -- so each array's gl*Pointer names a range of bytes that contains the others' ranges, and
+ * the bind copied that memory once per array: four guest reads of overlapping bytes for one draw,
+ * each its own pass of probes. The draw's fetches are now taken from one pool, and an array whose
+ * range falls inside an earlier fetch of the same draw is pointed into that copy instead of reading
+ * the guest again. Nothing runs in the guest between them: this all happens inside one QEMU_CALL.
+ *
+ * The pool is a fixed size and a bump allocator, reset per draw, so no pointer handed to GL ever
+ * moves: an array's registered pointer stays valid for as long as its delta into the pool does, and
+ * the host-pointer cache above it keeps working. An array larger than the pool takes the per-array
+ * buffer, exactly as before. Per thread, because a queued GL call runs on the GL thread while the
+ * vCPU may be inside one of its own.
+ */
+#define GLES_DRAW_POOL_BYTES (1u << 20)
+#define GLES_DRAW_FETCHES    8
+
+static __thread struct {
+    uint8_t *pool;                      /* allocated on first use, never moves */
+    size_t used;                        /* bytes handed out this draw */
+    unsigned nfetch;
+    struct {
+        uint64_t start;                 /* guest address of host[0] */
+        size_t len;
+        uint8_t *host;
+    } fetch[GLES_DRAW_FETCHES];
+} gles_draw_fetch;
+
+/* A fetch's bytes for this draw, from the pool; NULL if the pool cannot take it. */
+static uint8_t *gles_draw_pool_take(size_t bytes)
+{
+    size_t at = (gles_draw_fetch.used + 15) & ~(size_t)15;
+
+    if (bytes > GLES_DRAW_POOL_BYTES || at + bytes > GLES_DRAW_POOL_BYTES) {
+        return NULL;
+    }
+    if (!gles_draw_fetch.pool) {
+        gles_draw_fetch.pool = g_malloc(GLES_DRAW_POOL_BYTES);
+    }
+    gles_draw_fetch.used = at + bytes;
+    return gles_draw_fetch.pool + at;
+}
+
+/* The pool copy of the range [va, va + bytes], if this draw already read a range containing it. */
+static const uint8_t *gles_draw_pool_find(uint64_t va, size_t bytes)
+{
+    for (unsigned i = 0; i < gles_draw_fetch.nfetch; i++) {
+        uint64_t start = gles_draw_fetch.fetch[i].start;
+        size_t len = gles_draw_fetch.fetch[i].len;
+
+        if (va >= start && va + bytes <= start + len) {
+            return gles_draw_fetch.fetch[i].host + (va - start);
+        }
+    }
+    return NULL;
+}
+
+static void gles_draw_pool_record(uint64_t va, size_t bytes, uint8_t *host)
+{
+    if (gles_draw_fetch.nfetch < GLES_DRAW_FETCHES) {
+        gles_draw_fetch.fetch[gles_draw_fetch.nfetch].start = va;
+        gles_draw_fetch.fetch[gles_draw_fetch.nfetch].len = bytes;
+        gles_draw_fetch.fetch[gles_draw_fetch.nfetch].host = host;
+        gles_draw_fetch.nfetch++;
+    }
+}
+
 static bool gles_bind_array(CPUState *cpu, GLESArray *a, uint32_t first,
                             uint32_t count)
 {
@@ -1400,25 +1469,39 @@ static bool gles_bind_array(CPUState *cpu, GLESArray *a, uint32_t first,
         }
         base = a->vbo->data + a->ptr + off;
     } else {
-        if (need > a->buf_size) {
-            a->buf = g_realloc(a->buf, need);
-            a->buf_size = need;
-        }
-        {
-            uint64_t t0 = gles_t();
-            int rc = gles_guest_rw(cpu, a->ptr + (hwaddr)off,
-                                         a->buf, need, 0);
-            gh.t_fetch += gles_t() - t0;
-            if (rc != 0) {
-                if (!gles_guest_fault_pending() &&  /* else it is reissued */
-                    gles_refuse("guest-read:array")) {
-                    fprintf(stderr, "[gles] failed to read %zu bytes of array data "
-                            "at guest 0x%08x\n", need, a->ptr);
+        uint64_t want = (uint64_t)a->ptr + off;
+        const uint8_t *pooled = gles_draw_pool_find(want, need);
+
+        if (pooled) {
+            base = pooled;
+        } else {
+            uint8_t *dst = gles_draw_pool_take(need);
+
+            if (!dst) {
+                if (need > a->buf_size) {
+                    a->buf = g_realloc(a->buf, need);
+                    a->buf_size = need;
                 }
-                return false;
+                dst = a->buf;
             }
+            {
+                uint64_t t0 = gles_t();
+                int rc = gles_guest_rw(cpu, want, dst, need, 0);
+                gh.t_fetch += gles_t() - t0;
+                if (rc != 0) {
+                    if (!gles_guest_fault_pending() &&  /* else it is reissued */
+                        gles_refuse("guest-read:array")) {
+                        fprintf(stderr, "[gles] failed to read %zu bytes of array data "
+                                "at guest 0x%08x\n", need, a->ptr);
+                    }
+                    return false;
+                }
+            }
+            if (dst != a->buf) {
+                gles_draw_pool_record(want, need, dst);
+            }
+            base = dst;
         }
-        base = a->buf;
     }
 
     data = base;
@@ -1721,6 +1804,10 @@ static uint32_t gles_bind_all_arrays(CPUState *cpu, uint32_t first,
     uint32_t bound = 0;
     unsigned i;
     uint64_t t0 = gles_t();
+
+    /* A new draw: its fetches start from the top of the pool (see gles_draw_fetch). */
+    gles_draw_fetch.used = 0;
+    gles_draw_fetch.nfetch = 0;
 
     for (i = 0; i < ARRAY_SIZE(arrays); i++) {
         if (gles_bind_array(cpu, arrays[i], first, count)) {
