@@ -25,6 +25,13 @@
  * "tone-hz" property replaces the input with a synthetic stereo sine at the
  * port's frame rate, so capture can be checked headless.
  *
+ * A phone's engine runs the audio backend as `driver=none`, whose input voice
+ * opens and then hands out silence, so the FIFO asks the frontend's own
+ * microphone first (hw/arm/host-mic.c): what it recorded, resampled to the
+ * port's rate, and -- when it pushed nothing, which is every case on the Mac --
+ * the voice's ring, then silence. That is the phone's capture path: the guest
+ * reaches the same CDMA chains and the same RX FIFO either way.
+ *
  * Use `-audio driver=wav,path=out.wav` (or coreaudio): the card resolves
  * its backend from the default audiodev list, as the iPod's I2S does.
  */
@@ -39,6 +46,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/arm/s5l8930.h"
 #include "hw/arm/ipod_touch_cs42l58.h"
+#include "hw/arm/host-mic.h"
 #include "qemu/audio.h"
 #include "migration/vmstate.h"
 
@@ -205,6 +213,11 @@ static void i2s_set_in_rate(S5L8930I2SState *s, unsigned rate)
         .freq = rate, .nchannels = 2, .fmt = AUDIO_FORMAT_S16, .big_endian = false,
     };
 
+    if (!s->tone_hz) {
+        /* The frontend resamples what it recorded to this rate, and is told even where a host
+         * input voice exists: it is the port's rate that decides which frames it hands out. */
+        host_mic_set_rate(rate);
+    }
     if (rate == s->in_rate || s->tone_hz) {
         s->in_rate = rate;
         return;
@@ -227,15 +240,25 @@ static void i2s_next_frame(S5L8930I2SState *s)
         stw_le_p(s->rx_frame + 2, v);
         return;
     }
-    if (s->in_level < 4) {
-        memset(s->rx_frame, 0, 4);
+    /* The frontend's microphone comes first, not as a fallback. A phone's engine has no real input
+     * voice -- the audio backend is `driver=none` -- but that backend's input voice still OPENS
+     * (audio/noaudio.c: max_voices_in, no_init_in, no_read) and then hands out silence paced at the
+     * port's rate, so the voice's ring below is never empty and a capture read out of it hears
+     * nothing. host_mic_read_frame() is false when the frontend pushed nothing (the Mac, where
+     * coreaudio -- not this ring -- is the input, or a phone with the switch off), and only then is
+     * the voice's ring, exactly as before. */
+    if (host_mic_read_frame(s->rx_frame)) {
         return;
     }
-    for (int i = 0; i < 4; i++) {
-        s->rx_frame[i] = s->in_ring[s->in_tail];
-        s->in_tail = (s->in_tail + 1) % I2S_RING;
+    if (s->in_level >= 4) {
+        for (int i = 0; i < 4; i++) {
+            s->rx_frame[i] = s->in_ring[s->in_tail];
+            s->in_tail = (s->in_tail + 1) % I2S_RING;
+        }
+        s->in_level -= 4;
+        return;
     }
-    s->in_level -= 4;
+    memset(s->rx_frame, 0, 4);
 }
 
 static uint64_t i2s_rx_read(S5L8930I2SState *s, unsigned size)
@@ -420,6 +443,10 @@ static void i2s_write(void *opaque, hwaddr offset, uint64_t value,
         if (run) {
             i2s_set_in_rate(s, s5l8930_i2s_rate(s->port));
             s->rx_pos = 0;
+        } else {
+            /* A stopped recording's unread frames would play back as a burst at the head of the
+             * next one, a second or a day later. */
+            host_mic_flush();
         }
         if (s->voice_in) {
             audio_be_set_active_in(s->audio_be, s->voice_in, run);
