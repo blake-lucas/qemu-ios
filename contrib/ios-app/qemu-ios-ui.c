@@ -22,6 +22,7 @@
 #define IOS_FRAME_PATH_DEFINES_EVENT /* strong definitions on Windows: see the header */
 #include "qemu/ios-frame-path.h"
 #include "hw/arm/ipod_touch_lis302dl.h"
+#include "hw/arm/nand-image.h"
 #include "qemu/aio.h"
 #include "system/runstate.h"
 #include "ui/console.h"
@@ -929,6 +930,19 @@ bool qemu_ios_ui_storage_failed(void)
 {
     return ipod_touch_fmss_io_failed() || ipod_touch_nor_io_failed() ||
            s5l8930_iop_io_failed();
+}
+
+void qemu_ios_storage_stats(QemuIosStorageStats *out)
+{
+    NANDStorageStats s;
+
+    nand_storage_stats(&s);
+    *out = (QemuIosStorageStats) {
+        .read_ops = s.ops[NAND_STAT_READ], .read_bytes = s.bytes[NAND_STAT_READ], .read_ns = s.ns[NAND_STAT_READ],
+        .write_ops = s.ops[NAND_STAT_WRITE], .write_bytes = s.bytes[NAND_STAT_WRITE],
+        .write_ns = s.ns[NAND_STAT_WRITE],
+        .erase_ops = s.ops[NAND_STAT_ERASE], .erase_ns = s.ns[NAND_STAT_ERASE],
+    };
 }
 
 void qemu_ios_ui_vm_stopped(void)

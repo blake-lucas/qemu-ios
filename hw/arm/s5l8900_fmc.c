@@ -81,8 +81,8 @@ static void fmc_erase_marker(S5L8900FMCState *s, uint32_t bank, uint32_t block,
  * the block's base pages stop showing through. A page with no file anywhere
  * has never been programmed and reads erased (0xFF), as the chip would.
  */
-void s5l8900_fmc_load_page(S5L8900FMCState *s, uint32_t bank, uint32_t page,
-                           uint8_t *data, uint8_t *spare)
+static void fmc_load_page(S5L8900FMCState *s, uint32_t bank, uint32_t page,
+                          uint8_t *data, uint8_t *spare)
 {
     char path[PATH_MAX];
 
@@ -122,14 +122,24 @@ void s5l8900_fmc_load_page(S5L8900FMCState *s, uint32_t bank, uint32_t page,
     fmc_erased_page(data, spare);
 }
 
+/* A page the guest reads, counted for the performance overlay (a program's read of the old cells is not). */
+void s5l8900_fmc_load_page(S5L8900FMCState *s, uint32_t bank, uint32_t page,
+                           uint8_t *data, uint8_t *spare)
+{
+    int64_t stat = nand_stat_begin();
+
+    fmc_load_page(s, bank, page, data, spare);
+    nand_stat(NAND_STAT_READ, FMC_BYTES_PER_PAGE + FMC_BYTES_PER_SPARE, stat);
+}
+
 /*
  * Program one page. NAND programs can only clear bits, so the stored page is
  * the old contents ANDed with the new: programming an erased page stores
  * exactly what the FTL sent, and a reprogram without an erase behaves as on
  * the chip instead of silently replacing the page.
  */
-static bool fmc_program_page(S5L8900FMCState *s, uint32_t bank, uint32_t page,
-                             const uint8_t *data, const uint8_t *spare)
+static bool fmc_program_page_inner(S5L8900FMCState *s, uint32_t bank, uint32_t page,
+                                   const uint8_t *data, const uint8_t *spare)
 {
     char path[PATH_MAX], dir[PATH_MAX];
     uint8_t cell[FMC_BYTES_PER_PAGE], cell_spare[FMC_BYTES_PER_SPARE];
@@ -140,7 +150,7 @@ static bool fmc_program_page(S5L8900FMCState *s, uint32_t bank, uint32_t page,
                       bank, page);
         return true;
     }
-    s5l8900_fmc_load_page(s, bank, page, cell, cell_spare);
+    fmc_load_page(s, bank, page, cell, cell_spare);
     if (!s5l8900_fmc_page_erased(cell, cell_spare)) {
         /* An FTL never does this to a consistent store: the page was not erased. */
         qemu_log_mask(LOG_GUEST_ERROR, "[fmc] program of bank %u page %u, which is not erased\n", bank, page);
@@ -185,7 +195,17 @@ static bool fmc_program_page(S5L8900FMCState *s, uint32_t bank, uint32_t page,
     return ok;
 }
 
-bool s5l8900_fmc_erase_block(S5L8900FMCState *s, uint32_t bank, uint32_t block)
+static bool fmc_program_page(S5L8900FMCState *s, uint32_t bank, uint32_t page,
+                             const uint8_t *data, const uint8_t *spare)
+{
+    int64_t stat = nand_stat_begin();
+    bool ok = fmc_program_page_inner(s, bank, page, data, spare);
+
+    nand_stat(NAND_STAT_WRITE, FMC_BYTES_PER_PAGE + FMC_BYTES_PER_SPARE, stat);
+    return ok;
+}
+
+static bool fmc_erase_block(S5L8900FMCState *s, uint32_t bank, uint32_t block)
 {
     char path[PATH_MAX];
 
@@ -223,6 +243,15 @@ bool s5l8900_fmc_erase_block(S5L8900FMCState *s, uint32_t bank, uint32_t block)
         return false;
     }
     return true;
+}
+
+bool s5l8900_fmc_erase_block(S5L8900FMCState *s, uint32_t bank, uint32_t block)
+{
+    int64_t stat = nand_stat_begin();
+    bool ok = fmc_erase_block(s, bank, block);
+
+    nand_stat(NAND_STAT_ERASE, 0, stat);
+    return ok;
 }
 
 void s5l8900_fmc_start_program(S5L8900FMCState *s, unsigned count)

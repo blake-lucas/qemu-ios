@@ -653,9 +653,11 @@ static bool fmss_erase_block_inner(IPodTouchFMSSState *s, uint32_t cs, uint32_t 
 
 static bool fmss_erase_block(IPodTouchFMSSState *s, uint32_t cs, uint32_t block)
 {
+    int64_t stat = nand_stat_begin();
     uint64_t id = fmss_path_begin(3, cs, block);
     bool result = fmss_erase_block_inner(s, cs, block);
     fmss_path_end(id, 3, cs, block);
+    nand_stat(NAND_STAT_ERASE, 0, stat);
     return result;
 }
 
@@ -733,13 +735,14 @@ static void fmss_fix_generated_free_pool(IPodTouchFMSSState *s, uint32_t cs,
 static void fmss_load_page(IPodTouchFMSSState *s, uint32_t cs, uint32_t page_nr,
                            uint8_t *data, uint8_t *spare)
 {
-    int64_t t0;
+    int64_t t0, stat = nand_stat_begin();
     uint64_t id = fmss_path_begin(1, cs, page_nr);
 
     if (!fmss_stats_on()) {
         fmss_load_page_inner(s, cs, page_nr, data, spare);
         fmss_fix_generated_free_pool(s, cs, page_nr, data, spare);
         fmss_path_end(id, 1, cs, page_nr);
+        nand_stat(NAND_STAT_READ, NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE, stat);
         return;
     }
     t0 = qemu_clock_get_ns(QEMU_CLOCK_HOST);
@@ -748,6 +751,7 @@ static void fmss_load_page(IPodTouchFMSSState *s, uint32_t cs, uint32_t page_nr,
     fmss_stats.ns += qemu_clock_get_ns(QEMU_CLOCK_HOST) - t0;
     fmss_stats.reads++;
     fmss_path_end(id, 1, cs, page_nr);
+    nand_stat(NAND_STAT_READ, NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE, stat);
     fmss_stats_report();
 }
 
@@ -1327,9 +1331,11 @@ static bool fmss_store_page_inner(IPodTouchFMSSState *s, uint32_t cs, uint32_t p
 static bool fmss_store_page(IPodTouchFMSSState *s, uint32_t cs, uint32_t page_nr,
                             const uint8_t *data, const uint8_t *spare)
 {
+    int64_t stat = nand_stat_begin();
     uint64_t id = fmss_path_begin(2, cs, page_nr);
     bool result = fmss_store_page_inner(s, cs, page_nr, data, spare);
     fmss_path_end(id, 2, cs, page_nr);
+    nand_stat(NAND_STAT_WRITE, NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE, stat);
     return result;
 }
 

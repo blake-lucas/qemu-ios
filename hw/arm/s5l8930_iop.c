@@ -509,10 +509,11 @@ static uint32_t nand_read_page(S5L8930IOPState *s, int bus, uint32_t ce,
     }
     len = s->page_stride;
     p = g_malloc(len);
-    int64_t t0 = ioprof_t0();
+    int64_t t0 = ioprof_t0(), stat = nand_stat_begin();
     result = nand_io_error(s->disk ? nand_disk_read(s->disk, nand_disk_at(s, bus, ce, page), len, p) :
                            nand_page_io(nand_fd(s, bus, ce, page, false), blk, (int64_t)page * len, len, p, false),
                            bus, ce, "read");
+    nand_stat(NAND_STAT_READ, len, stat);
     ioprof_done(IOPROF_PREAD, IOPROF_PREAD_NS, t0);
     s5l8930_ioprof_add(IOPROF_PG_READ, 1);
     if (result != FMI_STATUS_OK) {
@@ -603,7 +604,8 @@ static uint32_t nand_program_page(S5L8930IOPState *s, int bus, uint32_t ce,
     }
     p = g_malloc(s->page_stride);
     old = nand_backend(s, bus, ce, page, false);
-    int64_t t0 = ioprof_t0();
+    /* One program for the overlay: the read before it is part of its host time. */
+    int64_t t0 = ioprof_t0(), stat = nand_stat_begin();
     result = nand_io_error(s->disk ? nand_disk_read(s->disk, nand_disk_at(s, bus, ce, page), s->page_stride, p) :
                            nand_page_io(nand_fd(s, bus, ce, page, false), old, (int64_t)page * s->page_stride,
                                         s->page_stride, p, false), bus, ce, "read before program");
@@ -639,6 +641,7 @@ static uint32_t nand_program_page(S5L8930IOPState *s, int bus, uint32_t ce,
     result = nand_io_error(s->disk ? nand_disk_write(s->disk, nand_disk_at(s, bus, ce, page), s->page_stride, p) :
                            nand_page_io(nand_fd(s, bus, ce, page, true), blk, (int64_t)page * s->page_stride,
                                         s->page_stride, p, true), bus, ce, "program");
+    nand_stat(NAND_STAT_WRITE, s->page_stride, stat);
     ioprof_done(IOPROF_PWRITE, IOPROF_PWRITE_NS, t0);
     if (result == FMI_STATUS_OK && s->overlay_dir && !s->disk && nand_set_dirty(s, bus, ce, page)) {
         nand_publish_owners(s, bus, ce, page, page);
@@ -670,12 +673,13 @@ static uint32_t nand_erase_block(S5L8930IOPState *s, int bus, uint32_t ce,
     }
     /* Both formats encode erased pages as zero; QEMU guarantees zero reads
      * whether the file backend can unmap the extent or writes zeros itself. */
-    int64_t t0 = ioprof_t0();
+    int64_t t0 = ioprof_t0(), stat = nand_stat_begin();
     result = nand_io_error(s->disk ? nand_disk_erase(s->disk, bus * ctpop8(s->nand_ce_mask) +
                                                      ctpop8(s->nand_ce_mask & ((1u << ce) - 1)), block) :
                            blk_pwrite_zeroes(blk, (int64_t)first * s->page_stride,
                               (int64_t)s->store_ppb * s->page_stride,
                               BDRV_REQ_MAY_UNMAP), bus, ce, "erase");
+    nand_stat(NAND_STAT_ERASE, 0, stat);
     ioprof_done(IOPROF_ZERO, IOPROF_ZERO_NS, t0);
     s5l8930_ioprof_add(IOPROF_ERASE, 1);
     if (result == FMI_STATUS_OK && s->overlay_dir && !s->disk) {

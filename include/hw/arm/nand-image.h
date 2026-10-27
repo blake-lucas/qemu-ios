@@ -93,4 +93,17 @@ void nand_disk_close(NANDDisk *d, DeviceState *owner);
 /* NAND page I/O straight on the host files (POSIX; LT_NAND_DIRECT=off: through the block layer). */
 bool nand_direct_enabled(void);
 
+/*
+ * Guest storage traffic as the boards' NAND controllers perform it (every board, both NAND formats), for the apps'
+ * performance overlay (qemu_ios_storage_stats): operations, the bytes they moved and the host time they took. A
+ * controller passes nand_stat_begin()'s value to nand_stat() once the operation is done. Counters only grow.
+ */
+typedef enum { NAND_STAT_READ, NAND_STAT_WRITE, NAND_STAT_ERASE, NAND_STAT_KINDS } NANDStat;
+typedef struct NANDStorageStats {
+    uint64_t ops[NAND_STAT_KINDS], bytes[NAND_STAT_KINDS], ns[NAND_STAT_KINDS];
+} NANDStorageStats;
+int64_t nand_stat_begin(void);
+void nand_stat(NANDStat kind, uint64_t bytes, int64_t begin);
+void nand_storage_stats(NANDStorageStats *out);
+
 #endif

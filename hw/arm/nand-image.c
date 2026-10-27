@@ -16,6 +16,7 @@
 #include "block/coroutines.h"
 #include "system/runstate.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "hw/arm/nand-image.h"
 #ifdef _WIN32
 #include <winioctl.h>
@@ -280,6 +281,29 @@ static void nand_image_xor(NANDImage *n, uint8_t *out, const uint8_t *in)
 {
     for (uint32_t i = 0; i < n->stride; i++) {
         out[i] = in[i] ^ n->blank[i];
+    }
+}
+
+static NANDStorageStats nand_stats;
+
+int64_t nand_stat_begin(void)
+{
+    return get_clock();
+}
+
+void nand_stat(NANDStat kind, uint64_t bytes, int64_t begin)
+{
+    qatomic_add(&nand_stats.ops[kind], 1);
+    qatomic_add(&nand_stats.bytes[kind], bytes);
+    qatomic_add(&nand_stats.ns[kind], get_clock() - begin);
+}
+
+void nand_storage_stats(NANDStorageStats *out)
+{
+    for (int i = 0; i < NAND_STAT_KINDS; i++) {
+        out->ops[i] = qatomic_read(&nand_stats.ops[i]);
+        out->bytes[i] = qatomic_read(&nand_stats.bytes[i]);
+        out->ns[i] = qatomic_read(&nand_stats.ns[i]);
     }
 }
 
