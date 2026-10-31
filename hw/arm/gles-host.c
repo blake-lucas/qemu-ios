@@ -1387,12 +1387,24 @@ static __thread struct {
     } fetch[GLES_DRAW_FETCHES];
 } gles_draw_fetch;
 
+/* LT_GLES_DRAW_POOL=off reads each array on its own again, for A/B. */
+static bool gles_draw_pool_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_GLES_DRAW_POOL");
+        on = !v || (strcmp(v, "0") && strcmp(v, "off"));
+    }
+    return on;
+}
+
 /* A fetch's bytes for this draw, from the pool; NULL if the pool cannot take it. */
 static uint8_t *gles_draw_pool_take(size_t bytes)
 {
     size_t at = (gles_draw_fetch.used + 15) & ~(size_t)15;
 
-    if (bytes > GLES_DRAW_POOL_BYTES || at + bytes > GLES_DRAW_POOL_BYTES) {
+    if (!gles_draw_pool_on() || bytes > GLES_DRAW_POOL_BYTES || at + bytes > GLES_DRAW_POOL_BYTES) {
         return NULL;
     }
     if (!gles_draw_fetch.pool) {
@@ -1405,6 +1417,9 @@ static uint8_t *gles_draw_pool_take(size_t bytes)
 /* The pool copy of the range [va, va + bytes], if this draw already read a range containing it. */
 static const uint8_t *gles_draw_pool_find(uint64_t va, size_t bytes)
 {
+    if (!gles_draw_pool_on()) {
+        return NULL;
+    }
     for (unsigned i = 0; i < gles_draw_fetch.nfetch; i++) {
         uint64_t start = gles_draw_fetch.fetch[i].start;
         size_t len = gles_draw_fetch.fetch[i].len;
