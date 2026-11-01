@@ -1823,6 +1823,9 @@ static void ipad1_init(MachineState *machine)
         dev = qdev_new(TYPE_S5L8930_I2S);
         qdev_prop_set_bit(dev, "audio-out", i == 0);
         qdev_prop_set_uint8(dev, "port", i);
+        /* The frontend's microphone, where a recording app has been heard through it: iPad, iPhone 4,
+         * iPod touch 4G. The 3GS (s5l8920.c) shares the port model but records silence. */
+        qdev_prop_set_bit(dev, "host-mic", i == 0);
         if (i == 0 && s->codec) {
             qdev_connect_clock_in(dev, "lrclk", qdev_get_clock_out(s->codec, "lrclk"));
             object_property_set_link(OBJECT(dev), "codec", OBJECT(s->codec), &error_fatal);

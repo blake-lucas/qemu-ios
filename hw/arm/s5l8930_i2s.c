@@ -105,6 +105,7 @@ struct S5L8930I2SState {
      * (0x7900101) and stops by clearing it (0x7900000, then 0), leaving +0x08 at its frame
      * format (0x78057805); the A4's starts with TXCOM = 6. */
     bool ctrl_run;
+    bool host_mic;                  /* property: the frontend's microphone is this port's input */
     uint8_t port;                   /* property: i2s<port>, selects its NCO */
     Clock *lrclk;                   /* in: the codec's frame clock, followed while the port is the slave */
     CS42L58State *codec;            /* link: the codec this port feeds, whose output volume the host hears */
@@ -213,7 +214,7 @@ static void i2s_set_in_rate(S5L8930I2SState *s, unsigned rate)
         .freq = rate, .nchannels = 2, .fmt = AUDIO_FORMAT_S16, .big_endian = false,
     };
 
-    if (!s->tone_hz) {
+    if (!s->tone_hz && s->host_mic) {
         /* The frontend resamples what it recorded to this rate, and is told even where a host
          * input voice exists: it is the port's rate that decides which frames it hands out. */
         host_mic_set_rate(rate);
@@ -247,7 +248,7 @@ static void i2s_next_frame(S5L8930I2SState *s)
      * nothing. host_mic_read_frame() is false when the frontend pushed nothing (the Mac, where
      * coreaudio -- not this ring -- is the input, or a phone with the switch off), and only then is
      * the voice's ring, exactly as before. */
-    if (host_mic_read_frame(s->rx_frame)) {
+    if (s->host_mic && host_mic_read_frame(s->rx_frame)) {
         return;
     }
     if (s->in_level >= 4) {
@@ -446,7 +447,9 @@ static void i2s_write(void *opaque, hwaddr offset, uint64_t value,
         } else {
             /* A stopped recording's unread frames would play back as a burst at the head of the
              * next one, a second or a day later. */
-            host_mic_flush();
+            if (s->host_mic) {
+                host_mic_flush();
+            }
         }
         if (s->voice_in) {
             audio_be_set_active_in(s->audio_be, s->voice_in, run);
@@ -561,6 +564,7 @@ static const VMStateDescription vmstate_s5l8930_i2s = {
 static const Property s5l8930_i2s_properties[] = {
     DEFINE_PROP_BOOL("audio-out", S5L8930I2SState, audio_out, false),
     DEFINE_PROP_BOOL("ctrl-run", S5L8930I2SState, ctrl_run, false),
+    DEFINE_PROP_BOOL("host-mic", S5L8930I2SState, host_mic, false),
     DEFINE_PROP_UINT8("port", S5L8930I2SState, port, 0),
     DEFINE_PROP_UINT64("nco-base", S5L8930I2SState, nco_base, 0),
     DEFINE_PROP_UINT32("nco-ref-hz", S5L8930I2SState, nco_ref_hz, 0),
