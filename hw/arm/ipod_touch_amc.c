@@ -704,12 +704,16 @@ static void amc_decode_publish(IPodTouchAMCState *s)
     bool jobs = s->rev21 && ((s->int_mask[0] & AMC_E0_DONE) || !(s->int_mask[0] & 4));
     unsigned slot = d->slot, offset = slot * d->capacity;
     if (jobs) {
+        /* A slot holds the larger of a job and the program's capacity: an S16 mono frame's job (2 KiB,
+         * Voice Memos on n81ap-10B500) leaves its slots 4 KiB apart, a 32-bit stereo one's (8 KiB)
+         * fills them. */
         uint32_t size = s->xfer[0], from = s->xfer[1] - (s->result_offset + 0x100);
+        uint32_t stride = MAX(size, d->capacity);
         if (!s->xfers || size < bytes ||
-            from % size || from / size >= d->buffers) {
+            from % stride || from / stride >= d->buffers) {
             return;
         }
-        slot = from / size;
+        slot = from / stride;
         offset = from;
     } else if ((s->pending & 4) || lduw_le_p(header + 0xa + slot * 4)) {
         return;

@@ -479,6 +479,19 @@ int main(void) {
     assert(!lduw_le_p(aperture+0x18000+0xc) && !a.e0_resume);  /* then cleared; the list is done */
     unsigned loud=0; for (unsigned i=0;i<4096;i++) loud+=a.port[i]!=0;
     assert(loud>100);
+    /* Voice Memos on 6.1.6 (n81ap-10B500): the LC program's mono frame is a 2 KiB job, and the slots stay
+     * the program's capacity apart, so the second slot's job names +0x1000 and still means slot 1. */
+    assert(!g_queue_is_empty(&d->output_sizes));
+    static const uint32_t list_vm[] = { 0x34a1c,0x00140101,0x34a80,0x303060, 0,0x00040001,0x34a94,0x303060 };
+    for (unsigned i=0;i<8;i++) stl_le_p(aperture+0x34a00+(i/4)*0x1c+(i%4)*4,list_vm[i]);
+    static const uint32_t job_vm[] = { 0, 0x800, 0x19100, 0, AMC_PORT_LOCAL_21, 3 };
+    for (unsigned i=0;i<6;i++) stl_le_p(aperture+0x34a80+i*4,job_vm[i]);
+    a.port_len = 0;
+    ipod_touch_amc_write(&a, AMC_E0_HEAD, 0x34a02, 4);
+    assert(a.xfers == 1);
+    amc_decode_tick(&a);
+    assert(!a.xfers && a.port_len == 2048 && !memcmp(a.port, aperture+0x19100, 2048));
+    assert(lduw_le_p(aperture+0x18000+0xe) == 1 && lduw_le_p(aperture+0x18000+0x10) == 1024);
     /* iOS 7 (n90ap 11D257) chains several frames' commands into one list, 16 links and more: every link runs. */
     for (unsigned i=0;i<18;i++) {
         uint32_t at=0x34600+i*0x1c;
