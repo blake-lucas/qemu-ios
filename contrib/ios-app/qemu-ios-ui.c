@@ -44,6 +44,21 @@ bool s5l8930_d1815_guest_shutdown_confirmed(void);
 
 #include "qemu-ios-ui.h"
 #include "virtual-input.h"
+
+/*
+ * Whether a frame is published as soon as the panel paint returns (a main-loop timer) or only at QEMU's display
+ * refresh. Every host defers to the paint but the original iOS app, which pulls frames on its own refresh: the
+ * macOS build is LightTouch's desktop app, a portable host like Linux and Windows, and left on the refresh's 30 ms
+ * boundary it received every other frame of a game drawing at 60 (Doodle Jump's title at 33 fps on an M4 Pro).
+ */
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define IOS_DEFERRED_PUBLISH 0
+#else
+#define IOS_DEFERRED_PUBLISH 1
+#endif
 #include "qemu-ios-input.h"
 #include "qemu-ios-input.c.inc"
 
@@ -58,14 +73,16 @@ static void portable_runstate_changed(void *opaque, bool running, RunState state
 }
 static void portable_release_all(void);
 static void portable_release_input(bool preserve_buttons);
-#ifndef __APPLE__
+#if IOS_DEFERRED_PUBLISH
 static void ios_cancel_publish(bool stopping);
 #endif
 static void ios_sequence_reset(void *opaque)
 {
     ios_sequence_cancel_current();
-#ifndef __APPLE__
+#if IOS_DEFERRED_PUBLISH
     ios_cancel_publish(false);
+#endif
+#ifndef __APPLE__
     portable_release_input(ipod_touch_ap_wake_reset_pending());
 #else
     portable_release_all();
@@ -128,7 +145,7 @@ static struct {
 
     /* Set by a partial update, cleared when a whole frame is published. */
     bool pending;
-#ifndef __APPLE__
+#if IOS_DEFERRED_PUBLISH
     /* Main AioContext/BQL only; never retains a DisplaySurface pointer. */
     QEMUTimer *publish_timer;
 #endif
@@ -780,13 +797,13 @@ static void ios_capture(DisplaySurface *surface)
  * mid-paint, which is visible as the screen wiping top-to-bottom instead of
  * changing at once -- and costs a full-surface copy per fragment rather than
  * per frame. Portable hosts defer publication until the panel paint returns;
- * Apple hosts retain the original display-refresh publication boundary.
+ * the iOS app retains the original display-refresh publication boundary.
  */
 static void ios_gfx_update(DisplayChangeListener *dcl,
                            int x, int y, int w, int h)
 {
     ios.pending = true;
-#ifndef __APPLE__
+#if IOS_DEFERRED_PUBLISH
     if (ios.publish_timer && !timer_pending(ios.publish_timer)) {
         timer_mod(ios.publish_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
     }
@@ -809,7 +826,7 @@ static void ios_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *surface)
     }
 }
 
-#ifndef __APPLE__
+#if IOS_DEFERRED_PUBLISH
 /* Adapted from upstream 97860b36b0e9fcdd008e95e58efff9609ca44aee.
  * Coalesce dirty rectangles until the whole panel paint has returned, rather
  * than resampling its vsync at QEMU's 30 ms display-refresh interval. */
@@ -853,7 +870,7 @@ static void ios_cancel_publish(bool stopping)
 
 static void ios_refresh(DisplayChangeListener *dcl)
 {
-#ifndef __APPLE__
+#if IOS_DEFERRED_PUBLISH
     /* Display cleanup can still notify listeners after the main loop ends. */
     if (!ios.attached || !qatomic_read(&ios_vm_alive)) {
         return;
@@ -957,6 +974,9 @@ void qemu_ios_ui_vm_stopped(void)
 #else
     qemu_ios_ui_cancel_input();
     qatomic_set(&ios_vm_alive, 0);
+#if IOS_DEFERRED_PUBLISH
+    ios_cancel_publish(true);
+#endif
 #endif
     /* Also drop `attached`. It used to stay true for the life of the process,
      * so every entry point below that guarded on it kept accepting work after
@@ -985,7 +1005,7 @@ void qemu_ios_ui_vm_started(void)
     if (ios.con) {
         ios.dcl.ops = &ios_dcl_ops;
         ios.dcl.con = ios.con;
-#ifndef __APPLE__
+#if IOS_DEFERRED_PUBLISH
         ios.publish_timer = timer_new_ns(QEMU_CLOCK_REALTIME, ios_publish_timer, NULL);
 #endif
         register_displaychangelistener(&ios.dcl);
