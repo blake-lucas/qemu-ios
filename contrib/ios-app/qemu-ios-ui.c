@@ -39,6 +39,7 @@ void gles_host_set_allowed(bool allowed);
 bool ipod_touch_fmss_io_failed(void);
 bool ipod_touch_nor_io_failed(void);
 bool s5l8930_iop_io_failed(void);
+bool nand_image_io_failed(void);
 bool ipod_touch_mipi_dsi_panel_off(void);
 bool s5l8930_d1815_guest_shutdown_confirmed(void);
 
@@ -949,7 +950,7 @@ int qemu_ios_ui_backlight_level(void)
 bool qemu_ios_ui_storage_failed(void)
 {
     return ipod_touch_fmss_io_failed() || ipod_touch_nor_io_failed() ||
-           s5l8930_iop_io_failed();
+           s5l8930_iop_io_failed() || nand_image_io_failed();
 }
 
 void qemu_ios_storage_stats(QemuIosStorageStats *out)
