@@ -1245,7 +1245,7 @@ uint32_t HELPER(get_cp_reg)(CPUARMState *env, const void *rip)
     const ARMCPRegInfo *ri = rip;
     uint32_t res;
 
-    if (ri->type & ARM_CP_IO) {
+    if ((ri->type & (ARM_CP_IO | ARM_CP_IO_READ_UNLOCKED)) == ARM_CP_IO) {
         bql_lock();
         res = ri->readfn(env, ri);
         bql_unlock();
@@ -1274,7 +1274,7 @@ uint64_t HELPER(get_cp_reg64)(CPUARMState *env, const void *rip)
     const ARMCPRegInfo *ri = rip;
     uint64_t res;
 
-    if (ri->type & ARM_CP_IO) {
+    if ((ri->type & (ARM_CP_IO | ARM_CP_IO_READ_UNLOCKED)) == ARM_CP_IO) {
         bql_lock();
         res = ri->readfn(env, ri);
         bql_unlock();
