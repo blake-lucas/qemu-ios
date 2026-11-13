@@ -374,6 +374,11 @@ static inline const char *gles_id_name(uint32_t id)
  * Only calls that return nothing and pass no guest pointer are queued.
  */
 #define GLES_OP_BATCH                   (GLES_OP_BASE + 9)
+/* GLES_OP_BASE + 10 is upstream qemu-ios's GLES_OP_CAPABILITIES (iPhone 5 renderer features), not taken here; left
+ * unassigned so its numbers stay the same as upstream's. */
+/* args: an ES error. A call the guest shim refuses itself (gles_stub: an entry point with no host implementation)
+ * sets the context's error the way a refusal on the host does, so the app's glGetError sees it. */
+#define GLES_OP_SET_ERROR               (GLES_OP_BASE + 11)
 #define GLES_BATCH_MAX_WORDS            4096
 
 /* Surface pixel formats, as IOSurfaceGetPixelFormat reports them (FourCC). */
