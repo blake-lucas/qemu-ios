@@ -76,6 +76,12 @@ static int gles_slot_of(unsigned id);
 #define GLES_OP_PRESENT         0x1000
 #define GLES_OP_PRESENT_SURFACE 0x1001
 #define GLES_OP_DRAWABLE_STORAGE 0x1008
+#define GLES_OP_CAPABILITIES     0x100a
+/* its answer's bits, as include/hw/arm/guest-services/gles.h has them (this side builds without that header) */
+#define GLES_CAP_FRAMEBUFFER_FETCH 1u
+#define GLES_CAP_MAP_BUFFER        2u
+#define GLES_CAP_NATIVE_DISPATCH   4u
+#define GLES_CAP_FENCE_FINISH      8u
 
 /* The two drawable formats CA hands the engine. Declared up here because the
  * surface plausibility check needs the pixel size before the drawable code

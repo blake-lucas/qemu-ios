@@ -374,8 +374,16 @@ static inline const char *gles_id_name(uint32_t id)
  * Only calls that return nothing and pass no guest pointer are queued.
  */
 #define GLES_OP_BATCH                   (GLES_OP_BASE + 9)
-/* GLES_OP_BASE + 10 is upstream qemu-ios's GLES_OP_CAPABILITIES (iPhone 5 renderer features), not taken here; left
- * unassigned so its numbers stay the same as upstream's. */
+/* Optional implemented renderer features. Unknown on older cores => no bits. This host answers 0 (upstream's
+ * answers bits only for the iPhone 5, which is not taken here). */
+#define GLES_OP_CAPABILITIES            (GLES_OP_BASE + 10)
+#define GLES_CAP_FRAMEBUFFER_FETCH      1u
+/* The A6's shim behavior (contrib/gles-public/opengles.c): OES_mapbuffer and EXT_map_buffer_range advertised, the
+ * stock engine's thread slot published so cached callers (VectorKit, CoreImage) dispatch, and a glFinish before each
+ * APPLE_sync fence. A host without them (every other board's) keeps the shim as those boards were qualified with. */
+#define GLES_CAP_MAP_BUFFER             2u
+#define GLES_CAP_NATIVE_DISPATCH        4u
+#define GLES_CAP_FENCE_FINISH           8u
 /* args: an ES error. A call the guest shim refuses itself (gles_stub: an entry point with no host implementation)
  * sets the context's error the way a refusal on the host does, so the app's glGetError sees it. */
 #define GLES_OP_SET_ERROR               (GLES_OP_BASE + 11)
