@@ -192,6 +192,8 @@ static void nand_image_vm_state(void *opaque, bool running, RunState state)
     if (running) {
         return;
     }
+    /* The vCPUs are paused: a transfer still running in its model's coroutine ends before the flush. */
+    bdrv_drain_all();
     if (n->disk) {
         int result = nand_disk_sync(n->disk);
         if (result < 0) {
