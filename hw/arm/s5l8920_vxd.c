@@ -100,8 +100,8 @@ struct S5L8920VXDState {
      * Where each picture goes, by its tag (the count of pictures given). The host decoder gives them in display
      * order, a reference picture only once the next one is decoded; the hardware writes each to its own buffer as
      * it decodes it, and the guest reorders. Written to the current render's buffer, a stream with B pictures had
-     * each P picture in the next P picture's buffer. ponytail: a stream's last held-back picture never comes (no
-     * end of stream reaches the host decoder); its buffer keeps what it held.
+     * each P picture in the next P picture's buffer. The host decoder hands each picture back as its render
+     * decodes it (vxd_h264_decode), so a picture is in its buffer by the time its fence is answered.
      */
     VXDTarget target[VXD_TARGETS];
     int64_t seq;
@@ -382,8 +382,20 @@ static int vxd_decode(S5L8920VXDState *s, uint32_t ptd, const VXDRender *r)
             }
             vxd_rw(t->ptd, t->chroma + y * t->stride, row, w, true);
         }
-        VXD_LOG(s, "picture %" PRId64 " %ux%u to %08x/%08x stride %u\n", pic.tag, w, hgt, t->luma, t->chroma,
-                t->stride);
+        if (s->trace) {
+            /* Where the picture lands in physical memory, a sample checksum of its luma and when (host clock, us). */
+            hwaddr pa = 0;
+            uint32_t sum = 2166136261u;
+            for (unsigned y = 0; y < hgt; y++) {
+                for (unsigned x = 0; x < w; x += 7) {
+                    sum = (sum ^ pic.plane[0][y * pic.stride[0] + x]) * 16777619u;
+                }
+            }
+            vxd_translate(t->ptd, t->luma, &pa);
+            VXD_LOG(s, "picture %" PRId64 " %ux%u to %08x/%08x stride %u pa %08" HWADDR_PRIx " crc %08x t %" PRId64 "\n",
+                    pic.tag, w, hgt, t->luma, t->chroma, t->stride, pa, sum,
+                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME) / 1000);
+        }
     }
     return got;
 }
@@ -417,6 +429,11 @@ static void vxd_complete(void *opaque)
     S5L8920VXDState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     unsigned n = 0;
+    if (s->trace) {
+        for (unsigned i = 0; i < s->pending && s->due[i] <= now; i++) {
+            VXD_LOG(s, "complete fence %u t %" PRId64 "\n", s->fence[i], qemu_clock_get_ns(QEMU_CLOCK_REALTIME) / 1000);
+        }
+    }
 
     while (n < s->pending && s->due[n] <= now) {
         uint32_t done[3] = { MSG_CMD_COMPLETED << 8 | 12, s->fence[n], 0 };
