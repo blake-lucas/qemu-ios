@@ -39,6 +39,7 @@ void gles_host_set_allowed(bool allowed);
 bool ipod_touch_fmss_io_failed(void);
 bool ipod_touch_nor_io_failed(void);
 bool s5l8930_iop_io_failed(void);
+bool nand_image_io_failed(void);
 bool ipod_touch_mipi_dsi_panel_off(void);
 bool s5l8930_d1815_guest_shutdown_confirmed(void);
 
@@ -689,6 +690,9 @@ static void ios_capture(DisplaySurface *surface)
     int next, y;
     uint8_t *dst;
 
+    if (surface_bits_per_pixel(surface) != 32 || stride < w * 4) {
+        return;     /* the copies below read 4 bytes a pixel */
+    }
     /*
      * The compare and copy run without the BQL (two passes over 2.4 MiB at 640x960): the surface
      * belongs to the main loop, which is running this, and the buffers to frame_lock.
@@ -946,7 +950,7 @@ int qemu_ios_ui_backlight_level(void)
 bool qemu_ios_ui_storage_failed(void)
 {
     return ipod_touch_fmss_io_failed() || ipod_touch_nor_io_failed() ||
-           s5l8930_iop_io_failed();
+           s5l8930_iop_io_failed() || nand_image_io_failed();
 }
 
 void qemu_ios_storage_stats(QemuIosStorageStats *out)

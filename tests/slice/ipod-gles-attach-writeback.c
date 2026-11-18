@@ -3,7 +3,8 @@
  * Without the mark the flush's sync sees only the new attachment, and the old surface's guest memory
  * keeps its stale pixels. Adapted from blake-lucas/qemu-ios b0d0c475ee's surface-attachments test.
  *
- * SLICE hw/arm/gles-host.c fn gles_sync_surface_1
+ * SLICE hw/arm/gles-host.c define GLES_PRIVATE_NAME
+ * SLICE hw/arm/gles-host.c fn gles_guest_name_ok gles_sync_surface_1
  * SLICE:attach hw/arm/gles-host.c range     case GLES_SLOT_FB_RENDERBUFFER: { |     case GLES_SLOT_DELETE_RENDERBUFFERS:
  * PKG glib-2.0
  */
@@ -23,7 +24,7 @@ enum {
     GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_EXT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_EXT,
     GL_TEXTURE, GL_RENDERBUFFER_EXT,
     GLES_SURFACE_BGRA32, GLES_SURFACE_RGBA32, GLES_SURFACE_RGB565, GLES_SURFACE_RGB555,
-    GLES_SLOT_FB_RENDERBUFFER, GLES_SLOT_FB_TEXTURE_2D,
+    GLES_SLOT_FB_RENDERBUFFER, GLES_SLOT_FB_TEXTURE_2D, GL_INVALID_OPERATION,
 };
 typedef struct GLESSurface { bool dirty, detached; unsigned format; } GLESSurface;
 static struct { unsigned bound_framebuffer; bool fb_dirty; GHashTable *surfaces, *rb_sized; } gh;
@@ -39,7 +40,8 @@ static void glGetFramebufferAttachmentParameterivEXT(GLenum t, GLenum point, GLe
     *v = pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_EXT ? (color ? GL_TEXTURE : GL_RENDERBUFFER_EXT)
                                                             : (GLint)color;
 }
-static void gles_refuse(const char *fmt, const char *v) { refusals++; }
+static bool gles_refuse(const char *fmt, ...) { refusals++; return true; }
+static int64_t gles_reject(GLenum e) { return -1; }
 static char *gles_fourcc(unsigned f, char *s) { strcpy(s, "bad"); return s; }
 static void gles_set_drawable(unsigned fb, bool v) { drawable = v; if (v) color = 0; }
 static bool gles_is_drawable(unsigned fb) { return drawable; }

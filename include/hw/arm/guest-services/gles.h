@@ -374,6 +374,19 @@ static inline const char *gles_id_name(uint32_t id)
  * Only calls that return nothing and pass no guest pointer are queued.
  */
 #define GLES_OP_BATCH                   (GLES_OP_BASE + 9)
+/* Optional implemented renderer features. Unknown on older cores => no bits. This host answers 0 (upstream's
+ * answers bits only for the iPhone 5, which is not taken here). */
+#define GLES_OP_CAPABILITIES            (GLES_OP_BASE + 10)
+#define GLES_CAP_FRAMEBUFFER_FETCH      1u
+/* The A6's shim behavior (contrib/gles-public/opengles.c): OES_mapbuffer and EXT_map_buffer_range advertised, the
+ * stock engine's thread slot published so cached callers (VectorKit, CoreImage) dispatch, and a glFinish before each
+ * APPLE_sync fence. A host without them (every other board's) keeps the shim as those boards were qualified with. */
+#define GLES_CAP_MAP_BUFFER             2u
+#define GLES_CAP_NATIVE_DISPATCH        4u
+#define GLES_CAP_FENCE_FINISH           8u
+/* args: an ES error. A call the guest shim refuses itself (gles_stub: an entry point with no host implementation)
+ * sets the context's error the way a refusal on the host does, so the app's glGetError sees it. */
+#define GLES_OP_SET_ERROR               (GLES_OP_BASE + 11)
 #define GLES_BATCH_MAX_WORDS            4096
 
 /* Surface pixel formats, as IOSurfaceGetPixelFormat reports them (FourCC). */
@@ -399,6 +412,14 @@ static inline const char *gles_id_name(uint32_t id)
 #define GLES_SURFACE_LA88               0x32433038  /* '2C08' */
 /* The same two channels as 7.x QuartzCore names them on its IOSurfaces (text and glyph layers). */
 #define GLES_SURFACE_LA88_IOS7          0x4c413838  /* 'LA88' */
+/* 16 bits, A1R5G5B5 little-endian (premultiplied: a clear pixel is 0), in rows: 3.1.3's album
+ * covers (ArtworkCache's 320x320, 16-bit skip-first data) as CoreAnimation hands them over. */
+#define GLES_SURFACE_ARGB1555           0x35353531  /* '5551' */
+/* The same 16 bits in the GPU's twiddled
+ * order instead of rows: a square power-of-two surface whose pixel (x, y) is at the index
+ * that interleaves their bits, y's in the even ones. Cover Flow's album covers and their
+ * placeholder (4.2.1: 512x512, stride 1024); IOSurface and QuartzCore name it from 7E18. */
+#define GLES_SURFACE_ARGB1555_TWIDDLED  0x73353531  /* 's551' */
 
 #ifndef OUT_OF_TREE_BUILD
 int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a);

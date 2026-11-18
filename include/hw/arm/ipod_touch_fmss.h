@@ -78,6 +78,10 @@ typedef struct IPodTouchFMSSState
     uint32_t reg_script_csgenr15; /* Sequencer-owned chunk-loop state. */
     uint32_t reg_cs_status;       /* CSSTATUS (0xC30) of the last program run. */
     bool read_clean;              /* the read moved before the next run found only erased pages */
+    /* A page transfer in its coroutine (fmss_transfer), the one written meanwhile, and a go waiting for it;
+     * transient, never migrated. */
+    bool transferring, go_pending;
+    uint32_t transfer_op, transfer_next;
     char *nand_path;
     char *nand_overlay;   /* writable COW overlay dir, or NULL to discard writes */
     /* nand_path as a NAND image store (nand-image.h), written in place: no overlay, no packed base. */
@@ -128,9 +132,13 @@ typedef struct IPodTouchFMSSState
      * page read back. This memory is serialized in VMState but not written to
      * disk: the mapping holds until the FTL is rebuilt at the next cold boot.
      *
-     * It is keyed by physical page, so it is bounded by the size of the flash
-     * (~520 MB if every page were rewritten) rather than by how much the guest
-     * writes over the life of the session.
+     * It is keyed by physical page (4 chip selects of 4096 x 128 pages, checked
+     * where a write script is read), so it is bounded by the size of the flash
+     * rather than by how much the guest writes over the life of the session:
+     * 4160 bytes a page, about 8.7 GB if every page were rewritten. A smaller
+     * cap would lose pages the FTL reads back.
+     * ponytail: held in RAM; spill it to a file beside the overlay if a session
+     * that rewrites most of the flash ever matters.
      */
     GTree *phys_pages;
 } IPodTouchFMSSState;

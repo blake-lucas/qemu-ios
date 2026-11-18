@@ -6,6 +6,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/atomic.h"
 #include "qemu/bswap.h"
 #include "qobject/qjson.h"
 #include "qobject/qdict.h"
@@ -21,6 +22,17 @@
 #ifdef _WIN32
 #include <winioctl.h>
 #endif
+
+/*
+ * A failed write, erase or flush latches: the helper must not report the stop as clean, which lets the device's old
+ * store be deleted (qemu_ios_ui_storage_failed).
+ */
+static bool nand_image_failed;
+
+bool nand_image_io_failed(void)
+{
+    return qatomic_read(&nand_image_failed);
+}
 
 struct NANDImage {
     BlockBackend *chip[NAND_IMAGE_MAX_CHIPS];
@@ -180,9 +192,12 @@ static void nand_image_vm_state(void *opaque, bool running, RunState state)
     if (running) {
         return;
     }
+    /* The vCPUs are paused: a transfer still running in its model's coroutine ends before the flush. */
+    bdrv_drain_all();
     if (n->disk) {
         int result = nand_disk_sync(n->disk);
         if (result < 0) {
+            qatomic_set(&nand_image_failed, true);
             error_report("NAND image: sync: %s", strerror(-result));
         }
         return;
@@ -190,6 +205,7 @@ static void nand_image_vm_state(void *opaque, bool running, RunState state)
     for (unsigned i = 0; i < n->geo.chips; i++) {
         int result = blk_flush(n->chip[i]);
         if (result < 0) {
+            qatomic_set(&nand_image_failed, true);
             error_report("NAND image: flush of chip select %u: %s", i, strerror(-result));
         }
     }
@@ -314,6 +330,7 @@ int nand_image_read(NANDImage *n, unsigned chip, uint32_t page, uint8_t *record)
     if (nand_image_bad(n, chip, page)) {
         return -EINVAL;
     }
+    /* bounded: nand_image_bad checked chip */
     result = n->disk ? nand_disk_read(n->disk, nand_disk_record(n->disk, chip, page), n->stride, record)
                      : blk_pread(n->chip[chip], (int64_t)page * n->stride, n->stride, record, 0);
     if (result < 0) {
@@ -329,25 +346,33 @@ int nand_image_write(NANDImage *n, unsigned chip, uint32_t page, const uint8_t *
         return -EINVAL;
     }
     nand_image_xor(n, n->buffer, record);
-    if (n->disk) {
-        return nand_disk_write(n->disk, nand_disk_record(n->disk, chip, page), n->stride, n->buffer);
+    /* bounded: nand_image_bad checked chip */
+    int result = n->disk ? nand_disk_write(n->disk, nand_disk_record(n->disk, chip, page), n->stride, n->buffer)
+                         : blk_pwrite(n->chip[chip], (int64_t)page * n->stride, n->stride, n->buffer, 0);
+
+    if (result < 0) {
+        qatomic_set(&nand_image_failed, true);
     }
-    return blk_pwrite(n->chip[chip], (int64_t)page * n->stride, n->stride, n->buffer, 0);
+    return result;
 }
 
 int nand_image_erase(NANDImage *n, unsigned chip, uint32_t block)
 {
-    uint32_t first = block * n->geo.pages_per_block;
+    uint64_t first = (uint64_t)block * n->geo.pages_per_block;   /* 32 bits would wrap */
 
-    if (nand_image_bad(n, chip, first)) {
+    if (first > UINT32_MAX || nand_image_bad(n, chip, first)) {
         return -EINVAL;
     }
-    if (n->disk) {
-        return nand_disk_erase(n->disk, chip, block);
-    }
     /* Zeros read as blank whether the host unmaps the range or writes them. */
-    return blk_pwrite_zeroes(n->chip[chip], (int64_t)first * n->stride,
-                             (int64_t)n->geo.pages_per_block * n->stride, BDRV_REQ_MAY_UNMAP);
+    /* bounded: nand_image_bad checked chip */
+    int result = n->disk ? nand_disk_erase(n->disk, chip, block)
+                         : blk_pwrite_zeroes(n->chip[chip], (int64_t)first * n->stride,
+                                             (int64_t)n->geo.pages_per_block * n->stride, BDRV_REQ_MAY_UNMAP);
+
+    if (result < 0) {
+        qatomic_set(&nand_image_failed, true);
+    }
+    return result;
 }
 
 /* ---- containers: a qcow2 system image under the device's qcow2 overlay ---- */

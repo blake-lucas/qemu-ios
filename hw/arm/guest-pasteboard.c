@@ -254,15 +254,6 @@ static char *guest_pb_get_pb_status(GuestPasteboard *pb)
                            "(agent: %s)", agent);
 }
 
-static int pb_copy(CPUState *cpu, uint32_t address, uint8_t *data,
-                   size_t length, bool write)
-{
-    if (length && length - 1 > UINT32_MAX - address) {
-        return -1;
-    }
-    return cpu_memory_rw_debug(cpu, address, data, length, write);
-}
-
 bool guest_pb_call(GuestPasteboard *pb, CPUState *cpu, qemu_call_t *q,
                    int32_t *err)
 {
@@ -285,8 +276,8 @@ bool guest_pb_call(GuestPasteboard *pb, CPUState *cpu, qemu_call_t *q,
         if (len > pb->pb_out_len - off) {
             len = pb->pb_out_len - off;
         }
-        if (pb_copy(cpu, q->args.pb.buffer_guest_ptr,
-                    (uint8_t *)pb->pb_out + off, len, true)) {
+        if (guest_copy(cpu, q->args.pb.buffer_guest_ptr,
+                       (uint8_t *)pb->pb_out + off, len, true)) {
             q->retval = -1;
             *err = EFAULT;
             return true;
@@ -329,8 +320,8 @@ bool guest_pb_call(GuestPasteboard *pb, CPUState *cpu, qemu_call_t *q,
             return true;
         }
         pb->pb_in = g_realloc(pb->pb_in, off + len + 1);
-        if (pb_copy(cpu, q->args.pb.buffer_guest_ptr,
-                    (uint8_t *)pb->pb_in + off, len, false)) {
+        if (guest_copy(cpu, q->args.pb.buffer_guest_ptr,
+                       (uint8_t *)pb->pb_in + off, len, false)) {
             g_clear_pointer(&pb->pb_in, g_free);
             pb->pb_in_len = 0;
             q->retval = -1;

@@ -545,7 +545,8 @@ static bool scaler_rgb(IPodScalerState *s)
  * decoded movie frame (VXD's 480x270 at stride 512) upright for the iPhone 4's portrait panel
  * (270x480 at stride 320), formats +0x10/+0x30 both 0, planes at +0x14/+0x18 and +0x34/+0x38, plane
  * strides in bytes at +0x1c and +0x3c (UV << 16 | Y). The camera's viewfinder takes the same path scaled
- * down: the ISP's 2592x1936 frame to 640x852, turned.
+ * down: the ISP's 2592x1936 frame to 640x852, turned. Each side's planes are tiled or linear as its format's
+ * bit 10 says (scaler_row), as for RGB: AppleM2ScalerCSCHal sets the bit whatever the format.
  * ponytail: nearest sampling where the hardware has polyphase taps, and one turning direction (the movie
  * came out upright with it); +0x58 (3 here) likely selects it.
  */
@@ -557,6 +558,7 @@ static bool scaler_nv12(IPodScalerState *s)
     unsigned sys = r[0x1c / 4] & 0xffff, suvs = r[0x1c / 4] >> 16;
     unsigned dys = r[0x3c / 4] & 0xffff, duvs = r[0x3c / 4] >> 16;
     bool rot = sw != sh && dw != dh && (sw > sh) != (dw > dh);
+    bool stiled = r[0x10 / 4] & 0x400, dtiled = r[0x30 / 4] & 0x400;
 
     if ((r[0x10 / 4] & 7) || (r[0x30 / 4] & 7) || !sw || !sh || sw > 4096 || sh > 4096 || (sw | sh) & 1 ||
         !dw || !dh || (dw | dh) & 1 || sys < sw || suvs < sw || dys < dw || duvs < dw) {
@@ -565,8 +567,9 @@ static bool scaler_nv12(IPodScalerState *s)
     uint8_t *y = scaler_scratch(s, 0, (size_t)sw * sh), *uv = scaler_scratch(s, 1, (size_t)sw * sh / 2);
     g_autofree uint8_t *row = g_malloc(dw);
     for (unsigned i = 0; i < sh; i++) {
-        if (!scaler_read_bus(s, r[0x14 / 4] + i * sys, y + (size_t)i * sw, sw) ||
-            (!(i & 1) && !scaler_read_bus(s, r[0x18 / 4] + i / 2 * suvs, uv + (size_t)i / 2 * sw, sw))) {
+        if (!scaler_read_bus(s, scaler_row(r[0x14 / 4], i, sys, ROUND_UP(sw, 256), stiled), y + (size_t)i * sw, sw) ||
+            (!(i & 1) && !scaler_read_bus(s, scaler_row(r[0x18 / 4], i / 2, suvs, ROUND_UP(sw, 256), stiled),
+                                          uv + (size_t)i / 2 * sw, sw))) {
             return false;
         }
     }
@@ -586,7 +589,7 @@ static bool scaler_nv12(IPodScalerState *s)
         for (unsigned x = 0; x < dw; x++) {
             row[x] = line[xo[x]];
         }
-        if (!scaler_write_bus(s, r[0x34 / 4] + j * dys, row, dw)) {
+        if (!scaler_write_bus(s, scaler_row(r[0x34 / 4], j, dys, ROUND_UP(dw, 256), dtiled), row, dw)) {
             return false;
         }
     }
@@ -602,7 +605,7 @@ static bool scaler_nv12(IPodScalerState *s)
             row[2 * x] = line[xo[x]];
             row[2 * x + 1] = line[xo[x] + 1];
         }
-        if (!scaler_write_bus(s, r[0x38 / 4] + j * duvs, row, dw)) {
+        if (!scaler_write_bus(s, scaler_row(r[0x38 / 4], j, duvs, ROUND_UP(dw, 256), dtiled), row, dw)) {
             return false;
         }
     }
@@ -624,10 +627,12 @@ static bool scaler_convert(IPodScalerState *s)
     unsigned fmt = r[0x30 / 4] & 7, bpp = fmt == 4 ? 2 : 4;
     unsigned ds = (r[0x3c / 4] & 0xffff) * bpp;
     uint32_t ybase = r[0x14 / 4], uvbase = r[0x18 / 4], dest = r[0x34 / 4];
+    bool stiled = r[0x10 / 4] & 0x400, dtiled = r[0x30 / 4] & 0x400;
     /* ponytail: implement the observed unscaled NV12-to-RGB movie path first;
-     * scaling needs the programmed polyphase filters, not guessed sampling. */
+     * scaling needs the programmed polyphase filters, not guessed sampling.
+     * Either side tiled or linear (+0x10/+0x30 bit 10), addressed as scaler_rgb's. */
     if (!w || !h || w > 2048 || h > 2048 || (w | h) & 1 ||
-        r[0x10 / 4] || (fmt != 4 && fmt != 6) || (r[0x30 / 4] & ~7u) ||
+        (r[0x10 / 4] & ~0x400u) || (fmt != 4 && fmt != 6) || (r[0x30 / 4] & ~0x407u) ||
         r[0x20 / 4] || r[0x24 / 4] != r[0x40 / 4] || ys < w || uvs < w || ds < w * bpp ||
         (!s->xlate && (!scaler_range(ybase, ys, h, w) ||
                        !scaler_range(uvbase, uvs, h / 2, w) ||
@@ -637,8 +642,9 @@ static bool scaler_convert(IPodScalerState *s)
     g_autofree uint8_t *row = g_malloc(w * bpp);
     /* Snapshot sources before writing: IOSurface transfers may alias. Through the DART on the S5L8920 (3GS). */
     for (unsigned y = 0; y < h; y++) {
-        if (!scaler_read_bus(s, ybase + y * ys, yplane + y * w, w) ||
-            (!(y & 1) && !scaler_read_bus(s, uvbase + (y / 2) * uvs, uvplane + (y / 2) * w, w))) {
+        if (!scaler_read_bus(s, scaler_row(ybase, y, ys, ROUND_UP(w, 256), stiled), yplane + y * w, w) ||
+            (!(y & 1) && !scaler_read_bus(s, scaler_row(uvbase, y / 2, uvs, ROUND_UP(w, 256), stiled),
+                                          uvplane + (y / 2) * w, w))) {
             return false;
         }
     }
@@ -666,7 +672,7 @@ static bool scaler_convert(IPodScalerState *s)
                 row[x * 4 + 2] = rgb[0]; row[x * 4 + 3] = 255;
             }
         }
-        if (!scaler_write_bus(s, dest + y * ds, row, w * bpp)) {
+        if (!scaler_write_bus(s, scaler_row(dest, y, ds, ROUND_UP(w * bpp, 256), dtiled), row, w * bpp)) {
             return false;
         }
     }

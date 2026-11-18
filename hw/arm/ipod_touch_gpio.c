@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_gpio.h"
+#include "hw/arm/ipod_touch_guard.h"
 #include "migration/vmstate.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -65,9 +66,10 @@ static uint64_t s5l8900_gpio_read_pad(IPodTouchGPIOState *s, hwaddr addr)
     return 0;
 }
 
+/* GPIO2PAD reaches 0xff; the pads stop at NUM_GPIO_PADS. */
 bool gpio_is_on(uint32_t *state, uint32_t gpio)
 {
-    return (state[GPIO2PAD(gpio)] & (1 << GPIO2PIN(gpio)));
+    return (state[IT_IDX("gpio", GPIO2PAD(gpio), NUM_GPIO_PADS)] & (1 << GPIO2PIN(gpio)));
 }
 
 bool gpio_is_off(uint32_t *state, uint32_t gpio)
@@ -77,12 +79,12 @@ bool gpio_is_off(uint32_t *state, uint32_t gpio)
 
 void gpio_set_on(uint32_t *state, uint32_t gpio)
 {
-    state[GPIO2PAD(gpio)] |= (1 << GPIO2PIN(gpio));
+    state[IT_IDX("gpio", GPIO2PAD(gpio), NUM_GPIO_PADS)] |= (1 << GPIO2PIN(gpio));
 }
 
 void gpio_set_off(uint32_t *state, uint32_t gpio)
 {
-    state[GPIO2PAD(gpio)] &= ~(1 << GPIO2PIN(gpio));
+    state[IT_IDX("gpio", GPIO2PAD(gpio), NUM_GPIO_PADS)] &= ~(1 << GPIO2PIN(gpio));
 }
 
 static const MemoryRegionOps gpio_ops = {

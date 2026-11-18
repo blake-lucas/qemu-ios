@@ -15,9 +15,19 @@
  *
  *   IT_IDX(dev, idx, n)     bound an array index to [0, n), clamping high
  *   IT_SIZE(dev, n, max)    bound a length or allocation to [0, max]
+ *   IT_RANGE(dev, off, len, size)  true when [off, off + len) lies in [0, size),
+ *                           computed without overflow; refuse the operation if not
  *   IT_FIELD(v, width)      mask a value into a `width`-bit register field
  *
- * IT_IDX and IT_SIZE log once per occurrence at LOG_GUEST_ERROR with the device
+ * Clamping (IT_IDX, IT_SIZE) suits a value whose out-of-range use only has to stay
+ * inside the array; where acting on a clamped value would be wrong (a write to the
+ * wrong register, a short copy reported as complete), test with IT_RANGE and refuse.
+ * Every guest-driven host allocation also has a per-device cap (IT_SIZE against a
+ * named constant, or a refusal).  tests/lint/guest-bounds.py, run by
+ * tests/gate.sh --quick, flags guest values reaching an index, a length or an
+ * allocation without one of these or an explicit bounds test.
+ *
+ * IT_IDX, IT_SIZE and IT_RANGE log once per occurrence at LOG_GUEST_ERROR with the device
  * name and the offending expression, then return a safe value -- they never
  * abort. IT_FIELD is silent: truncating to the field width is what the hardware
  * does, not an error.
@@ -61,10 +71,25 @@ static inline uint64_t it_guard_size(const char *dev, const char *expr,
     return n;
 }
 
+static inline bool it_guard_range(const char *dev, const char *expr,
+                                  uint64_t off, uint64_t len, uint64_t size)
+{
+    if (off > size || len > size - off) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "[%s] %s: 0x%" PRIx64 " + 0x%" PRIx64 " is outside 0x%"
+                      PRIx64 "; refused\n", dev, expr, off, len, size);
+        return false;
+    }
+    return true;
+}
+
 #define IT_IDX(dev, idx, n)    it_guard_idx((dev), #idx, (uint64_t)(idx), \
                                             (uint64_t)(n))
 #define IT_SIZE(dev, n, max)   it_guard_size((dev), #n, (uint64_t)(n), \
                                              (uint64_t)(max))
+#define IT_RANGE(dev, off, len, size) \
+    it_guard_range((dev), #off " + " #len, (uint64_t)(off), (uint64_t)(len), \
+                   (uint64_t)(size))
 #define IT_FIELD(v, width)     ((uint32_t)((v) & ((1u << (width)) - 1)))
 
 #endif /* HW_ARM_IPOD_TOUCH_GUARD_H */

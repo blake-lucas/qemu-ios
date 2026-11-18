@@ -6,6 +6,10 @@
     case GLES_SLOT_FB_RENDERBUFFER: {    /* target, attach, rbtarget, rb */
         uint32_t attach = a[1], rb = a[3];
 
+        if (!gles_guest_name_ok(rb)) {
+            gles_refuse("name:private:%u", slot);
+            return gles_reject(GL_INVALID_OPERATION);
+        }
         if (attach == GL_COLOR_ATTACHMENT0_EXT) {
             if (gles_sync_surface(cpu)) return -1;
             /* A color renderbuffer that never got GL storage is the CA
@@ -38,6 +42,10 @@
          * current color attachment sent its render-to-texture pass to the
          * screen and left the texture empty, which composited as a white
          * level while the menus (UIKit) looked perfect. */
+        if (!gles_guest_name_ok(a[3])) {
+            gles_refuse("name:private:%u", slot);
+            return gles_reject(GL_INVALID_OPERATION);
+        }
         if (a[1] == GL_COLOR_ATTACHMENT0_EXT) {
             if (gles_sync_surface(cpu)) return -1;
             gles_set_drawable(gh.bound_framebuffer, false);

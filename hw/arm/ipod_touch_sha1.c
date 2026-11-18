@@ -1,5 +1,6 @@
 #include "hw/arm/ipod_touch_sha1.h"
 #include "hw/arm/sha1_compress.h"
+#include "hw/arm/ipod_touch_guard.h"
 #include "exec/cpu-common.h"
 #include "migration/vmstate.h"
 #include "trace.h"
@@ -7,6 +8,8 @@
 
 /* Bound host scratch storage, not the full-width DMA length register. */
 #define IT_SHA1_DMA_CHUNK (64 * 1024)
+/* The most one memory-mode job hashes: no board has more RAM, and the job runs with the BQL held. */
+#define IT_SHA1_MAX_JOB (512 * 1024 * 1024)
 
 /*
  * S5L8720 SHA1 engine.
@@ -101,7 +104,7 @@ static void sha1_run(IPodTouchSHA1State *s, bool notify)
     }
 
     if (s->memory_mode) {
-        uint32_t nblocks = s->insize / 0x40;
+        uint32_t nblocks = IT_SIZE("sha1", s->insize, IT_SHA1_MAX_JOB) / 0x40;
 
         /* Batch physical reads without allocating the guest's entire job.
          * The engine chains raw blocks and leaves final padding to the guest. */

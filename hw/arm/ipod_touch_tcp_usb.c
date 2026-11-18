@@ -379,6 +379,13 @@ static void tcp_usb_pump(tcp_usb_state_t *state, int _can_read, int _can_write)
 			if (state->amount_done < sizeof(*state->header)) {
 				return;
 			}
+			if ((state->header->ep & USB_DIR_IN) != 0 &&
+				tcp_usb_payload_len(state->header) > state->request_len) {
+				fprintf(stderr, "tcp_usb: response of %zu bytes for a %zu-byte request\n",
+						tcp_usb_payload_len(state->header), state->request_len);
+				tcp_usb_do_closed(state);
+				return;
+			}
 		}
 
 		if ((state->header->ep & USB_DIR_IN) != 0 && tcp_usb_payload_len(state->header) > 0) {
@@ -532,6 +539,7 @@ int tcp_usb_request(tcp_usb_state_t *_state, tcp_usb_header_t *_header, const ch
 	_state->amount_done = 0;
 	_state->buffer = (char *)_data;
 	_state->header = _header;
+	_state->request_len = tcp_usb_payload_len(_header);
 	_state->owns_packet = false; /* caller owns these */
 
 	tcp_usb_callback(_state, 0, 1);

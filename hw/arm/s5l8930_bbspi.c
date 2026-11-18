@@ -196,7 +196,7 @@ static void bbspi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case R_TXDATA:
         t = MIN(s->regs[R_TXCNT / 4] * bbspi_ws(s), FRAME_MAX);
         for (unsigned i = 0; i < bbspi_ws(s) && s->tx_len < t; i++) {
-            s->tx[s->tx_len++] = val >> (8 * i);
+            s->tx[s->tx_len++] = val >> (8 * i);   /* bounded: the loop's tx_len < t <= FRAME_MAX */
         }
         if (t && s->tx_len == t && s->modem) {
             TRACE("MOSI hdr %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -317,10 +317,17 @@ static const Property bbspi_props[] = {
     DEFINE_PROP_UINT32("base", IosBbSpiState, base, 0),
 };
 
+static int bbspi_post_load(void *opaque, int version_id)
+{
+    IosBbSpiState *s = opaque;
+    return s->tx_len <= FRAME_MAX && s->rx_len <= FRAME_MAX && s->rx_pos <= s->rx_len ? 0 : -EINVAL;
+}
+
 static const VMStateDescription bbspi_vmstate = {
     .name = "ios-baseband-spi",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = bbspi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, IosBbSpiState, 0x100 / 4),
         VMSTATE_UINT8_ARRAY(tx, IosBbSpiState, FRAME_MAX),

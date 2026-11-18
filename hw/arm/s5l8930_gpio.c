@@ -317,6 +317,9 @@ void s5l8930_gpio_set_rest_level(DeviceState *dev, unsigned pin, bool level)
 {
     S5L8930GPIOState *s = S5L8930_GPIO(dev);
 
+    if (pin >= s->ports * 8) {
+        return;
+    }
     if (level) {
         s->rest_low[pin / 32] &= ~(1u << (pin % 32));
     } else {

@@ -47,6 +47,10 @@
 #include "qemu/memfd.h"
 #endif
 
+#if defined(__APPLE__) && TARGET_OS_OSX
+__thread int qemu_jit_state;
+#endif
+
 #ifdef CONFIG_LINUX
 #include <sys/syscall.h>
 #endif

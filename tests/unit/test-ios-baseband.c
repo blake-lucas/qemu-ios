@@ -1628,6 +1628,19 @@ static void test_radio_nvram(void)
         }
     }
     CHECK(got == 0x600);
+    /* Blocks whose byte offset overflows an int are past the image too, not a read
+     * at the wrapped offset (2147483647 * 512 wraps to 512 bytes before the image). */
+    for (unsigned i = 0; i < 2; i++) {
+        static const char *const far[] = { "at+xdrv=9,1,2147483647;\r", "at+xdrv=9,1,8388608;\r" };
+        int status = 0, b;
+        char *line;
+
+        outlen = 0;
+        ios_bb_input(&bb, (const uint8_t *)far[i], strlen(far[i]));
+        outbuf[outlen] = 0;
+        line = strstr((char *)outbuf, "+XDRV: 9,1,");
+        CHECK(line && sscanf(line, "+XDRV: 9,1,%d,%d,", &status, &b) == 2 && status != 0);
+    }
     CHECK(nv[0] == 0 && nv[1] == 1 && ((nv[2] << 8) | nv[3]) * 2 - 4 == 1024);
     bool zero = true, ones = true;
     for (int i = 0; i < 128; i++) {

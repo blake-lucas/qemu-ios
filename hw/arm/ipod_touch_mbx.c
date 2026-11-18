@@ -982,11 +982,25 @@ static const VMStateDescription vmstate_mbx_2d_surface = {
     }
 };
 
+// A partial 2D block, and the blit state its decoding leaves, as only a guest's words could have made them: the next
+// word lands at block[block_len], and the scales divide.
+static int ipod_touch_mbx_post_load(void *opaque, int version_id)
+{
+    IPodTouchMBXState *s = opaque;
+
+    if (s->block_len >= ipod_touch_mbx_2d_block_len(s->block[0]) || s->scale_x - 1 > 0x3fe ||
+        s->scale_y - 1 > 0x3fe || s->src_x > 0x1fff || s->src_y > 0x1fff) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 // Version 3: the 2D and 3D model replaced the completion shim (versions 1 and 2), whose state does not carry over.
 static const VMStateDescription vmstate_ipod_touch_mbx = {
     .name = "ipod_touch_mbx",
     .version_id = 3,
     .minimum_version_id = 3,
+    .post_load = ipod_touch_mbx_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, IPodTouchMBXState, MBX_NUM_REGS),
         VMSTATE_UINT32_ARRAY(wrapper_regs, IPodTouchMBXState, MBX2_SIZE / 4),

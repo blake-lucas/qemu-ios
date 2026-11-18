@@ -94,6 +94,7 @@ typedef struct A4Board {
     uint64_t dram_size;                  /* also mirrored right above itself (iBoot) */
     uint32_t chipid[2];                  /* ChipID fuse words 0-1 */
     uint8_t board_id;                    /* PMGR POWER_ID[23:16] */
+    uint32_t apll, mpll;                 /* PMGR APLL and MPLL CON0 as iBoot leaves them; 0, 0: the iPad's (N81 too) */
     const uint8_t *product_id;           /* /product product-id (20 bytes) as iBoot fills it; NULL: left zero */
     /* Panel: scan-out size, the DSI ID read, lanes. */
     uint16_t width, height;
@@ -288,6 +289,8 @@ static const A4Board a4_n90 = {
     .dram_size = 0x20000000,
     .chipid = { 0x31800387, 0x80758000 },    /* same die as K48 */
     .board_id = 0x00,
+    /* The real unit's clock-frequencies: APLL 800 MHz (P 6, M 200, S 1), MPLL 500 MHz (P 3, M 125, S 2). */
+    .apll = 0xA0018641, .mpll = 0xA000C3EA,
     .product_id = a4_n90_product_id,
     .width = 640, .height = 960,
     .panel_id = 0x0969e5a1,                  /* ponytail: K48's, as N81's */
@@ -380,6 +383,7 @@ struct IPad1MachineState {
     bool ring_silent;                    /* ring-switch: the side switch at silent (default off: ring) */
     uint8_t wifi_mac[6];                 /* BCM4329 CIS MAC (wifi-mac) */
     bool wifi_mac_explicit;
+    char *wifi_country;                  /* the access point's 802.11d country (wifi-country), NULL = the card's */
     bool iop_core;                       /* run the IOP firmware on a second core (default; off: the HLE) */
     DeviceState *iopcore;
     bool resume_boot;                    /* the next reset is the AP's power-on out of hibernate */
@@ -463,15 +467,6 @@ static qemu_irq ipad1_irq(IPad1MachineState *s, int irq)
  * keyboard services are replaced by the USB keyboard here
  * (docs/ipad1/guest-services.md).
  */
-static int ipad1_agent_copy(void *opaque, uint32_t address, uint8_t *data,
-                            size_t length, bool write)
-{
-    if (length && length - 1 > UINT32_MAX - address) {
-        return -1;
-    }
-    return cpu_memory_rw_debug(opaque, address, data, length, write);
-}
-
 static void ipad1_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri,
                             uint64_t value)
 {
@@ -514,7 +509,7 @@ static void ipad1_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri,
                                    q.args.ag.buffer_guest_ptr, q.args.ag.offset,
                                    q.args.ag.length,
                                    qemu_clock_get_ms(QEMU_CLOCK_REALTIME),
-                                   candidate, ipad1_agent_copy, cs);
+                                   candidate, guest_copy, cs);
         err = q.retval < 0 ? EINVAL : 0;
         break;
     }
@@ -1448,6 +1443,10 @@ static void ipad1_init(MachineState *machine)
         }
     }
     qdev_prop_set_uint8(dev, "board-id", s->board->board_id);
+    if (s->board->apll) {
+        qdev_prop_set_uint32(dev, "apll", s->board->apll);
+        qdev_prop_set_uint32(dev, "mpll", s->board->mpll);
+    }
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, S5L8930_PMGR_BASE);
     sysbus_connect_irq(sbd, 0, ipad1_irq(s, S5L8930_IRQ_TIMER0));
@@ -1532,6 +1531,9 @@ static void ipad1_init(MachineState *machine)
         /* qom-set /machine wifi-bssid aa:bb:..: a new access point for
          * locationd, which caches a position per BSSID (location.md). */
         object_property_add_alias(OBJECT(machine), "wifi-bssid", OBJECT(card), "bssid");
+        if (s->wifi_country) {
+            object_property_set_str(OBJECT(card), "country", s->wifi_country, &error_fatal);
+        }
         card->card_present = true;
         sysbus_realize_and_unref(SYS_BUS_DEVICE(card), &error_fatal);
         /* The soldered combo chip exists even with host networking disabled.
@@ -1938,6 +1940,19 @@ static void ipad1_set_wifi_mac(Object *obj, const char *value, Error **errp)
     }
     memcpy(s->wifi_mac, mac, sizeof(mac));
     s->wifi_mac_explicit = true;
+}
+
+static char *ipad1_get_wifi_country(Object *obj, Error **errp)
+{
+    return g_strdup(IPAD1_MACHINE(obj)->wifi_country ?: "");
+}
+
+static void ipad1_set_wifi_country(Object *obj, const char *value, Error **errp)
+{
+    IPad1MachineState *s = IPAD1_MACHINE(obj);
+
+    g_free(s->wifi_country);
+    s->wifi_country = g_strdup(value);
 }
 
 static char *ipad1_get_kboot(Object *obj, Error **errp)
@@ -2514,6 +2529,10 @@ static void ipad1_class_init(ObjectClass *klass, const void *data)
                                   ipad1_set_wifi_mac);
     object_class_property_set_description(klass, "wifi-mac",
         "BCM4329 card MAC (unset keeps the board's placeholder)");
+    object_class_property_add_str(klass, "wifi-country", ipad1_get_wifi_country,
+                                  ipad1_set_wifi_country);
+    object_class_property_set_description(klass, "wifi-country",
+        "The access point's 802.11d country, two letters (unset: US)");
     object_class_property_add_str(klass, "kboot", ipad1_get_kboot,
                                   ipad1_set_kboot);
     object_class_property_set_description(klass, "kboot",

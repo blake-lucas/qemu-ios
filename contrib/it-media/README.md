@@ -140,9 +140,14 @@ MusicLibrary sets the native media kind and video fields. The caller supplies
 metadata and is responsible for validating the codecs; accepting a filename
 extension does not mean the device can decode its contents.
 
-Artwork: MusicLibrary reads a purchased item's cover from the ArtworkCache in
-`Purchases/MobileArtworkDB` (`artwork.db`, `artwork.pix`) under the decimal
-`artworkDBRecordID`, which the insert takes from `itemId`. The helper sets
+Artwork: MusicLibrary reads a purchased item's cover from an ArtworkCache
+(`artwork.db`, `artwork.pix`) under the decimal `artworkDBRecordID`, which the insert takes from
+`itemId`. On 3.x the cache is `Purchases/MobileArtworkDB`; on 4.0 to 4.2.1 it is the `MobileArtworkDB`
+beside the purchase's own media (8C148 `-[MLTrack mobileArtworkCacheFolder]`: the track's path, its last
+component replaced), here `LightTouch/<staging-id>/MobileArtworkDB`; one in `Purchases` there is never read,
+so Music, Now Playing and Cover Flow showed the placeholder. The helper picks the cache by whether
+`MLTrack` has that method. A 4.x song imported before keeps no cover until it is imported again
+(same staging ID: `already-imported`, the cover rendered where 4.x reads it). The helper sets
 an unused `itemId` from the native library under the import lock and, before
 inserting, renders the cover with `ArtworkCache_ProcessArtworkData`:
 the device's own AlbumArt formats from lockdown's `com.apple.mobile.iTunes`

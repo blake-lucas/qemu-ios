@@ -56,6 +56,9 @@ hwaddr s5l8920_dart_xlate(void *opaque, uint32_t va, unsigned sid)
     if (!(s->regs[DART_CONFIG / 4] & DART_CONFIG_ENABLE) || va < DART_WINDOW) {
         return va;
     }
+    if (off >= (uint32_t)DART_SEGS << DART_SEG_SHIFT) {    /* past the last segment */
+        return -1;
+    }
     ste = s->ste[off >> DART_SEG_SHIFT];
     if (!(ste & 1)) {
         return -1;

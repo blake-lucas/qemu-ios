@@ -44,6 +44,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8930IOPCoreState, S5L8930_IOP_CORE)
 #define IOP_PERIPH_SIZE     0x40000000
 #define IOP_VIC_COUNT       4
 #define IOP_VIC_STRIDE      0x10000
+#define IOP_FW_MAX          (16u << 20)     /* EmbeddedIOP images are a few hundred KiB */
 
 struct S5L8930IOPCoreState {
     DeviceState parent_obj;
@@ -214,6 +215,7 @@ qemu_irq s5l8930_iop_core_irq(DeviceState *dev, int irq)
 {
     S5L8930IOPCoreState *s = S5L8930_IOP_CORE(dev);
 
+    /* bounded: irq is a board's wiring constant, not a guest value */
     return qdev_get_gpio_in(s->vic[irq / 32], irq % 32);
 }
 
@@ -227,7 +229,9 @@ void s5l8930_iop_core_run(DeviceState *dev, uint32_t fw_base, uint32_t fw_size)
         object_unparent(OBJECT(&s->fw));
         s->fw_mapped = false;
     }
-    if (fw_base < S5L8930_DRAM_BASE || fw_base + fw_size > S5L8930_DRAM_BASE + memory_region_size(s->dram)) {
+    /* The size is the guest's: in 64 bits, and capped (the idle-loop scan copies the image). */
+    if (fw_base < S5L8930_DRAM_BASE || fw_size > IOP_FW_MAX ||
+        (uint64_t)fw_base + fw_size > S5L8930_DRAM_BASE + memory_region_size(s->dram)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: firmware 0x%08x+0x%x outside DRAM\n",
                       __func__, fw_base, fw_size);
         return;

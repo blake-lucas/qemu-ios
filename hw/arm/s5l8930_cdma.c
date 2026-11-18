@@ -58,12 +58,14 @@
 #include "qemu/timer.h"
 #include "trace.h"
 #include "hw/trace-printf.h"
+#include "hw/arm/ipod_touch_guard.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(S5L8930CDMAState, S5L8930_CDMA)
 
 #define CDMA_CHANNELS       S5L8930_CDMA_CHANNELS
 #define CDMA_CHAN_SHIFT     12
 #define AES_CONTEXTS        9
+#define CDMA_FIFO_MAX       CDMA_MAX_SEGMENT    /* engine output not yet drained; a snapshot holds no more */
 
 #define CH_CTRL             0x00
 #define CH_SETTINGS         0x04
@@ -217,7 +219,7 @@ static const uint8_t *gid_lookup(S5L8930CDMAState *s,
 
 static bool aes_apply(S5L8930CDMAState *s, AESContext *c, uint8_t *buf,
                       uint32_t len, bool restart);
-static void fifo_push(S5L8930CDMAState *s, const uint8_t *buf, uint32_t len);
+static bool fifo_push(S5L8930CDMAState *s, const uint8_t *buf, uint32_t len);
 
 /*
  * Feed a segment through the engine. The engine works on the stream, not per
@@ -249,7 +251,7 @@ static bool aes_feed(S5L8930CDMAState *s, AESContext *c, const uint8_t *buf,
     whole = n & ~15u;
     if (whole) {
         ok = aes_apply(s, c, work, whole, false);
-        fifo_push(s, work, whole);
+        ok = fifo_push(s, work, whole) && ok;
     }
     c->carry_len = n - whole;
     memcpy(c->carry, work + whole, c->carry_len);
@@ -297,7 +299,7 @@ static bool aes_apply(S5L8930CDMAState *s, AESContext *c, uint8_t *buf,
             stl_le_p(keybuf + 4 * i, c->key[i]);
         }
         key = keybuf;
-        algo = algos[AES_KEYLEN(c->setup)];
+        algo = algos[AES_KEYLEN(c->setup)];     /* bounded: a 2-bit field, 4 entries */
     } else if (c->setup & AES_KEY_GID) {
         const uint8_t *b = encrypt ? NULL : gid_lookup(s, buf, len);
         if (b) {
@@ -432,11 +434,20 @@ static void cdma_update_irq(S5L8930CDMAState *s, int ch)
     qemu_set_irq(s->irq[ch], en && (c->ctrl & (ST_DONE | ST_ERROR)));
 }
 
-static void fifo_push(S5L8930CDMAState *s, const uint8_t *buf, uint32_t len)
+/*
+ * The engine's output waits here for a draining channel. A feeding channel the
+ * guest never drains would grow it without end (and wrap fifo_len), so past
+ * CDMA_FIFO_MAX the push fails and the channel reports an error.
+ */
+static bool fifo_push(S5L8930CDMAState *s, const uint8_t *buf, uint32_t len)
 {
+    if (!IT_RANGE("s5l8930.cdma", s->fifo_len, len, CDMA_FIFO_MAX)) {
+        return false;
+    }
     s->fifo = g_realloc(s->fifo, s->fifo_len + len);
     memcpy(s->fifo + s->fifo_len, buf, len);
     s->fifo_len += len;
+    return true;
 }
 
 static uint32_t fifo_pop(S5L8930CDMAState *s, uint8_t *buf, uint32_t len)
@@ -589,7 +600,7 @@ static void cdma_run(S5L8930CDMAState *s, int ch)
                 }
                 if (feeds) {
                     if (!(flags & DESC_AES)) {
-                        fifo_push(s, buf, len);
+                        ok = fifo_push(s, buf, len) && ok;
                     }
                 } else if (dev_mem) {
                     dma_memory_write(&address_space_memory, dev, buf, len,
@@ -1181,6 +1192,13 @@ static const VMStateDescription vmstate_aes_context = {
     }
 };
 
+/* Runs between fifo_len and the buffer it sizes, so a bad length fails
+ * before anything is allocated. */
+static bool cdma_fifo_len_ok(void *opaque, int version_id)
+{
+    return ((S5L8930CDMAState *)opaque)->fifo_len <= CDMA_MAX_SEGMENT;
+}
+
 static int cdma_pre_save(void *opaque)
 {
     S5L8930CDMAState *s = opaque;
@@ -1188,7 +1206,7 @@ static int cdma_pre_save(void *opaque)
     for (int ch = 0; ch < CDMA_CHANNELS; ch++) {
         s->in_seg_mig[ch] = s->ch[ch].in_seg;
     }
-    return 0;
+    return cdma_fifo_len_ok(s, 0) ? 0 : -E2BIG;  /* what a load would refuse (and VALIDATE asserts on) */
 }
 
 static int cdma_pre_load(void *opaque)
@@ -1205,6 +1223,12 @@ static int cdma_post_load(void *opaque, int version_id)
     S5L8930CDMAState *s = opaque;
 
     for (int ch = 0; ch < CDMA_CHANNELS; ch++) {
+        /* A stalled segment resumes with remain as its length (cdma_run's
+         * bound); a paced chain divides by its rate. */
+        if ((s->in_seg_mig[ch] && s->ch[ch].remain > CDMA_MAX_SEGMENT) ||
+            (s->paced[ch] && !s->paced_bps[ch])) {
+            return -EINVAL;
+        }
         s->ch[ch].in_seg = s->in_seg_mig[ch];
     }
     return 0;
@@ -1220,6 +1244,7 @@ static const VMStateDescription vmstate_s5l8930_cdma = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(enabled, S5L8930CDMAState, 2),
         VMSTATE_UINT32(fifo_len, S5L8930CDMAState),
+        VMSTATE_VALIDATE("fifo_len", cdma_fifo_len_ok),
         VMSTATE_VBUFFER_ALLOC_UINT32(fifo, S5L8930CDMAState, 0, NULL, fifo_len),
         VMSTATE_STRUCT_ARRAY(ch, S5L8930CDMAState, CDMA_CHANNELS, 1,
                              vmstate_cdma_channel, CDMAChannel),

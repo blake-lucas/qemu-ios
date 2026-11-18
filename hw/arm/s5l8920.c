@@ -299,6 +299,7 @@ struct S5L8920MachineState {
     QEMUBH *bt_kick;                     /* resumes the CDMA receive from the HCI's UART */
     bool gles_debug;                     /* paint what the GL bridge refuses magenta (tests) */
     bool wifi;                           /* bridge the Wi-Fi card to -netdev id=wifi0 (default on) */
+    char *wifi_country;                  /* the access point's 802.11d country (wifi-country), NULL = the card's */
     bool usb_attached;                   /* usb-attached (default on) */
     int battery_level;                   /* battery-level, -1 = the PMU model's own */
     unsigned battery_charging;           /* battery-charging: 0 auto, 1 on, 2 off */
@@ -608,14 +609,6 @@ static void s5l8920_i2c_create(S5L8920MachineState *s, int n)
  * (contrib/gles-public) uses, as ipad1's: GLES, guest packages (which also
  * answer the shim's hello), the pasteboard and the guest agent (it_agent).
  */
-static int s5l8920_agent_copy(void *opaque, uint32_t address, uint8_t *data, size_t length, bool write)
-{
-    if (length && length - 1 > UINT32_MAX - address) {
-        return -1;
-    }
-    return cpu_memory_rw_debug(opaque, address, data, length, write);
-}
-
 static void s5l8920_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
 {
     CPUState *cs = env_cpu(env);
@@ -655,7 +648,7 @@ static void s5l8920_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t
         }
         q.retval = ipod_agent_call(s->agent, q.call_number, q.args.ag.token, q.args.ag.buffer_guest_ptr,
                                    q.args.ag.offset, q.args.ag.length, qemu_clock_get_ms(QEMU_CLOCK_REALTIME),
-                                   candidate, s5l8920_agent_copy, cs);
+                                   candidate, guest_copy, cs);
         err = q.retval < 0 ? EINVAL : 0;
         break;
     }
@@ -838,6 +831,9 @@ static void s5l8920_init(MachineState *machine)
 
         ipod_touch_sdio_set_chip(card, &s->board->wifi);
         object_property_add_alias(OBJECT(machine), "wifi-bssid", OBJECT(card), "bssid");
+        if (s->wifi_country) {
+            object_property_set_str(OBJECT(card), "country", s->wifi_country, &error_fatal);
+        }
         card->card_present = true;
         sysbus_realize_and_unref(SYS_BUS_DEVICE(card), &error_fatal);
         if (s->wifi && !qemu_find_netdev("wifi0")) {
@@ -1471,6 +1467,17 @@ static void s5l8920_set_wifi(Object *obj, bool value, Error **errp)
     S5L8920_MACHINE(obj)->wifi = value;
 }
 
+static char *s5l8920_get_wifi_country(Object *obj, Error **errp)
+{
+    return g_strdup(S5L8920_MACHINE(obj)->wifi_country ?: "");
+}
+
+static void s5l8920_set_wifi_country(Object *obj, const char *value, Error **errp)
+{
+    g_free(S5L8920_MACHINE(obj)->wifi_country);
+    S5L8920_MACHINE(obj)->wifi_country = g_strdup(value);
+}
+
 /* The agent's properties (tests and the app drive it over QMP), as ipad1's. */
 static void s5l8920_set_agent_request(Object *obj, const char *value, Error **errp)
 {
@@ -1595,6 +1602,7 @@ static void s5l8920_instance_finalize(Object *obj)
     g_free(S5L8920_MACHINE(obj)->kboot_path);
     g_free(S5L8920_MACHINE(obj)->nand_path);
     g_free(S5L8920_MACHINE(obj)->nand_overlay_path);
+    g_free(S5L8920_MACHINE(obj)->wifi_country);
 }
 
 static char *s5l8920_get_imei(Object *obj, Error **errp)
@@ -1728,6 +1736,9 @@ static void s5l8920_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "wifi", s5l8920_get_wifi, s5l8920_set_wifi);
     object_class_property_set_description(klass, "wifi",
         "Bridge the Wi-Fi card to -netdev id=wifi0 (a NAT one is made when absent); off keeps the card, unbridged");
+    object_class_property_add_str(klass, "wifi-country", s5l8920_get_wifi_country, s5l8920_set_wifi_country);
+    object_class_property_set_description(klass, "wifi-country",
+        "The access point's 802.11d country, two letters (unset: US)");
     object_class_property_add_bool(klass, "gles-debug", s5l8920_get_gles_debug, s5l8920_set_gles_debug);
     object_class_property_add_bool(klass, "baseband", s5l8920_get_baseband, s5l8920_set_baseband);
     object_class_property_add_bool(klass, "ring-switch", s5l8920_get_ring_switch, s5l8920_set_ring_switch);

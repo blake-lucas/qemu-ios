@@ -172,18 +172,21 @@ static bool i2s_frame_master(S5L8930I2SState *s)
 
 unsigned s5l8930_i2s_rate(unsigned port)
 {
-    S5L8930I2SState *s = port < ARRAY_SIZE(i2s_ports) ? i2s_ports[port] : NULL;
+    S5L8930I2SState *s;
     uint32_t bclk;
 
+    if (port >= ARRAY_SIZE(i2s_ports)) {
+        return 44100;
+    }
+    s = i2s_ports[port];
     if (!s) {
         return 44100;
     }
-    if (!i2s_frame_master(s)) {
-        /* ponytail: no clock connected or none driven yet plays at 44.1 kHz, where the hardware would stall. */
-        return clock_get_hz(s->lrclk) ? clock_get_hz(s->lrclk) : 44100;
-    }
-    if (s->nco_ref_hz) {
-        return i2s_nco_mclk_rate(s);
+    if (!i2s_frame_master(s) || s->nco_ref_hz) {
+        /* ponytail: no clock connected or none driven yet plays at 44.1 kHz, where the hardware would stall.
+         * Both clocks come from guest register bits: outside audio rates, 44.1 kHz too. */
+        unsigned hz = !i2s_frame_master(s) ? clock_get_hz(s->lrclk) : i2s_nco_mclk_rate(s);
+        return hz >= 8000 && hz <= 192000 ? hz : 44100;
     }
     bclk = address_space_ldl_le(&address_space_memory, S5L8930_NCO_BCLK(port),
                                 MEMTXATTRS_UNSPECIFIED, NULL);
@@ -417,9 +420,13 @@ static void i2s_lrclk_update(void *opaque, ClockEvent event)
  */
 unsigned s5l8930_i2s_sync_rate(unsigned port)
 {
-    S5L8930I2SState *s = port < ARRAY_SIZE(i2s_ports) ? i2s_ports[port] : NULL;
     unsigned rate = s5l8930_i2s_rate(port);
+    S5L8930I2SState *s;
 
+    if (port >= ARRAY_SIZE(i2s_ports)) {
+        return rate;
+    }
+    s = i2s_ports[port];
     if (s && s->voice && i2s_tx_running(s)) {
         i2s_set_rate(s, rate);
     }

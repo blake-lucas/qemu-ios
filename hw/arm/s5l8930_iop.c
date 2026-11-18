@@ -1405,7 +1405,8 @@ static void iop_run(S5L8930IOPState *s)
     uint32_t end = iop_ldl(s->fw_base + FW_HDR_BSS_END);
 
     s->fw_config = 0;
-    if (!iop_config(s) || bss >= end || end > s->fw_size) {
+    /* The header and FW_SIZE are the guest's: the zeroed bss stays inside an image of a sane size. */
+    if (!iop_config(s) || bss >= end || end > MIN(s->fw_size, 16u << 20)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: no 'cnfg' block / bss [0x%x, 0x%x) in firmware at 0x%08x+0x%x\n",
                       __func__, bss, end, s->fw_base, s->fw_size);
@@ -1955,6 +1956,12 @@ static int iop_post_load(void *opaque, int version)
     if (s->snapshot_format != (s->nand_xor_ff ? 2 : 0)) {
         error_report("s5l8930-iop: snapshot NAND storage format mismatch");
         return -EINVAL;
+    }
+    for (int bus = 0; bus < NAND_BUSES; bus++) {     /* fmi_set_config's bounds: the page buffers */
+        if (!s->bytes_per_page[bus] || s->bytes_per_page[bus] > FMI_MAX_PAGE ||
+            s->bytes_per_spare[bus] > FMI_MAX_PAGE) {
+            return -EINVAL;
+        }
     }
     return 0;
 }

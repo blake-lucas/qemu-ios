@@ -6,7 +6,7 @@
  *
  * Mutation (named, must fail this test): in panel_word's DP_SIZE case return `v` instead of `panel`.
  *
- * SLICE hw/arm/s5l8930_display.c define (DP_SIZE|DP_UI_BASE|DP_UI_STRIDE|DP_UI_SRC_SIZE|DP_UI_DST_END|CLCD_SIZE|DEFAULT_WIDTH|DEFAULT_HEIGHT)[[:space:](]
+ * SLICE hw/arm/s5l8930_display.c define (DP_SIZE|DP_UI_BASE|DP_UI_STRIDE|DP_UI_SRC_END|DP_UI_DST_END|CLCD_SIZE|DEFAULT_WIDTH|DEFAULT_HEIGHT)[[:space:](]
  * SLICE hw/arm/s5l8930_display.c fn panel_word
  */
 #include <assert.h>
@@ -21,8 +21,8 @@ int main(void)
     const uint32_t native = 1024u << 16 | 768, tall = 1280u << 16 | 768;
     DisplayPipe k48 = { 0, native }, k48t = { tall, native };
 #define panel_word(pn, a, v) panel_word((pn) ? &k48t : &k48, a, v)
-    hwaddr geometry[] = { DP_SIZE, DP_UI_BASE(0) + DP_UI_SRC_SIZE, DP_UI_BASE(0) + DP_UI_DST_END,
-                          DP_UI_BASE(1) + DP_UI_SRC_SIZE, DP_UI_BASE(1) + DP_UI_DST_END };
+    hwaddr geometry[] = { DP_SIZE, DP_UI_BASE(0) + DP_UI_SRC_END, DP_UI_BASE(0) + DP_UI_DST_END,
+                          DP_UI_BASE(1) + DP_UI_SRC_END, DP_UI_BASE(1) + DP_UI_DST_END };
     for (unsigned i = 0; i < sizeof(geometry) / sizeof(geometry[0]); i++) {
         assert(panel_word(0, geometry[i], native) == native);
         assert(panel_word(tall, geometry[i], native) == tall);

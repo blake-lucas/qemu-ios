@@ -41,7 +41,7 @@ is the wire contract).
 | `contrib/guest-package` | `mkpkg.c` and `VERSION`: the versioned guest-tools package format the loader installs at boot |
 | `contrib/macos-app` | `make-dylib-macos.sh` (the app's dylib), `entitlements.plist` (the app's helper entitlements), `ipod-helper.c` (the app's `ipa-chmod`) |
 | `imgtools/lldb` | lldb scripting for guest debugging (`xnu.py`). Devices are made by LightTouchMac's Swift FirmwareKit: `firmwarekit create --catalog CATALOG --id BOARD-BUILD --ipsw IPSW --out OUT` (CATALOG: LightTouchMac's `LightTouchMac/Resources/firmware-catalog.json`; k48ap and 4.x n72ap also take `--helper` with the LightTouchDevice executable) |
-| `tests/slice/`, `tests/ipod/`, `tests/ipad1/`, `tests/guest-package/` | The gates below |
+| `tests/slice/`, `tests/ipod/`, `tests/ipad1/`, `tests/guest-package/`, `tests/lint/` | The gates below |
 | `scripts/ccninja`, `scripts/configure-patched-ffmpeg` | Build helpers |
 | `docs/` | Ours are the `.md` files; the `.rst`/`.txt` tree is upstream QEMU's. See "Documentation" |
 
@@ -95,7 +95,7 @@ directory. `QEMU=` overrides the emulator (default `build/qemu-system-arm`).
 | Gate | What it covers | Inputs |
 |---|---|---|
 | `tests/slice/run.sh tests/slice/<board>-<name>.c` | Host-only unit checks, one file each: the `SLICE` lines at the top name the code under test, compiled under ASan/UBSan | No emulator |
-| `tests/*/*-test.sh` | Guest-package, toolchain and loader checks | No emulator |
+| `tests/*/*-test.sh` | Guest-package, toolchain and loader checks; the guest-values lint ("Guest values" below) | No emulator |
 
 Boots of prepared devices are LightTouchMac's: `swift run --package-path tests/sessions sessions single <BASE>`
 (also `phone`, `local-network`, `proxy-trust`, `helper`), and its Release plan's prepare matrix (`firmwarekit
@@ -104,6 +104,28 @@ create` on each route, then a boot). Every headless boot passes `-audio driver=n
 The export for the app (`contrib/export-guest-artifacts.sh`, "Build" above) is gated on the LightTouchMac side:
 its `scripts/build-guest-tools.sh` runs the export from the commit pinned in `build-support/sources.json`
 and `scripts/vendor` checks the staged tree against `manifest.json`; a pin bump is a LightTouchMac commit.
+
+## Guest values
+
+The guest is untrusted: anything it writes can be chosen to hurt the host, and a host write out of bounds runs
+code as the user. So in every device model and guest service:
+
+- Every index, length, offset and count the guest wrote (a register or bus write, a descriptor or buffer read from
+  guest memory, an AT command's number, a value another model took from the guest) is bounded before its first use
+  as an array index, a copy or allocation length, a guest-memory read's length into a host buffer, a loop bound, or
+  an MMIO handler's offset. Use `IT_IDX`, `IT_SIZE` or `IT_RANGE` (`include/hw/arm/ipod_touch_guard.h`) or an
+  explicit test; do size arithmetic in 64 bits or check it for overflow.
+- Never call an MMIO handler with a guest offset; the memory region's size is the only thing that bounded it.
+- Every host allocation whose size the guest drives has a per-device cap (a named constant), and so does every
+  queue the guest can fill without draining.
+- No `exit()`, `abort()`, `hw_error()` or `g_assert` on a path the guest can reach: log at `LOG_GUEST_ERROR` and
+  refuse the operation.
+- Copies to and from guest virtual memory go through `guest_copy` (`hw/arm/guest-services.c`), which honors the
+  calling mode's page permissions.
+
+`tests/lint/guest-bounds.py` (in `tests/gate.sh --quick`, via `tests/lint/guest-bounds-test.sh`) follows guest
+values through each file and flags an unchecked use. A use it can't see is bounded takes a `/* bounded: why */`
+comment naming the bound.
 
 ## Documentation
 

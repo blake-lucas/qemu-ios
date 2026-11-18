@@ -779,6 +779,9 @@ static int exynos4210_uart_post_load(void *opaque, int version_id)
 {
     Exynos4210UartState *s = (Exynos4210UartState *)opaque;
 
+    if (s->rx.sp >= s->rx.size || s->rx.rp >= s->rx.size) {
+        return -EINVAL;                 /* both index rx.data */
+    }
     exynos4210_uart_update_parameters(s);
     exynos4210_uart_rx_timeout_set(s);
 

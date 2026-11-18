@@ -820,6 +820,12 @@ static void it_i2s_clock_update(void *opaque, ClockEvent event)
     if (!rate || getenv("IT_I2S_RATE") || rate == s->as.freq) {
         return;
     }
+    /* The codec derives LRCLK from guest register bits; a host voice and the
+     * pacing arithmetic only make sense for an audio rate (post_load's range). */
+    if (rate < 8000 || rate > 192000) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ipod i2s: codec LRCLK %u Hz ignored\n", rate);
+        return;
+    }
     /* Account for the elapsed interval using the old clock first. */
     if (s->enable) {
         it_i2s_pace_drain(s);

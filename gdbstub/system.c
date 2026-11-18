@@ -385,10 +385,15 @@ bool gdbserver_start(const char *device, Error **errp)
 
         qemu_add_vm_change_state_handler(gdb_vm_state_change, NULL);
 
-        /* Initialize a monitor terminal for gdb */
-        mon_chr = qemu_chardev_new(NULL, TYPE_CHARDEV_GDB,
-                                   NULL, NULL, &error_abort);
-        monitor_init_hmp(mon_chr, false, &error_abort);
+        /*
+         * qemu-ios: no HMP monitor behind the gdbstub. A debugger gets the
+         * guest (memory, registers, breakpoints); `monitor` packets would
+         * also give whoever reaches the stub this process's own monitor
+         * (host files and commands), which nothing here uses: the lldb
+         * flows (imgtools/lldb/xnu.py) speak only gdb packets and Qqemu.*.
+         * qRcmd answers as unsupported.
+         */
+        mon_chr = NULL;
     } else {
         qemu_chr_fe_deinit(&gdbserver_system_state.chr, true);
         mon_chr = gdbserver_system_state.mon_chr;
@@ -514,6 +519,10 @@ void gdb_handle_query_rcmd(GArray *params, void *ctx)
     const guint8 zero = 0;
     int len;
 
+    if (!gdbserver_system_state.mon_chr) {
+        gdb_put_packet("");     /* no monitor (gdbserver_start) */
+        return;
+    }
     if (!params->len) {
         gdb_put_packet("E22");
         return;

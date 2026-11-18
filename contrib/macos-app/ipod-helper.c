@@ -118,11 +118,12 @@ static int ipa_chmod(const char *src, const char *dst, const char *member)
 
     p = buf + cd_off;
     end = buf + cd_off + cd_size;
-    while (p + 46 <= end && rd32(p) == 0x02014b50) {
+    while ((size_t)(end - p) >= 46 && rd32(p) == 0x02014b50) {
         uint16_t nlen = rd16(p + 28);
         uint16_t elen = rd16(p + 30);
         uint16_t clen = rd16(p + 32);
-        if (p + 46 + nlen > end) {
+        size_t step = (size_t)46 + nlen + elen + clen;
+        if ((size_t)46 + nlen > (size_t)(end - p)) {
             break;
         }
         if (nlen == strlen(member) &&
@@ -134,7 +135,10 @@ static int ipa_chmod(const char *src, const char *dst, const char *member)
             patched = 1;
             break;
         }
-        p += 46 + nlen + elen + clen;
+        if (step > (size_t)(end - p)) {
+            break;      /* p stays inside the directory */
+        }
+        p += step;
         (void)entries;
     }
 

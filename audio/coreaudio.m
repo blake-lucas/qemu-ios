@@ -481,7 +481,22 @@ static OSStatus out_device_ioproc(
         return 0;
     }
 
-    frame_size = core->device_frame_size;
+    /*
+     * Write no more frames than the buffer CoreAudio handed us holds
+     * (mDataByteSize), whatever the frame size and channel count we were
+     * told at init: the device can change either under us.
+     */
+    {
+        UInt32 dev_frame_bytes = core->dev_nchannels *
+                                 (hw->info.bytes_per_frame / hw->info.nchannels);
+
+        if (!outOutputData->mNumberBuffers || !dev_frame_bytes) {
+            coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(no buffer)");
+            return 0;
+        }
+        frame_size = MIN(core->device_frame_size,
+                         outOutputData->mBuffers[0].mDataByteSize / dev_frame_bytes);
+    }
     pending_frames = hw->pending_emul / hw->info.bytes_per_frame;
 
     if (ca_tap.pcm && frame_size) {
@@ -594,7 +609,8 @@ static OSStatus out_device_ioproc(
 
     if (ca_tap.pcm) {
         int64_t t_in = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-        size_t n = frame_size * hw->info.bytes_per_frame;
+        size_t n = MIN((size_t)frame_size * hw->info.bytes_per_frame,
+                       outOutputData->mBuffers[0].mDataByteSize);
         const float *f = outOutputData->mBuffers[0].mData;
         bool signal = false;
         for (size_t i = 0; i < n / sizeof(float); i++) {

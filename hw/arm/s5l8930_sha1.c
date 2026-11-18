@@ -145,10 +145,17 @@ static void s5l8930_sha1_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
 }
 
+static int sha1_post_load(void *opaque, int version_id)
+{
+    S5L8930SHA1State *s = opaque;
+    return s->fill < sizeof(s->block) && !(s->fill & 3) ? 0 : -EINVAL;  /* a word lands at block + fill */
+}
+
 static const VMStateDescription vmstate_s5l8930_sha1 = {
     .name = "s5l8930.sha1",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = sha1_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cmd, S5L8930SHA1State),
         VMSTATE_UINT32(mode, S5L8930SHA1State),
