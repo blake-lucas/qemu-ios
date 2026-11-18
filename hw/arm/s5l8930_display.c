@@ -980,7 +980,7 @@ static void video_render(const VideoPlan *v, unsigned w, unsigned h, uint32_t *o
 
         for (unsigned x = v->x0; x < x1; x++) {
             unsigned sx = xs[x];
-            d[x] = srow ? srow[sx] : video_px(v, yrow[sx], crow[sx & ~1u], crow[(sx & ~1u) + 1]);
+            d[x] = srow ? srow[sx] : video_px(v, yrow[sx], crow[sx & ~1u], crow[(sx & ~1u) + 1]);   /* bounded: sx = xs[x] < v->sw */
         }
     }
 }

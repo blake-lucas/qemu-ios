@@ -1091,7 +1091,7 @@ static void lcd_refresh_rotated(IPodTouchLCDState *lcd, DisplaySurface *surface,
             for (sx = 0; sx < sw; sx++, s += 4, d += step) {
                 *(uint32_t *)d = rgb_to_pixel32(lcd_bright_lut[0][s[2]],
                                                 lcd_bright_lut[1][s[1]],
-                                                lcd_bright_lut[2][s[0]]);
+                                                lcd_bright_lut[2][s[0]]);   /* bounded: a byte indexes a 256-entry table */
             }
         }
     }
