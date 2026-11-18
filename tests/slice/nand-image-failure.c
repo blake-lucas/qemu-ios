@@ -14,8 +14,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 typedef int BlockBackend, RunState, VMChangeStateEntry;
 typedef struct NANDImage NANDImage;
+typedef struct NANDDisk NANDDisk;
+typedef struct DeviceState DeviceState;
 #define qatomic_read(p) (*(p))
 #define qatomic_set(p, v) (*(p) = (v))
 #define BDRV_REQ_MAY_UNMAP 1
@@ -25,6 +28,12 @@ static int blk_pwrite(BlockBackend *b, int64_t o, int64_t n, const void *p, int 
 static int blk_pwrite_zeroes(BlockBackend *b, int64_t o, int64_t n, int f) { return zero_result; }
 static int blk_flush(BlockBackend *b) { return flush_result; }
 static void bdrv_drain_all(void) {}
+/* develop's direct-I/O container: its results stand in for the block layer's */
+static int disk_write_result, disk_erase_result, disk_sync_result;
+static uint64_t nand_disk_record(NANDDisk *d, unsigned chip, uint32_t page) { return 0; }
+static int nand_disk_write(NANDDisk *d, uint64_t o, uint32_t n, const void *p) { return disk_write_result; }
+static int nand_disk_erase(NANDDisk *d, unsigned chip, uint32_t block) { return disk_erase_result; }
+static int nand_disk_sync(NANDDisk *d) { return disk_sync_result; }
 #include "slice.h"
 
 int main(void)
@@ -61,6 +70,23 @@ int main(void)
     nand_image_failed = false;
     zero_result = -EIO;
     assert(nand_image_erase(&n, 0, 0) == -EIO && nand_image_io_failed());
+
+    /* the same through the direct-I/O container */
+    NANDDisk *disk = (NANDDisk *)&chip;
+    n.disk = disk;
+    nand_image_failed = false;
+    assert(!nand_image_write(&n, 0, 0, record) && !nand_image_erase(&n, 0, 0) && !nand_image_io_failed());
+    disk_write_result = -ENOSPC;
+    assert(nand_image_write(&n, 0, 0, record) == -ENOSPC && nand_image_io_failed());
+    disk_write_result = 0;
+    nand_image_failed = false;
+    disk_erase_result = -EIO;
+    assert(nand_image_erase(&n, 0, 0) == -EIO && nand_image_io_failed());
+    disk_erase_result = 0;
+    nand_image_failed = false;
+    disk_sync_result = -EIO;
+    nand_image_vm_state(&n, false, 0);
+    assert(nand_image_io_failed());
     puts("PASS: an image store's failed write, erase or flush latches; a guest's bad address doesn't");
     return 0;
 }
