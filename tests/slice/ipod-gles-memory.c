@@ -15,7 +15,7 @@
  * SLICE hw/arm/gles-host.c fn gles_texture_begin gles_texture_end gles_guest_name_ok gles_guest_names gles_rb_format gles_texture_object
  * SLICE:teximage hw/arm/gles-host.c range case GLES_SLOT_TEX_IMAGE_2D: { | case GLES_SLOT_TEX_SUB_IMAGE_2D: {
  * SLICE:teximage hw/arm/gles-host.c range case GLES_SLOT_DELETE_TEXTURES: { | case GLES_SLOT_ALPHA_FUNC:
- * SLICE:teximage hw/arm/gles-host.c range case GLES_SLOT_RENDERBUFFER_STORAGE: { | case GLES_SLOT_FB_RENDERBUFFER: {
+ * SLICE:teximage hw/arm/gles-host.c range case GLES_SLOT_RENDERBUFFER_STORAGE: { | #include "gles-host-surface-attachments.c.inc"
  * SLICE:teximage hw/arm/gles-host.c range case GLES_SLOT_DELETE_RENDERBUFFERS: | case GLES_SLOT_CHECK_FB_STATUS: {
  * CFLAGS -I$ROOT/include -Wno-pointer-to-int-cast -Wno-pointer-bool-conversion -framework OpenGL -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework CoreFoundation
  * PKG glib-2.0
