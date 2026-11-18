@@ -857,6 +857,37 @@ static int fe_bind_layer(GuestGC *gc, void *drawable)
     return 1;
 }
 
+extern unsigned long long mach_absolute_time(void);
+extern int mach_timebase_info(unsigned *);
+extern int usleep(unsigned);
+
+/* A device's present waits for a free buffer, which the panel hands back at its next vblank, so a loop that presents
+ * faster than 60 times a second is held to the panel there. fe_present never waits (with no buffer free it drops the
+ * frame), so such a loop ran free: Doodle Jump's armv7 build stepped its game 120 times a second on the iPod touch 3G
+ * and iPhone 3GS, at double speed. Each view takes one present per 60 Hz slot: a present before its slot waits for it;
+ * one that comes later keeps the slots' phase while it is less than a frame late, else starts them again from now. */
+static void fe_pace(ca_view_t *v)
+{
+    static unsigned numer, denom;
+    unsigned long long now, period;
+    if (!denom) {
+        unsigned tb[2] = {0, 0};
+        if (mach_timebase_info(tb) || !tb[0] || !tb[1]) return;
+        numer = tb[0];
+        denom = tb[1];
+    }
+    period = 16666667ull * denom / numer;
+    now = mach_absolute_time();
+    if (v->next_present > now) {
+        usleep((unsigned)((v->next_present - now) * numer / denom / 1000));
+        v->next_present += period;
+    } else if (v->next_present && now - v->next_present < period) {
+        v->next_present += period;
+    } else {
+        v->next_present = now + period;
+    }
+}
+
 /* The frame goes into this GC's layer surface (or, for the CA compositor, the surface it attached as the
  * renderbuffer). The host writes it with a debug write, which cannot fault pages in, and a buffer CA has just
  * allocated may have none mapped: take the frame's buffer now and touch every page of it. */
@@ -871,6 +902,7 @@ static int fe_present(GuestGC *gc)
         for (i = 0; i < n; i += 4096) p[i] = p[i];
         if (n) p[n - 1] = p[n - 1];
     }
+    if (v) fe_pace(v);
     return GLESPresentView(gc, 0) != 0;
 }
 

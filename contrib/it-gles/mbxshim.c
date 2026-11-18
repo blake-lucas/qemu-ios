@@ -1110,6 +1110,7 @@ typedef struct {
     void *ref;
     unsigned base, stride, width, height, format;
     unsigned char need_buffer;
+    unsigned long long next_present;   /* mach time of the next 60 Hz slot a present may take (fe_pace) */
 } ca_view_t;
 
 #define CA_MAX_VIEWS 4
