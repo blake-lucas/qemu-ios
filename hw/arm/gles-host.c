@@ -261,13 +261,15 @@ static unsigned gles_fb_w = 320, gles_fb_h = 480;   /* the iPod panel: lcd->pw/p
 #define GLES_MAX_CONTEXTS     256u
 /* What the GL objects of every context may hold together, as the host stores
  * them: texture levels (PVRTC and palettes decoded to RGBA), renderbuffers,
- * each context's drawable and its readback, and buffer objects' bytes. The
- * GPUs of the devices emulated drew on the device's RAM, 128 MB (the iPhone and
- * the iPod touch 1G and 2G) to 512 MB (the iPhone 4), and an app had a fraction
- * of it; past this an allocation fails with GL_OUT_OF_MEMORY, as their drivers'
- * did. Decoded PVRTC is 8-16x its size on the device, so the cap is the largest
- * RAM rather than a device's texture budget. */
-#define GLES_MAX_GPU_BYTES    ((uint64_t)512 << 20)
+ * each context's drawable and its readback, and buffer objects' bytes. A bound
+ * on what a guest can make the host allocate, not a device's texture budget:
+ * decoded PVRTC is 8-16x its size on the device, and apps iOS has suspended
+ * keep their objects here (on a device their memory pressure would get them
+ * jettisoned, which host allocations never cause). Measured on the iPad 5.1.1:
+ * Temple Run about 65 MiB, Infinity Blade 130 MiB, Epic Citadel 320 MiB, so
+ * 512 MiB froze the third of them launched (GL_OUT_OF_MEMORY, an incomplete
+ * framebuffer); 2 GiB holds several large games suspended at once. */
+#define GLES_MAX_GPU_BYTES    ((uint64_t)2048 << 20)
 
 /* [off, off + len) lies inside a `size`-byte buffer. Every buffer-object, index
  * and client-array range check goes through here, so none of them can wrap. */
