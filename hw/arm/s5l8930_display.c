@@ -1070,6 +1070,42 @@ static bool compose(S5L8930DisplayState *s, unsigned w, unsigned h, uint32_t *ou
     return true;
 }
 /* vbl: called from the VBL tick, which may drop the BQL for the pixel work. */
+/* IT_DISPLAY_TRACE=FILE: each latch's layers and result, at most one line per 100 ms unless the layers changed, and
+ * the movie layer's buffer each time it changes. */
+static void display_trace_latch(S5L8930DisplayState *s, bool valid, bool video, bool changed, const uint32_t key[4])
+{
+    static FILE *tr; static bool tried; static int64_t last; static uint32_t lastkey[4];
+    if (!tried) {
+        const char *t = getenv("IT_DISPLAY_TRACE");
+        tried = true;
+        if (t && *t && (tr = fopen(t, "a"))) {
+            setvbuf(tr, NULL, _IOLBF, 0);
+        }
+    }
+    if (!tr) {
+        return;
+    }
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) / 1000;
+    if (video) {
+        /* a movie's frame: the buffer (physical) the video layer now reads, whenever it changes (cf. IT_VXD_TRACE) */
+        static hwaddr last_video;
+        hwaddr pa = dart_xlate(s, s->pipe[0].regs[0x307c / 4]);
+        if (pa != last_video) {
+            last_video = pa;
+            fprintf(tr, "display t %" PRId64 " video luma pa %08" HWADDR_PRIx "\n", now, pa);
+        }
+    }
+    if (now - last >= 100000 || memcmp(key, lastkey, sizeof(uint32_t) * 4)) {
+        uint32_t *r = s->pipe[0].regs;
+        fprintf(tr, "t %" PRId64 " latch swap %u valid %d video %d changed %d gen %u swaps %u layers %08x key %08x %08x %08x %08x "
+                "ui0 %08x ui1 %08x\n", now, s->pipe[0].swap_id, valid, video, changed, s->front_gen, s->swaps,
+                r[DP_LAYERS / 4], key[0], key[1], key[2], key[3],
+                r[(DP_UI_BASE(0) + DP_UI_ADDR) / 4], r[(DP_UI_BASE(1) + DP_UI_ADDR) / 4]);
+        last = now;
+        memcpy(lastkey, key, sizeof(uint32_t) * 4);
+    }
+}
+
 static void front_latch(S5L8930DisplayState *s, bool vbl)
 {
     unsigned w, h;
@@ -1162,6 +1198,7 @@ static void front_latch(S5L8930DisplayState *s, bool vbl)
         if (unlocked) {
             bql_lock();
         }
+        display_trace_latch(s, valid, video, false, key);
         return;
     }
     if (valid) {
@@ -1187,6 +1224,7 @@ static void front_latch(S5L8930DisplayState *s, bool vbl)
         s->front_gen++;
     }
     s->front_video = video;
+    display_trace_latch(s, valid, video, changed, key);
 }
 
 /* One row of the panel through the output gamma (BGRA: B in bits 0-7, R in 16-23). */
