@@ -868,18 +868,21 @@ extern int usleep(unsigned);
  * one that comes later keeps the slots' phase while it is less than a frame late, else starts them again from now. */
 static void fe_pace(ca_view_t *v)
 {
-    static unsigned numer, denom;
-    unsigned long long now, period;
-    if (!denom) {
+    /* No 64-bit divides: the old SDKs link no __udivdi3. A slot and a wait fit 32 bits of 24 MHz ticks. */
+    static double ns_per_tick;
+    static unsigned period;
+    unsigned long long now;
+    if (!period) {
         unsigned tb[2] = {0, 0};
         if (mach_timebase_info(tb) || !tb[0] || !tb[1]) return;
-        numer = tb[0];
-        denom = tb[1];
+        ns_per_tick = (double)tb[0] / tb[1];
+        period = (unsigned)(16666667.0 / ns_per_tick);
+        if (!period) return;
     }
-    period = 16666667ull * denom / numer;
     now = mach_absolute_time();
     if (v->next_present > now) {
-        usleep((unsigned)((v->next_present - now) * numer / denom / 1000));
+        unsigned wait = (unsigned)(v->next_present - now);
+        if (wait <= period) usleep((unsigned)(wait * ns_per_tick / 1000.0));
         v->next_present += period;
     } else if (v->next_present && now - v->next_present < period) {
         v->next_present += period;
