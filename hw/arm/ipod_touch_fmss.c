@@ -10,7 +10,6 @@
 #include "system/address-spaces.h"
 #include "qemu/coroutine.h"
 #include "qemu/aio-wait.h"
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <glib/gstdio.h>
 #include "trace.h"
