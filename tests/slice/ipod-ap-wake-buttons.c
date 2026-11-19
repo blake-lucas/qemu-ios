@@ -143,8 +143,7 @@ int main(void) {
     }
     now=1000; event(1,true); now=1050; reset_holds(true,true);
     assert(ios_button_holds[1].down && !ios_button_holds[1].release->pending);
-    now=1500; event(1,false); assert(ios_button_holds[1].release->deadline==1500);
-    advance(1500); assert(!ios_button_holds[1].down); cleanup();
+    now=1500; event(1,false); assert(!ios_button_holds[1].down && !ios_button_holds[1].release->pending); cleanup();
     // Standalone cold GPIO hold clears a stale DOWN cache before later callers.
     ipod_touch_press_button(IPOD_TOUCH_BUTTON_POWER,true);
     gpio.ap_wake_reset_pending=false; s5l8900_gpio_reset((DeviceState *)&gpio);

@@ -1199,11 +1199,24 @@ struct ios_button {
     bool down;
 };
 
+/* A host click reaches the guest as a whole press: down for at least
+ * IOS_BUTTON_HOLD_MS and up for at least IOS_BUTTON_GAP_MS before the next,
+ * in guest time, so its debounce handler sees both edges. Host events that come
+ * sooner (a quick double or triple click of Home, or both edges in one BH batch
+ * under load) wait their turn, up to IOS_BUTTON_QUEUED presses; a longer hold
+ * passes through as the host made it. */
+#define IOS_BUTTON_HOLD_MS 100
+#define IOS_BUTTON_GAP_MS 100
+#define IOS_BUTTON_QUEUED 3
+
 static struct ios_button_hold {
-    QEMUTimer *release;
-    int64_t pressed_at;
+    QEMUTimer *release;   /* due when the next waiting change may apply */
+    int64_t pressed_at, released_at;
     IPodTouchButton button;
-    bool down;
+    bool down;            /* the pin as the guest sees it */
+    bool waiting[2 * IOS_BUTTON_QUEUED + 2];
+    int queued;
+    bool dropping;        /* a press past the limit: its release goes too */
 } ios_button_holds[4];
 
 static void ios_press(IPodTouchButton button, bool down)
@@ -1215,11 +1228,42 @@ static void ios_press(IPodTouchButton button, bool down)
     s5l8920_press_button(button, down);
 }
 
+/* Apply the waiting changes that are due; the timer brings the rest. */
 static void ios_button_release(void *opaque)
 {
     struct ios_button_hold *hold = opaque;
-    ios_press(hold->button, false);
-    hold->down = false;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    while (hold->queued) {
+        bool down = hold->waiting[0];
+        if (down != hold->down) {
+            int64_t due = down ? hold->released_at + IOS_BUTTON_GAP_MS
+                               : hold->pressed_at + IOS_BUTTON_HOLD_MS;
+            if (now < due) {
+                timer_mod(hold->release, due);
+                return;
+            }
+            ios_press(hold->button, down);
+            hold->down = down;
+            *(down ? &hold->pressed_at : &hold->released_at) = now;
+        }
+        memmove(hold->waiting, hold->waiting + 1, --hold->queued * sizeof(hold->waiting[0]));
+    }
+    timer_del(hold->release);
+}
+
+/* Forget waiting presses and let go of the button (input cancelled). */
+static void ios_button_drop(struct ios_button_hold *hold)
+{
+    if (hold->release) {
+        timer_del(hold->release);
+    }
+    hold->queued = 0;
+    hold->dropping = false;
+    if (hold->down) {
+        ios_press(hold->button, false);
+        hold->down = false;
+        hold->released_at = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    }
 }
 
 static void ios_button_bh(void *opaque)
@@ -1245,20 +1289,29 @@ static void ios_button_bh(void *opaque)
     }
     ios_sequence_cancel_current();
     struct ios_button_hold *hold = &ios_button_holds[b->button];
-    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     if (!hold->release) {
         hold->button = button;
         hold->release = timer_new_ms(QEMU_CLOCK_VIRTUAL, ios_button_release, hold);
+        hold->released_at = INT64_MIN / 2;
     }
-    if (b->down) {
-        timer_del(hold->release);
-        hold->pressed_at = now;
-        hold->down = true;
-        ios_press(button, true);
-    } else {
-        /* Both host events can arrive in one BH batch under load. Give the
-         * guest's debounce handler time to observe the pressed pin. */
-        timer_mod(hold->release, MAX(now, hold->pressed_at + 100));
+    /* The last change asked for: the pin's, or the newest waiting. */
+    bool last = hold->queued ? hold->waiting[hold->queued - 1] : hold->down;
+    bool take = false;
+    if (b->down && !last) {
+        int presses = 0;
+        for (int i = 0; i < hold->queued; i++) {
+            presses += hold->waiting[i];
+        }
+        hold->dropping = presses >= IOS_BUTTON_QUEUED;
+        take = !hold->dropping;
+    } else if (!b->down && hold->dropping) {
+        hold->dropping = false;
+    } else if (!b->down && last) {
+        take = true;
+    }
+    if (take) {
+        hold->waiting[hold->queued++] = b->down;
+        ios_button_release(hold);
     }
     g_free(b);
 }
@@ -1375,7 +1428,7 @@ static void ios_sequence_submit_bh(void *opaque)
     ios_sequence_publish(0, QEMU_IOS_INPUT_REJECTED);
     bool manual = ios_manual_touch || ios_manual_touch2;
     for (int i = 0; i < 4; ++i) {
-        manual |= ios_button_holds[i].down;
+        manual |= ios_button_holds[i].down || ios_button_holds[i].queued;
     }
     if (!manual && ios.con && qemu_ios_ui_ready()) {
         memcpy(ios_sequence.events, r->events, r->count * sizeof(r->events[0]));
@@ -1760,8 +1813,7 @@ static void portable_release_input(bool preserve_buttons)
     ios_manual_touch = ios_manual_touch2 = false;
     if (!preserve_buttons) {
         for (int i = 0; i < 4; i++) {
-            if (ios_button_holds[i].release) timer_del(ios_button_holds[i].release);
-            if (ios_button_holds[i].down) ios_button_release(&ios_button_holds[i]);
+            ios_button_drop(&ios_button_holds[i]);
         }
     }
     LIS302DLState *a = portable_accel();
