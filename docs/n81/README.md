@@ -265,7 +265,7 @@ documented quirk/patch, S stub.
    unit's real sensitivity matrix.
 6. ~~Accelerometer mounting~~ (2026-10-04; from the DT, 2026-10-20): the board carries its DT accelerometer
    orientation (`accel_dt`), and the part reads as `ios_dt_mount` derives from it (x reads -y, y reads -x).
-   Safari turns with `accel-orientation` 1/3 as on hardware (3 = Home right). z reads z (flip-z, cdd01aec99):
+   Safari turns with `accel-orientation` 1/3 as on hardware (3 = Home right). z reads z (cdd01aec99's flip-z; ios_dt_mount's rule for every 3.0 board since 2026-11-18):
    with -z, 6.1.6's CoreMotion read face up as face down and fought its gyro. Safari's devicemotion agrees:
    the long edge, the right edge and the screen up all read -10.
 7. ~~**Multitouch calibration**~~ (2026-10-05): `mt_profile_n81`'s frame is now fitted the way the K48's was

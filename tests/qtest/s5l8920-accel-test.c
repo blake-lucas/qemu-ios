@@ -3,7 +3,8 @@
  * The kboot boards' accelerometer reads as each board mounts it, from the board's DT orientation (ios_dt_mount):
  * the N18's 4 and the N88's 7 (AppleLIS302DL bits), the iPad's, the iPod touch 4G's and the iPhone 4's matrices
  * (AppleLIS331DLH). Each board's expected mount is the one found on hardware-checked rotation (the iPod touch 4G's
- * z by a CoreMotion probe on 6.1.6, the iPhone 4's by Safari's devicemotion on 6.1.3). Read as the N18's part, the 3GS took Home-left (4) for
+ * z by a CoreMotion probe on 6.1.6, the iPhone 4's by Safari's devicemotion on 6.1.3, the others' as theirs, since
+ * a real part's map from gravity has det -1). Read as the N18's part, the 3GS took Home-left (4) for
  * Home-right (3) and drew landscape upside down (issues 23, 43).
  */
 #include "qemu/osdep.h"
@@ -71,9 +72,9 @@ static void n88_compass(void)
 }
 
 static const Board boards[] = {
-    { "n18", { 1, 2, 3 } },
-    { "n88", { -1, -2, 3 } },
-    { "ipad1", { 1, -2, -3 } },
+    { "n18", { 1, 2, -3 } },
+    { "n88", { -1, -2, -3 } },
+    { "ipad1", { 1, -2, 3 } },
     { "iPod-Touch-4G", { -2, -1, 3 } },
     { "iPhone-4", { -2, 1, -3 } },
 };

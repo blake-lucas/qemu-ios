@@ -52,18 +52,18 @@ int main(void) {
  assert(!lis302dl_post_load(&sensor,1));
  assert(sensor.pitch_mdeg==0 && sensor.roll_mdeg==90000 && !sensor.flat_pose);
  assert(sensor.out_x==-64 && sensor.shake_start_ns == -1 && sensor.last_sample_ns == -1);
- /* Each board's mount from its DT orientation: the mounts found on hardware-checked rotation, the iPod touch 4G's
-  * and the iPhone 4's rule mounts, and a swap. Then the N81 reading through it with its board's flip-z (6.1.6's
-  * CoreMotion read face up as z +1 under the rule; the iPhone 4's Safari did the same on 6.1.3). */
+ /* Each board's mount from its DT orientation: x and y as found on hardware-checked rotation, z as measured on the
+  * iPod touch 4G and the iPhone 4 (face up reads face up), and a swap. Every 3.0 accelerometer mount is a mirror of
+  * gravity (det -1), as a real part's is. Then the N81 reading through it. */
  static const struct { const char *dt; bool accel; int8_t axis[3]; } boards[] = {
-  { "04000000", true, { 1, 2, 3 } },                     /* N72, N18 */
-  { "07000000", true, { -1, -2, 3 } },                   /* N88 */
+  { "04000000", true, { 1, 2, -3 } },                    /* N72, N18 */
+  { "07000000", true, { -1, -2, -3 } },                  /* N88 */
   { "03000000", true, { 1, 2, 3 } },                     /* N45 (1.x) */
   { "00000000", true, { -1, -2, 3 } },                   /* M68 (1.x) */
-  { "0100000000ff000000000100", true, { 1, -2, -3 } },   /* K48 */
-  { "00ff0000ff00000000000100", true, { -2, -1, -3 } },  /* N81 */
-  { "00010000ff0000000000ff00", true, { -2, 1, 3 } },    /* N90 */
-  { "08000000", true, { 2, 1, -3 } },                    /* bit 3: the driver swaps x and y first */
+  { "0100000000ff000000000100", true, { 1, -2, 3 } },    /* K48 */
+  { "00ff0000ff00000000000100", true, { -2, -1, 3 } },   /* N81 */
+  { "00010000ff0000000000ff00", true, { -2, 1, -3 } },   /* N90 */
+  { "08000000", true, { 2, 1, 3 } },                     /* bit 3: the driver swaps x and y first */
   { "00ff0000ff0000000000ff00", false, { -2, -1, -3 } }, /* N81's gyro */
   { "010000000001000000000100", false, { 1, 2, 3 } },    /* N90's gyro */
  };
@@ -75,7 +75,7 @@ int main(void) {
  int8_t bad[3];
  assert(!ios_dt_mount("0400",true,bad) && !ios_dt_mount("02000000000000000000000000",true,bad));
  assert(!ios_dt_mount("000000000000000000000000",true,bad));       /* not a mount: a zero row */
- LIS302DLState n81={0};n81.dt_orientation=(char *)"00ff0000ff00000000000100";n81.flip_z=true;
+ LIS302DLState n81={0};n81.dt_orientation=(char *)"00ff0000ff00000000000100";
  assert(lis302dl_apply_attitude(&n81,0,0,false));       /* portrait: x reads -y */
  assert(n81.base_x==64 && n81.base_y==0 && n81.base_z==0);
  assert(lis302dl_apply_attitude(&n81,0,90,false) && n81.base_x==0 && n81.base_y==64);

@@ -262,7 +262,7 @@ What differs from 7.1.2:
    locationd on its AK8973-only offset-DAC path. 7.x is unchecked: its read-only root takes no probe.
 4. ~~Accelerometer mounting~~ (2026-10-04, z 2026-10-10; from the DT, 2026-10-20): the board carries its DT
    accelerometer orientation (`accel_dt`), and the part reads as `ios_dt_mount` derives from it: x reads -y,
-   y reads x, and z reads -z (the board's flip-z, 2026-11-18). With z reading z, 6.1.3's Safari devicemotion read
+   y reads x, and z reads -z (2026-11-18; now ios_dt_mount's rule for every 3.0 board, no flip-z). With z reading z, 6.1.3's Safari devicemotion read
    face up as z +9.9 while the long and short edges up read -10. Through a face-up-to-upright pitch with the gyro
    right, CoreMotion's gravity went upside down (2 g of user acceleration) and re-levelled over 2 s. The earlier
    finding that -z mirrored CoreLocation's heading face up on 4.2.1 tested the accelerometer against the compass
