@@ -52,9 +52,9 @@ int main(void) {
  assert(!lis302dl_post_load(&sensor,1));
  assert(sensor.pitch_mdeg==0 && sensor.roll_mdeg==90000 && !sensor.flat_pose);
  assert(sensor.out_x==-64 && sensor.shake_start_ns == -1 && sensor.last_sample_ns == -1);
- /* Each board's mount from its DT orientation: the mounts found on hardware-checked rotation (and the iPhone 4's
-  * z by its compass), the iPod touch 4G's rule mount, and a swap. Then the N81 reading through it with its board's
-  * flip-z (6.1.6's CoreMotion read face up as z +1 under the rule). */
+ /* Each board's mount from its DT orientation: the mounts found on hardware-checked rotation, the iPod touch 4G's
+  * and the iPhone 4's rule mounts, and a swap. Then the N81 reading through it with its board's flip-z (6.1.6's
+  * CoreMotion read face up as z +1 under the rule; the iPhone 4's Safari did the same on 6.1.3). */
  static const struct { const char *dt; bool accel; int8_t axis[3]; } boards[] = {
   { "04000000", true, { 1, 2, 3 } },                     /* N72, N18 */
   { "07000000", true, { -1, -2, 3 } },                   /* N88 */

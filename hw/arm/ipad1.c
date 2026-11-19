@@ -316,6 +316,14 @@ static const A4Board a4_n90 = {
         { 2, 0x68, TYPE_S5L8930_L3G4200D, 0x21, 0x05 },   /* gyro,ap3gdl: INT1, INT2 */
     },
     .accel_dt = "00010000ff0000000000ff00",
+    /*
+     * As on the N81: under the rule 6.1.3 read face up as face down. Safari's devicemotion
+     * (accelerationIncludingGravity, CoreMotion) read the screen's axis up as z +9.9 while
+     * the long edge up read y -10 and the right edge up x -10: z alone the other way. The
+     * 4.2.1 compass check behind the rule's z tested it against the compass model, which
+     * was found with this z (docs/n90/README.md, debt 4).
+     */
+    .accel_flip_z = true,
     .gyro_dt = "010000000001000000000100",
     .bt_uart = 3,
     .gauge_uart = 5,

@@ -265,8 +265,9 @@ documented quirk/patch, S stub.
    unit's real sensitivity matrix.
 6. ~~Accelerometer mounting~~ (2026-10-04; from the DT, 2026-10-20): the board carries its DT accelerometer
    orientation (`accel_dt`), and the part reads as `ios_dt_mount` derives from it (x reads -y, y reads -x).
-   Safari turns with `accel-orientation` 1/3 as on hardware (3 = Home right). z now reads -z, as on the
-   iPhone 4, whose z its compass checked; the N81 has no compass, and its face up is unchecked.
+   Safari turns with `accel-orientation` 1/3 as on hardware (3 = Home right). z reads z (flip-z, cdd01aec99):
+   with -z, 6.1.6's CoreMotion read face up as face down and fought its gyro. Safari's devicemotion agrees:
+   the long edge, the right edge and the screen up all read -10.
 7. ~~**Multitouch calibration**~~ (2026-10-05): `mt_profile_n81`'s frame is now fitted the way the K48's was
    (x = -69 + 4748u, y = -215 + 7360v; the N1's y runs bottom-up). The iPod's frame had put taps 9 px off at the
    edges and 21-27 px high. `tests/ipad1/touchcal.py` taps a 4x5 grid on a Safari page that marks each touch:
