@@ -153,6 +153,7 @@ bool lis302dl_apply_attitude(LIS302DLState *s, double pitch, double roll, bool f
     s->pitch_mdeg = lround(pitch * 1000);
     s->roll_mdeg = lround(roll * 1000);
     s->flat_pose = flat;
+    s->host_fields &= ~1u;      /* a pose set here replaces the host's held acceleration */
     lis302dl_mounted(s, g, v);
     s->base_x = v[0];
     s->base_y = v[1];
@@ -200,7 +201,7 @@ static void lis302dl_sample(LIS302DLState *s, int64_t now)
             values[i] = lis302dl_counts(s, values[i]);
         }
     }
-    if ((s->host_fields & 1) && now < s->host_accel_until_ns) {
+    if (s->host_fields & 1) {
         double g[3];
         for (int i = 0; i < 3; i++) g[i] = -s->host_acceleration[i] / 9.80665;
         lis302dl_mounted(s, g, values);
@@ -556,19 +557,33 @@ static void lis302dl_register_types(void)
 
 type_init(lis302dl_register_types)
 
-/* Host samples are transient, in device portrait axes; existing sensor mount
- * and CTRL full-scale conversion remain authoritative for guest registers. */
+/*
+ * Host samples, in device portrait axes; the sensor mount and CTRL full-scale
+ * conversion still make the guest's registers. The last acceleration holds
+ * until the host lets go (lis302dl_clear_host_motion) or sets a pose
+ * (lis302dl_apply_attitude), as a device held still keeps reading the same
+ * gravity: a host sends when its own sensor or the player moves, and a gap
+ * between samples is not the device turning. It used to lapse 250 ms after a
+ * sample to the board's resting pose (upright portrait on the iPod touch 2G),
+ * so a host that paused - a controller held steady, a UI frame late - read
+ * in the guest as the device snapping upright and back, which tilt-steered
+ * games (Real Racing) took as the steering recentring. A rotation rate is
+ * motion, not a pose: it still lapses to zero, the device then at rest where
+ * the last acceleration put it.
+ */
 void lis302dl_clear_host_motion(LIS302DLState *s)
 {
     s->host_fields = 0;
-    s->host_accel_until_ns = s->host_gyro_until_ns = 0;
+    s->host_gyro_until_ns = 0;
     memset(s->host_acceleration, 0, sizeof(s->host_acceleration));
     memset(s->host_angular_velocity, 0, sizeof(s->host_angular_velocity));
 }
 void lis302dl_set_host_motion(LIS302DLState *s, uint32_t fields, const double a[3], const double w[3])
 {
-    int64_t expires = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 250000000;
-    if (fields & 1) { memcpy(s->host_acceleration, a, sizeof(s->host_acceleration)); s->host_accel_until_ns = expires; }
-    if (fields & 2) { memcpy(s->host_angular_velocity, w, sizeof(s->host_angular_velocity)); s->host_gyro_until_ns = expires; }
+    if (fields & 1) memcpy(s->host_acceleration, a, sizeof(s->host_acceleration));
+    if (fields & 2) {
+        memcpy(s->host_angular_velocity, w, sizeof(s->host_angular_velocity));
+        s->host_gyro_until_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 250000000;
+    }
     s->host_fields |= fields;
 }

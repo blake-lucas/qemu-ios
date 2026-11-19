@@ -63,7 +63,7 @@ typedef struct LIS302DLState {
     double motion_from[3], motion_axis[3], motion_angle;
     uint32_t noise_state;
     uint32_t host_fields;
-    int64_t host_accel_until_ns, host_gyro_until_ns;
+    int64_t host_gyro_until_ns;    /* the host's acceleration holds; its rotation rate lapses */
     double host_acceleration[3], host_angular_velocity[3];
     int64_t last_sample_ns, shake_start_ns;
     int64_t trace_last_poll_ns, trace_last_report_ns;
