@@ -23,7 +23,7 @@
  */
 
 #define SNAP_MAGIC   0x534c4731u     /* "1GLS" */
-#define SNAP_VERSION 6                /* 6: OES_matrix_palette; 5: surfaces' page lists; 4: the guest's GLES API; 3 to 5 load without it */
+#define SNAP_VERSION 7                /* 7: vertex array objects; 6: OES_matrix_palette; 5: surfaces' page lists; 4: the guest's GLES API; 3 to 5 load without it */
 #define SNAP_SCAN_GAP 256            /* names probed past the last live one */
 
 static uint32_t gles_group_handle(GLESGroup *group);
@@ -953,6 +953,45 @@ static bool snap_alignment_ok(uint32_t align)
     return !align || align == 1 || align == 2 || align == 4 || align == 8;
 }
 
+/* A VAO's saved arrays (gles_vao_swap), in snap_put_host's order; a missing one as a 0. */
+static void snap_put_vao(SnapW *w, const GLESVao *v)
+{
+    sw32(w, v != NULL);
+    if (!v) return;
+    snap_put_array(w, &v->vertex);
+    for (unsigned i = 0; i < GLES_MAX_TEXUNITS; i++) snap_put_array(w, &v->texcoord[i]);
+    snap_put_array(w, &v->color);
+    snap_put_array(w, &v->normal);
+    snap_put_array(w, &v->pointsize);
+    snap_put_array(w, &v->weight);
+    snap_put_array(w, &v->matrix_index);
+    for (unsigned i = 0; i < GLES_MAX_ATTRIBS; i++) {
+        snap_put_array(w, &v->attr[i]);
+        sw32(w, v->attr_normalized[i]);
+    }
+    sw32(w, v->element_buffer ? v->element_buffer->name : 0);
+}
+
+static GLESVao *snap_get_vao(SnapR *r, GHashTable *buffers)
+{
+    GLESVao *v;
+    if (!sr32(r)) return NULL;
+    v = g_new0(GLESVao, 1);
+    snap_get_array(r, &v->vertex, buffers, GL_VERTEX_ARRAY);
+    for (unsigned i = 0; i < GLES_MAX_TEXUNITS; i++) snap_get_array(r, &v->texcoord[i], buffers, GL_TEXTURE_COORD_ARRAY);
+    snap_get_array(r, &v->color, buffers, GL_COLOR_ARRAY);
+    snap_get_array(r, &v->normal, buffers, GL_NORMAL_ARRAY);
+    snap_get_array(r, &v->pointsize, buffers, GL_POINT_SIZE_ARRAY_OES);
+    snap_get_array(r, &v->weight, buffers, GL_WEIGHT_ARRAY_OES);
+    snap_get_array(r, &v->matrix_index, buffers, GL_MATRIX_INDEX_ARRAY_OES);
+    for (unsigned i = 0; i < GLES_MAX_ATTRIBS; i++) {
+        snap_get_array(r, &v->attr[i], buffers, 0);
+        v->attr_normalized[i] = sr32(r);
+    }
+    v->element_buffer = snap_buffer(buffers, sr32(r));
+    return v;
+}
+
 static void snap_put_host(SnapW *w, GLESHost *h)
 {
     sw32(w, h->api_version);
@@ -990,6 +1029,20 @@ static void snap_put_host(SnapW *w, GLESHost *h)
     sw32(w, h->palette_mode);
     sw32(w, h->palette_current);
     swbytes(w, h->palette, sizeof(h->palette));
+    /* 7: the VAOs, the bound one's copy empty (gles_vao_swap) */
+    sw32(w, h->vao_bound);
+    sw32(w, h->vao_next);
+    snap_put_vao(w, h->vao_default);
+    sw32(w, h->vaos ? g_hash_table_size(h->vaos) : 0);
+    if (h->vaos) {
+        GHashTableIter it;
+        gpointer key, value;
+        g_hash_table_iter_init(&it, h->vaos);
+        while (g_hash_table_iter_next(&it, &key, &value)) {
+            sw32(w, GPOINTER_TO_UINT(key));
+            snap_put_vao(w, value);
+        }
+    }
 }
 
 static void snap_get_host(SnapR *r, GLESHost *h, uint32_t version)
@@ -1052,6 +1105,30 @@ static void snap_get_host(SnapR *r, GLESHost *h, uint32_t version)
             (h->weight.type && h->weight.type != GL_FLOAT && h->weight.type != GLES_FIXED) ||
             (h->matrix_index.type && h->matrix_index.type != GL_UNSIGNED_BYTE) ||
             h->palette_current >= GLES_MAX_PALETTE) {
+            r->bad = true;
+        }
+    }
+    if (version >= 7) {
+        uint32_t count;
+        h->vao_bound = sr32(r);
+        h->vao_next = sr32(r);
+        h->vao_default = snap_get_vao(r, h->buffers);
+        count = sr32(r);
+        if (count > GLES_MAX_NAMES) {
+            r->bad = true;
+            count = 0;
+        }
+        for (uint32_t i = 0; i < count && !r->bad; i++) {
+            uint32_t name = sr32(r);
+            GLESVao *v = snap_get_vao(r, h->buffers);
+            if (!name || !v) {
+                gles_vao_free(v);
+                r->bad = true;
+                break;
+            }
+            g_hash_table_replace(gles_vao_table(h), GUINT_TO_POINTER(name), v);
+        }
+        if (h->vao_bound && !(h->vaos && g_hash_table_contains(h->vaos, GUINT_TO_POINTER(h->vao_bound)))) {
             r->bad = true;
         }
     }

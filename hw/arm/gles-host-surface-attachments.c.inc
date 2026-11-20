@@ -20,6 +20,7 @@
                                   gh.rb_sized, GUINT_TO_POINTER(rb)));
         }
         gles_trace_attach("glFramebufferRenderbuffer", attach, rb);
+        gles_note_attach(attach, GL_RENDERBUFFER_EXT, rb, 0, 0);
         gh.fb_dirty = true;
         if (gles_is_drawable(gh.bound_framebuffer)) {
             /* gh.fbo already carries the color target we present out of and a
@@ -51,6 +52,7 @@
             gles_set_drawable(gh.bound_framebuffer, false);
         }
         gles_trace_attach("glFramebufferTexture2D", a[1], a[3]);
+        gles_note_attach(a[1], GL_TEXTURE, a[3], a[4], a[2]);
         gh.fb_dirty = true;
         if (gles_is_drawable(gh.bound_framebuffer)) {
             return 0;

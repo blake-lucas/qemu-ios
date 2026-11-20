@@ -254,6 +254,7 @@ static unsigned gles_fb_w = 320, gles_fb_h = 480;   /* the iPod panel: lcd->pw/p
  * both far above anything this device does. */
 #define GLES_MAX_TEX_BYTES ((size_t)4096 * 4096 * 4)
 #define GLES_MAX_NAMES     65536u
+#define GLES_VERTEX_ARRAY_BINDING_OES 0x85B5  /* OES_vertex_array_object's glGet */
 /* Every grow-and-keep scratch buffer (client arrays, indices, texels) and the
  * native contexts and share groups a guest may hold: a guest can only make the
  * host allocate this much. */
@@ -744,6 +745,14 @@ typedef struct {
     GHashTable *glsl;           /* shader/program names, without a group */
     uint32_t glsl_next;
     GHashTable *uloc;
+    /* OES_vertex_array_object (gles_vao_bind): the context's VAOs by name, the next name, the bound one (0: the
+     * default), and the default VAO's arrays while another is bound. */
+    GHashTable *vaos;
+    uint32_t vao_next, vao_bound;
+    struct GLESVao *vao_default;
+    /* What the guest attached to each of its framebuffers (gles_note_attach), by name, for
+     * glGetFramebufferAttachmentParameteriv: the drawable's attachments never reach the host. */
+    GHashTable *fb_attach;
 } GLESHost;
 
 /* Old guest engines retain their legacy context. New engines pass opaque
@@ -1263,6 +1272,40 @@ static void gles_set_drawable(uint32_t name, bool drawable)
     if (gh.bound_framebuffer == name) {
         glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gles_host_fbo(name));
     }
+}
+
+/* A framebuffer's attachments as the guest made them: color 0, depth, stencil; each its type (GL_TEXTURE or
+ * GL_RENDERBUFFER, 0 for none), object, mip level and texture target. */
+typedef struct {
+    struct { uint32_t type, name, level, target; } at[3];
+} GLESFbAttach;
+
+static int gles_attach_index(uint32_t attach)
+{
+    switch (attach) {
+    case 0x8CE0: return 0;      /* COLOR_ATTACHMENT0 */
+    case 0x8D00: return 1;      /* DEPTH_ATTACHMENT */
+    case 0x8D20: return 2;      /* STENCIL_ATTACHMENT */
+    default: return -1;
+    }
+}
+
+static void gles_note_attach(uint32_t attach, uint32_t type, uint32_t name, uint32_t level, uint32_t target)
+{
+    int i = gles_attach_index(attach);
+    GLESFbAttach *f;
+
+    if (i < 0 || !gh.bound_framebuffer) return;
+    if (!gh.fb_attach) gh.fb_attach = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    f = g_hash_table_lookup(gh.fb_attach, GUINT_TO_POINTER(gh.bound_framebuffer));
+    if (!f) {
+        f = g_new0(GLESFbAttach, 1);
+        g_hash_table_insert(gh.fb_attach, GUINT_TO_POINTER(gh.bound_framebuffer), f);
+    }
+    f->at[i].type = name ? type : 0;
+    f->at[i].name = name;
+    f->at[i].level = name ? level : 0;
+    f->at[i].target = name ? target : 0;
 }
 
 /* Every attachment change, with the role it left the framebuffer in. Which
@@ -2686,6 +2729,7 @@ static unsigned gles_query_count(uint32_t pname)
     case 0x80C8: case 0x80C9: case 0x80CA: case 0x80CB: /* BLEND_{DST,SRC}_{RGB,ALPHA} */
     case 0x8800: case 0x8801: case 0x8802: case 0x8803: /* STENCIL_BACK_* */
     case 0x8CA3: case 0x8CA4: case 0x8CA5:
+    case GLES_VERTEX_ARRAY_BINDING_OES:
         return 1;
     case GL_COMPRESSED_TEXTURE_FORMATS:
         return gles_compressed_count();
@@ -4935,6 +4979,99 @@ static void gles_buffer_forget(const GLESBuffer *b)
     if (gh.element_buffer == b) {
         gles_buffer_bind(&gh.element_buffer, NULL);
     }
+}
+
+/* ------------------------------------------------ vertex array objects ---- */
+
+/*
+ * OES_vertex_array_object: a VAO holds the vertex arrays (ES 1.1's client arrays and ES 2.0's generic attributes,
+ * each with the buffer captured by its pointer) and the element array buffer. iOS has it on every SGX device from
+ * 4.x, and engines built on it draw nothing without it: Zombie Gunship's world came through black, only its
+ * interface (drawn without a VAO) showed.
+ *
+ * The draw path keeps reading the live arrays in gh. Binding a VAO swaps their guest-side fields with the VAO's
+ * saved copy, so the bound VAO's own copy is always empty -- its state is the live one -- and every buffer
+ * reference has exactly one owner. The host-side caches stay with the live arrays: they describe the host
+ * context, which a bind does not change.
+ */
+typedef struct GLESVao {
+    GLESArray vertex, color, normal, pointsize, weight, matrix_index;
+    GLESArray texcoord[GLES_MAX_TEXUNITS];
+    GLESArray attr[GLES_MAX_ATTRIBS];
+    bool attr_normalized[GLES_MAX_ATTRIBS];
+    GLESBuffer *element_buffer;
+} GLESVao;
+
+static void gles_array_swap_guest(GLESArray *x, GLESArray *y)
+{
+#define GLES_SWAP(f) do { typeof(x->f) t_ = x->f; x->f = y->f; y->f = t_; } while (0)
+    GLES_SWAP(enabled); GLES_SWAP(size); GLES_SWAP(type); GLES_SWAP(stride); GLES_SWAP(ptr); GLES_SWAP(vbo);
+#undef GLES_SWAP
+}
+
+/* Exchange host `h`'s live arrays with a VAO's copy. */
+static void gles_vao_swap(GLESHost *h, GLESVao *v)
+{
+    GLESArray *live[] = { &h->vertex, &h->color, &h->normal, &h->pointsize, &h->weight, &h->matrix_index };
+    GLESArray *saved[] = { &v->vertex, &v->color, &v->normal, &v->pointsize, &v->weight, &v->matrix_index };
+    GLESBuffer *e = h->element_buffer;
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(live); i++) gles_array_swap_guest(live[i], saved[i]);
+    for (i = 0; i < GLES_MAX_TEXUNITS; i++) gles_array_swap_guest(&h->texcoord[i], &v->texcoord[i]);
+    for (i = 0; i < GLES_MAX_ATTRIBS; i++) {
+        bool n = h->attr_normalized[i];
+        gles_array_swap_guest(&h->attr[i], &v->attr[i]);
+        h->attr_normalized[i] = v->attr_normalized[i];
+        v->attr_normalized[i] = n;
+    }
+    h->element_buffer = v->element_buffer;
+    v->element_buffer = e;
+}
+
+static void gles_vao_free(gpointer p)
+{
+    GLESVao *v = p;
+    GLESArray *arrays[] = { &v->vertex, &v->color, &v->normal, &v->pointsize, &v->weight, &v->matrix_index };
+    unsigned i;
+
+    if (!v) return;
+    for (i = 0; i < ARRAY_SIZE(arrays); i++) gles_buffer_bind(&arrays[i]->vbo, NULL);
+    for (i = 0; i < GLES_MAX_TEXUNITS; i++) gles_buffer_bind(&v->texcoord[i].vbo, NULL);
+    for (i = 0; i < GLES_MAX_ATTRIBS; i++) gles_buffer_bind(&v->attr[i].vbo, NULL);
+    gles_buffer_bind(&v->element_buffer, NULL);
+    g_free(v);
+}
+
+static GHashTable *gles_vao_table(GLESHost *h)
+{
+    if (!h->vaos) h->vaos = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, gles_vao_free);
+    return h->vaos;
+}
+
+/* The VAO named `name` in `h` (0: the default one, always there), or NULL for a name glGenVertexArraysOES never
+ * gave. */
+static GLESVao *gles_vao_find(GLESHost *h, uint32_t name)
+{
+    if (!name) {
+        if (!h->vao_default) h->vao_default = g_new0(GLESVao, 1);
+        return h->vao_default;
+    }
+    return h->vaos ? g_hash_table_lookup(h->vaos, GUINT_TO_POINTER(name)) : NULL;
+}
+
+/* glBindVertexArrayOES; false for a name that isn't a VAO (GL_INVALID_OPERATION). */
+static bool gles_vao_bind(GLESHost *h, uint32_t name)
+{
+    GLESVao *to = gles_vao_find(h, name);
+
+    if (!to) return false;
+    if (name != h->vao_bound) {
+        gles_vao_swap(h, gles_vao_find(h, h->vao_bound));  /* the live arrays to the old VAO; live now empty */
+        gles_vao_swap(h, to);                               /* the new VAO's to live; its copy now empty */
+        h->vao_bound = name;
+    }
+    return true;
 }
 
 
@@ -7733,6 +7870,52 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         glAlphaFunc(a[0], gles_f(a[1]));
         return 0;
 
+    case GLES_ID_glGenVertexArraysOES: {        /* n, guest uint* */
+        uint32_t n = a[0], i;
+        g_autofree uint32_t *ids = NULL;
+
+        if (n > GLES_MAX_NAMES) {
+            gles_refuse("cap:glGenVertexArraysOES");
+            return gles_reject(GL_INVALID_VALUE);
+        }
+        if (!n || !a[1]) return 0;
+        ids = g_new0(uint32_t, n);
+        for (i = 0; i < n; i++) {
+            do {
+                ids[i] = ++gh.vao_next;
+            } while (!ids[i] || gles_vao_find(&gh, ids[i]));
+            g_hash_table_insert(gles_vao_table(&gh), GUINT_TO_POINTER(ids[i]), g_new0(GLESVao, 1));
+        }
+        gles_guest_rw(cpu, a[1], (uint8_t *)ids, n * sizeof(uint32_t), 1);
+        return 0;
+    }
+
+    case GLES_ID_glDeleteVertexArraysOES: {     /* n, guest const uint* */
+        uint32_t n = a[0], i;
+        g_autofree uint32_t *ids = NULL;
+
+        if (!n || !a[1] || !gh.vaos) return 0;
+        if (n > GLES_MAX_NAMES) {
+            gles_refuse("cap:glDeleteVertexArraysOES");
+            return gles_reject(GL_INVALID_VALUE);
+        }
+        ids = g_new0(uint32_t, n);
+        if (gles_guest_rw(cpu, a[1], (uint8_t *)ids, n * sizeof(uint32_t), 0) != 0) return -1;
+        for (i = 0; i < n; i++) {
+            if (!ids[i] || !gles_vao_find(&gh, ids[i])) continue;
+            if (ids[i] == gh.vao_bound) gles_vao_bind(&gh, 0);   /* deleting the bound VAO binds the default */
+            g_hash_table_remove(gh.vaos, GUINT_TO_POINTER(ids[i]));
+        }
+        return 0;
+    }
+
+    case GLES_ID_glBindVertexArrayOES:          /* array */
+        if (!gles_vao_bind(&gh, a[0])) return gles_reject(GL_INVALID_OPERATION);
+        return 0;
+
+    case GLES_ID_glIsVertexArrayOES:            /* array */
+        return a[0] && gles_vao_find(&gh, a[0]) ? 1 : 0;
+
     case GLES_SLOT_BIND_BUFFER: {               /* target, buffer */
         GLESBuffer *b = gles_buffer_intern(a[1]);
 
@@ -7954,6 +8137,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         }
         switch (pname) {
         case GL_VERTEX_ARRAY: v.i[0] = gh.vertex.enabled; break;
+        case GLES_VERTEX_ARRAY_BINDING_OES: v.i[0] = gh.vao_bound; break;
         case GL_MATRIX_PALETTE_OES: v.i[0] = gh.palette_on; break;
         case GL_CURRENT_PALETTE_MATRIX_OES: v.i[0] = gh.palette_current; break;
         case GL_MAX_PALETTE_MATRICES_OES: v.i[0] = GLES_MAX_PALETTE; break;
@@ -9007,6 +9191,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             glDeleteRenderbuffersEXT(n, ids);
         } else {
             for (i = 0; i < n; i++) {
+                if (gh.fb_attach) g_hash_table_remove(gh.fb_attach, GUINT_TO_POINTER(ids[i]));
                 /* Never let the guest delete gh.fbo out from under the
                  * present path by deleting the name that stands for it. */
                 if (g_hash_table_remove(gh.fbo_drawable,
@@ -9069,7 +9254,38 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
     }
 
     case GLES_SLOT_GET_FB_ATTACH_PARAM: { /* target, attach, pname, int* */
-        uint32_t v = gh.bound_renderbuffer;
+        /* From what the guest attached (gles_note_attach), as the device answers. This used to give the bound
+         * renderbuffer's name for every question: Zombie Gunship, asking its screen framebuffer for its depth
+         * buffer, took its world's half-size one and composited the world into a quarter of the screen. A
+         * framebuffer restored from a snapshot has no record: the host's answer, for one that isn't the drawable. */
+        int i = gles_attach_index(a[1]);
+        GLESFbAttach *f = gh.fb_attach && gh.bound_framebuffer
+            ? g_hash_table_lookup(gh.fb_attach, GUINT_TO_POINTER(gh.bound_framebuffer)) : NULL;
+        uint32_t v = 0;
+
+        if (i < 0 || !gh.bound_framebuffer) {
+            return gles_reject(i < 0 ? GL_INVALID_ENUM : GL_INVALID_OPERATION);
+        }
+        if (f) {
+            switch (a[2]) {
+            case 0x8CD0: v = f->at[i].type; break;                      /* OBJECT_TYPE */
+            case 0x8CD1: v = f->at[i].name; break;                      /* OBJECT_NAME */
+            case 0x8CD2:                                                /* TEXTURE_LEVEL */
+                if (f->at[i].type != GL_TEXTURE) return gles_reject(GL_INVALID_ENUM);
+                v = f->at[i].level;
+                break;
+            case 0x8CD3:                                                /* TEXTURE_CUBE_MAP_FACE */
+                if (f->at[i].type != GL_TEXTURE) return gles_reject(GL_INVALID_ENUM);
+                v = f->at[i].target != GL_TEXTURE_2D ? f->at[i].target : 0;
+                break;
+            default:
+                return gles_reject(GL_INVALID_ENUM);
+            }
+        } else if (!gles_is_drawable(gh.bound_framebuffer)) {
+            GLint hv = 0;
+            glGetFramebufferAttachmentParameterivEXT(GL_FRAMEBUFFER_EXT, a[1], a[2], &hv);
+            v = hv;
+        }
         if (a[3]) {
             gles_guest_rw(cpu, a[3], (uint8_t *)&v, sizeof(v), 1);
         }
@@ -9157,6 +9373,9 @@ static void gles_context_free(GLESHost *state)
         gles_buffer_destroy(state->attr[i].vbo);
         g_free(state->attr[i].buf); g_free(state->attr[i].fbuf);
     }
+    if (state->vaos) g_hash_table_destroy(state->vaos);
+    if (state->fb_attach) g_hash_table_destroy(state->fb_attach);
+    gles_vao_free(state->vao_default);
     gles_buffer_destroy(state->array_buffer);
     gles_buffer_destroy(state->element_buffer);
     g_free(state->ibuf); g_free(state->txbuf); g_free(state->zerobuf);
@@ -9415,13 +9634,26 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
         }
     }
     {
-        /* IT_GLES_CALL_TRACE=N: the first N calls, with arguments and result. */
+        /* IT_GLES_CALL_TRACE=N: the first N calls, with arguments and result. IT_GLES_CALL_TRACE_SLOTS=id,id,...
+         * counts and prints only those slots (gles-names.h ids, decimal), to follow a few calls deep into a game. */
         static long budget = -1;
+        static uint64_t only[(GLES_OP_BASE + 1024 + 63) / 64];
+        static bool filtered;
+        static long skip;
         if (budget < 0) {
-            const char *e = getenv("IT_GLES_CALL_TRACE");
+            const char *e = getenv("IT_GLES_CALL_TRACE"), *f = getenv("IT_GLES_CALL_TRACE_SLOTS");
+            const char *k = getenv("IT_GLES_CALL_TRACE_SKIP");     /* the first N matching calls go unprinted */
             budget = e ? atol(e) : 0;
+            skip = k ? atol(k) : 0;
+            for (char *end; f && *f; f = *end ? end + 1 : end) {
+                unsigned long id = strtoul(f, &end, 10);
+                if (end == f) break;
+                if (id < ARRAY_SIZE(only) * 64) only[id / 64] |= UINT64_C(1) << (id % 64);
+                filtered = true;
+            }
         }
-        if (budget > 0) {
+        if (budget > 0 && (!filtered || (slot < ARRAY_SIZE(only) * 64 && (only[slot / 64] >> (slot % 64) & 1))) &&
+            (skip <= 0 || !skip--)) {
             budget--;
             fprintf(stderr, "[gles-call] %08x %4u(%u)", ctx, slot, argc);
             for (uint32_t i = 0; i < MAX(argc, 4) && i < 10; i++) {
