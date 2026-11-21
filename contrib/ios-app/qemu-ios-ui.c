@@ -19,6 +19,7 @@
 #include "qemu/timer.h"
 #include "qemu/seqlock.h"
 #include "qemu/cutils.h"
+#include <glib/gstdio.h>
 #define IOS_FRAME_PATH_DEFINES_EVENT /* strong definitions on Windows: see the header */
 #include "qemu/ios-frame-path.h"
 #include "hw/arm/ipod_touch_lis302dl.h"
@@ -439,6 +440,24 @@ static void profile_flush_gl_locked(uint64_t now)
     profile_ntouched = 0;
 }
 
+/*
+ * A new capture file, refused if it exists. Not fopen(path, "wx"): the MinGW engine's msvcrt has no C11 "x" and
+ * answered every Windows capture with EINVAL ("Profile capture: Invalid argument" at each start with detailed
+ * timing on), and "w" there is text mode, which would write CRLF. g_open takes the UTF-8 path on Windows too.
+ */
+static FILE *profile_create(const char *path)
+{
+    int fd = g_open(path, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0644);
+    FILE *f = fd < 0 ? NULL : fdopen(fd, "wb");
+
+    if (fd >= 0 && !f) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
+    return f;
+}
+
 int qemu_ios_profile_start(const char *path)
 {
     int result = 0;
@@ -452,7 +471,7 @@ int qemu_ios_profile_start(const char *path)
         result = -EBUSY;
     } else if (!path || !*path) {
         result = -EINVAL;
-    } else if (!(profile_file = fopen(path, "wx"))) {
+    } else if (!(profile_file = profile_create(path))) {
         result = -errno;
     } else {
         setvbuf(profile_file, NULL, _IOFBF, 65536);
