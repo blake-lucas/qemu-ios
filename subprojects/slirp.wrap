@@ -1,7 +1,7 @@
 [wrap-git]
 url = https://gitlab.freedesktop.org/slirp/libslirp.git
 revision = d09dc9a70360ee7838acccbd234ab83f3b9b37a5
-diff_files = libslirp-set-restricted.patch, libslirp-windows.patch, libslirp-restricted-dns.patch
+diff_files = libslirp-set-restricted.patch, libslirp-windows.patch, libslirp-restricted-dns.patch, libslirp-unix-hup.patch
 
 [provide]
 slirp = libslirp_libdep
