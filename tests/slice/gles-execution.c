@@ -50,9 +50,14 @@ static void qemu_cond_wait_bql(QemuCond *c)
 #include "gate.h"
 typedef struct {
     unsigned kind;
+    bool idle, exec_seen;
 } CPUState;
+/* This engine runs a call past the gate without the BQL, except context setup and teardown */
+#define GLES_OP_NEW_SHAREGROUP 0x1004
+#define GLES_OP_DELETE_CONTEXT 0x1007
+#define qatomic_set(p, v) (*(p) = (v))
 typedef struct {
-    unsigned unused;
+    uint32_t slot;
 } qc_gles_args_t;
 static struct {
     bool armed, pending;
@@ -63,7 +68,8 @@ static bool drawing, finish, waiter_started, second_entered;
 static jmp_buf fault_return;
 static int64_t gles_handle_call(CPUState *cpu, qc_gles_args_t *a)
 {
-    assert(held && gles_execution_owner);
+    assert(gles_execution_owner && held == (a->slot == GLES_OP_NEW_SHAREGROUP));
+    assert(cpu->idle);                          /* the A6's stall check doesn't count a GL wait */
     if (cpu->kind == 1) {
         bool unlocked = gles_native_begin();
         assert(unlocked && !held);
@@ -96,7 +102,7 @@ static void gles_guest_fault_in(CPUState *cpu)
 static void *render(void *unused)
 {
     CPUState cpu = {1};
-    qc_gles_args_t args = {0};
+    qc_gles_args_t args = {GLES_OP_NEW_SHAREGROUP};
     bql_lock();
     assert(qc_handle_gles(&cpu, &args) == 73);
     bql_unlock();
