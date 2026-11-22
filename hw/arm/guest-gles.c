@@ -36,7 +36,31 @@ static QemuCond gles_execution_cond;
 static bool gles_execution_initialized, gles_execution_busy;
 static __thread bool gles_execution_owner;
 
-static void gles_execution_enter(void)
+/*
+ * The vCPU whose thread has a host GL context current. An EGL context is current on one thread at a time
+ * (eglMakeCurrent refuses one current elsewhere), where upstream's CGL lets every caller share it, and the A6's
+ * two cores both call. A caller on another vCPU asks the binder to let it go: the binder's thread unbinds as
+ * queued work at its next exit from guest code, or at once if it is itself waiting here. Under the BQL.
+ */
+static CPUState *gles_binder;
+static bool gles_binder_asked;
+
+static void gles_binder_unbind(void)
+{
+    gles_host_release_current();
+    gles_binder = NULL;
+    gles_binder_asked = false;
+    qemu_cond_broadcast(&gles_execution_cond);
+}
+
+static void gles_binder_release_work(CPUState *cpu, run_on_cpu_data data)
+{
+    if (gles_binder == cpu) {
+        gles_binder_unbind();
+    }
+}
+
+static void gles_execution_enter(CPUState *cpu)
 {
     assert(bql_locked());
     assert(!gles_execution_owner);
@@ -44,15 +68,24 @@ static void gles_execution_enter(void)
         qemu_cond_init(&gles_execution_cond);
         gles_execution_initialized = true;
     }
-    while (gles_execution_busy) {
+    while (gles_execution_busy || (gles_binder && gles_binder != cpu)) {
+        if (gles_binder == cpu && gles_binder_asked) {
+            gles_binder_unbind();               /* another vCPU waits for the context this thread holds */
+            continue;
+        }
+        if (!gles_execution_busy && gles_binder && gles_binder != cpu && !gles_binder_asked) {
+            gles_binder_asked = true;
+            async_run_on_cpu(gles_binder, gles_binder_release_work, RUN_ON_CPU_NULL);
+        }
         qemu_cond_wait_bql(&gles_execution_cond);
     }
     gles_execution_busy = gles_execution_owner = true;
 }
 
-static void gles_execution_leave(void)
+static void gles_execution_leave(CPUState *cpu)
 {
     assert(bql_locked() && gles_execution_owner);
+    gles_binder = cpu;                          /* the call left its context current on this thread */
     gles_execution_busy = gles_execution_owner = false;
     qemu_cond_broadcast(&gles_execution_cond);
 }
@@ -361,12 +394,12 @@ int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
     bool gate = bql_locked();
 
     if (gate) {
-        gles_execution_enter();
+        gles_execution_enter(cpu);
     }
     gf.armed = gf.pending = false;
     int64_t result = gles_handle_call(cpu, a);
     if (gate) {
-        gles_execution_leave();
+        gles_execution_leave(cpu);
     }
     /* A guest data abort can longjmp out of this helper. Release the renderer
      * gate first, while still holding the BQL, so that fault retries cannot

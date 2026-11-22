@@ -467,6 +467,9 @@ bool gles_host_debug(void);
 uint64_t gles_host_ram_gen(uint64_t addr, uint64_t len);
 /* The A6's renderer features, on the machine that calls it (s5l8950.c) */
 void gles_host_set_a6(bool on);
+/* Unbind the calling thread's current host GL context (EGL: so another thread can make it current); a no-op
+ * where contexts aren't per thread. */
+void gles_host_release_current(void);
 #endif
 
 #endif /* HW_ARM_GUEST_SERVICES_GLES_H */

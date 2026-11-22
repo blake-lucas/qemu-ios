@@ -50,3 +50,4 @@ void gles_host_set_debug(bool on) { }
 bool gles_host_debug(void) { return false; }
 uint64_t gles_host_ram_gen(uint64_t addr, uint64_t len) { return 0; }
 void gles_host_set_a6(bool on) { }
+void gles_host_release_current(void) { }
