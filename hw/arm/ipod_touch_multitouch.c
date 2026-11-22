@@ -340,6 +340,11 @@ static void mt_clear_pending(IPodTouchMultitouchState *s)
 static MTFrame *mt_take_pending(IPodTouchMultitouchState *s, uint32_t *length)
 {
     MTFrame *frame = s->next_frame;
+    /* hold-atn (the A6): the guest took the frame its attention line announced, so the line rises; a queued
+     * report that takes the slot pulls it low again (ipod_touch_multitouch_inform_frame_ready). */
+    if (s->hold_atn && frame) {
+        qemu_irq_raise(s->atn);
+    }
     *length = s->next_frame_len;
     s->next_frame = NULL;
     s->next_frame_len = 0;

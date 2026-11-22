@@ -2,7 +2,7 @@
  * collects the pending touch frame. The old zero-width pulse loses that level.
  * Legacy pulse and SYSIC boards retain their existing signaling contract.
  *
- * SLICE hw/arm/ipod_touch_multitouch.c fn ipod_touch_multitouch_inform_frame_ready ipod_touch_multitouch_frame_taken
+ * SLICE hw/arm/ipod_touch_multitouch.c fn ipod_touch_multitouch_inform_frame_ready mt_take_pending ipod_touch_multitouch_frame_taken
  * CFLAGS -Wall -Werror
  */
 #include <assert.h>
@@ -17,12 +17,18 @@ typedef struct {
 typedef struct {
     int64_t deadline;
 } QEMUTimer;
+typedef struct MTFrame MTFrame;
 typedef struct {
     void *sysic;
     unsigned sysic_atn_group, sysic_atn_bit;
     Pin *atn;
-    bool hold_atn, next_frame_changes, frame_owed;
+    bool hold_atn;
     QEMUTimer *touch_end_timer;
+    /* this engine's report queue (mt_take_pending) */
+    MTFrame *next_frame, *queued_frames[4];
+    uint32_t next_frame_len, queued_lengths[4];
+    bool next_frame_motion, queued_motion[4];
+    unsigned queued_count;
 } IPodTouchMultitouchState;
 static void qemu_irq_raise(Pin *p)
 {
@@ -33,17 +39,17 @@ static void qemu_irq_lower(Pin *p)
     p->falling += p->level != 0;
     p->level = 0;
 }
-static int64_t qemu_clock_get_ns(int clock)
+__attribute__((unused)) static int64_t qemu_clock_get_ns(int clock)
 {
     (void)clock;
     return 100;
 }
-static int64_t mt_frame_period_ns(IPodTouchMultitouchState *s)
+__attribute__((unused)) static int64_t mt_frame_period_ns(IPodTouchMultitouchState *s)
 {
     (void)s;
     return 10;
 }
-static void timer_mod(QEMUTimer *t, int64_t at)
+__attribute__((unused)) static void timer_mod(QEMUTimer *t, int64_t at)
 {
     t->deadline = at;
 }
@@ -56,6 +62,7 @@ static void ipod_touch_sysic_request_edge(void *sysic, unsigned group,
     sysic_group = group;
     sysic_bit = bit;
 }
+#include <string.h>
 #include "slice.h"
 int main(void)
 {
@@ -68,14 +75,20 @@ int main(void)
     assert(pin.level == 0 && pin.falling == 1);
     ipod_touch_multitouch_inform_frame_ready(&s);
     assert(pin.level == 0 && pin.falling == 2);
-    s.frame_owed = true;
-    s.next_frame_changes = true;
+    /* The guest takes the announced frame (the SPI read): the line rises until the next report. */
+    uint32_t len;
+    s.next_frame = (MTFrame *)&s;
+    s.next_frame_len = 4;
+    assert(mt_take_pending(&s, &len) == (MTFrame *)&s && len == 4);
+    assert(pin.level == 1 && !s.next_frame);
+    ipod_touch_multitouch_inform_frame_ready(&s);
+    assert(pin.level == 0);
+    /* A reader outside the model (the Z1) took it: frame_taken raises it too. */
     ipod_touch_multitouch_frame_taken(&s);
-    assert(pin.level == 1 && !s.frame_owed && !s.next_frame_changes);
-    assert(timer.deadline == 110);
+    assert(pin.level == 1);
     s.hold_atn = false;
     ipod_touch_multitouch_inform_frame_ready(&s);
-    assert(pin.level == 1 && pin.falling == 3);
+    assert(pin.level == 1 && pin.falling == 4);
     s.sysic = &s;
     ipod_touch_multitouch_inform_frame_ready(&s);
     assert(sysic_edges == 1 && sysic_group == 3 && sysic_bit == 13);
