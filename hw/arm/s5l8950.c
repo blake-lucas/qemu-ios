@@ -236,6 +236,7 @@ struct S5L8950State {
     bool resume_boot;
     bool button_down[IPOD_TOUCH_BUTTON_VOLDOWN + 1];
     char *kboot, *nand, *restore_image;
+    char *nand_overlay; /* nand-overlay: the device's writes over a container store (the IOP's, as the iPad's) */
     char *usb_tcp_addr; /* the host USB bridge (usbmuxd-qemu); unset: IT_USB_TCP */
     int restore_fd;
     uint64_t restore_size;
@@ -1796,6 +1797,8 @@ static void a6_init(MachineState *machine)
     DeviceState *nand_store = qdev_new(TYPE_S5L8930_IOP);
     if (s->nand)
         qdev_prop_set_string(nand_store, "nand", s->nand);
+    if (s->nand_overlay)
+        qdev_prop_set_string(nand_store, "nand-overlay", s->nand_overlay);
     if (s->ppn) {
         qdev_prop_set_uint32(nand_store, "nand-id", 0x014e5050);
         qdev_prop_set_uint8(nand_store, "nand-ce-mask", 1);
@@ -1954,6 +1957,16 @@ static void a6_set_nand(Object *obj, const char *path, Error **errp)
     S5L8950State *s = S5L8950_MACHINE(obj);
     g_free(s->nand);
     s->nand = g_strdup(path);
+}
+static char *a6_get_nand_overlay(Object *obj, Error **errp)
+{
+    return g_strdup(S5L8950_MACHINE(obj)->nand_overlay);
+}
+static void a6_set_nand_overlay(Object *obj, const char *path, Error **errp)
+{
+    S5L8950State *s = S5L8950_MACHINE(obj);
+    g_free(s->nand_overlay);
+    s->nand_overlay = g_strdup(path);
 }
 static char *a6_get_usb_tcp_addr(Object *obj, Error **errp)
 {
@@ -2169,6 +2182,9 @@ static void a6_class_init(ObjectClass *klass, const void *data)
     mc->default_ram_size = A6_RAM_SIZE;
     object_class_property_add_str(klass, "kboot", a6_get_kboot, a6_set_kboot);
     object_class_property_add_str(klass, "nand", a6_get_nand, a6_set_nand);
+    object_class_property_add_str(klass, "nand-overlay", a6_get_nand_overlay, a6_set_nand_overlay);
+    object_class_property_set_description(klass, "nand-overlay",
+        "The device's writes over a container NAND store (geometry.json \"container\"), as the iPad's");
     object_class_property_add_str(klass, "usb-tcp-addr", a6_get_usb_tcp_addr,
                                   a6_set_usb_tcp_addr);
     object_class_property_set_description(klass, "usb-tcp-addr",
