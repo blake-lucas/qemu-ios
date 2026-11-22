@@ -470,10 +470,24 @@ INT_PROP(answer_delay_ms, "answer-delay-ms", answer_delay_ms)
 BOOL_PROP(registered, registered)
 BOOL_PROP(sim_present, sim_present)
 
-/* Actions: writing the property performs the network-side event. */
-static void iosbb_set_incoming_call(Object *obj, const char *value, Error **errp)
+/*
+ * Actions: writing the property performs the network-side event, now. The core's clock only moves
+ * when the timer or the transport calls in, and a quiet link (iPhone 4: no AT line or URC for
+ * minutes once boot settles) left it far behind: an SMS sent 96 s into an n90 5.1.1 boot carried
+ * the SCTS and trace time of the last tick, 55 s: the trace read as a +CMT that waited 41 s for the
+ * AP (it went out at once, SRDY rose at 96150) and the text's SCTS was 41 s early.
+ */
+static IosBasebandState *iosbb_action(Object *obj)
 {
     IosBasebandState *s = IOS_BASEBAND(obj);
+
+    s->bb.now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    return s;
+}
+
+static void iosbb_set_incoming_call(Object *obj, const char *value, Error **errp)
+{
+    IosBasebandState *s = iosbb_action(obj);
 
     if (!value || !*value) {
         error_setg(errp, "incoming-call wants a phone number");
@@ -489,7 +503,7 @@ static void iosbb_set_incoming_call(Object *obj, const char *value, Error **errp
 
 static void iosbb_set_remote_answer(Object *obj, const char *value, Error **errp)
 {
-    IosBasebandState *s = IOS_BASEBAND(obj);
+    IosBasebandState *s = iosbb_action(obj);
 
     ios_bb_remote_answer(&s->bb);
     iosbb_arm(s, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + IOS_BB_LATENCY_MS);
@@ -497,7 +511,7 @@ static void iosbb_set_remote_answer(Object *obj, const char *value, Error **errp
 
 static void iosbb_set_remote_hangup(Object *obj, const char *value, Error **errp)
 {
-    IosBasebandState *s = IOS_BASEBAND(obj);
+    IosBasebandState *s = iosbb_action(obj);
 
     ios_bb_remote_hangup(&s->bb);
     iosbb_arm(s, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + IOS_BB_LATENCY_MS);
@@ -525,7 +539,7 @@ static void iosbb_set_gps_fix(Object *obj, const char *value, Error **errp)
 
 static void iosbb_set_incoming_sms(Object *obj, const char *value, Error **errp)
 {
-    IosBasebandState *s = IOS_BASEBAND(obj);
+    IosBasebandState *s = iosbb_action(obj);
     const char *bar = value ? strchr(value, '|') : NULL;
     char num[32];
     int n;
