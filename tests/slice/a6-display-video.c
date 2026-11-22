@@ -2,8 +2,8 @@
  * offsets, and the shifted full-range CSC matrix.
  * PKG glib-2.0
  * SLICE:types hw/arm/s5l8930_display.c define DP_
- * SLICE:types hw/arm/s5l8930_display.c typedef UILayer
- * SLICE hw/arm/s5l8930_display.c fn h5p_ui_xlate fb_read video_compose
+ * SLICE:types hw/arm/s5l8930_display.c typedef UILayer FbSeg VideoPlan
+ * SLICE hw/arm/s5l8930_display.c fn h5p_ui_xlate fb_plan_into plan_run video_plan video_px video_render video_compose
  */
 #include <assert.h>
 #include <glib.h>
@@ -19,6 +19,7 @@ typedef struct {
 typedef struct {
     bool h5p;
     DisplayPipe pipe[1];
+    GArray *vfetch;   /* the video planes' planned reads (video_plan) */
 } S5L8930DisplayState;
 static uint8_t ram[0x10000];
 static int address_space_memory;
@@ -49,7 +50,7 @@ static void put(uint32_t pa, uint32_t value)
 
 int main(void)
 {
-    S5L8930DisplayState s = {.h5p = true};
+    S5L8930DisplayState s = {.h5p = true, .vfetch = g_array_new(false, false, sizeof(FbSeg))};
     uint32_t *r = s.pipe[0].regs, out[8];
     r[DP_LAYERS / 4] = 0x400;
     r[0x3094 / 4] = 4 << 16 | 2;

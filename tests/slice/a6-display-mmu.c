@@ -3,16 +3,20 @@
  * Mutations: reject base zero; bypass translation; share UI0's table with UI1;
  * read across a physical page boundary without walking the next PTE.
  *
+ * PKG glib-2.0
  * SLICE:types hw/arm/s5l8930_display.c define DP_
- * SLICE:types hw/arm/s5l8930_display.c typedef UILayer
- * SLICE hw/arm/s5l8930_display.c fn h5p_ui_xlate fb_read scanout_layer layer_row_bytes layer_fetch
+ * SLICE:types hw/arm/s5l8930_display.c typedef UILayer FbSeg
+ * SLICE hw/arm/s5l8930_display.c fn h5p_ui_xlate fb_plan_into fb_plan plan_run fetch_run scanout_layer layer_row_bytes layer_fetch
  */
 #include <assert.h>
+#include <glib.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
 #define MEMTXATTRS_UNSPECIFIED 0
 typedef uint64_t hwaddr;
 typedef struct {
@@ -21,6 +25,7 @@ typedef struct {
 typedef struct {
     bool h5p;
     DisplayPipe pipe[1];
+    GArray *fetch;    /* the planned reads (fb_plan) */
 } S5L8930DisplayState;
 static uint8_t ram[0x10000];
 static int address_space_memory;
@@ -44,6 +49,13 @@ static hwaddr dart_xlate(S5L8930DisplayState *s, uint32_t va)
 #include "types.h"
 #include "slice.h"
 
+/* This engine plans reads under the BQL and runs them after (fb_plan, plan_run): one planned read. */
+static void fb_read(S5L8930DisplayState *s, uint32_t va, uint8_t *dst, unsigned len, const uint32_t *tables)
+{
+    fb_plan_into(s, s->fetch, va, 0, len, tables);
+    plan_run(s->fetch, dst);
+}
+
 static void put(uint32_t pa, uint32_t value)
 {
     memcpy(ram + pa, &value, 4);
@@ -51,7 +63,7 @@ static void put(uint32_t pa, uint32_t value)
 
 int main(void)
 {
-    S5L8930DisplayState s = {.h5p = true};
+    S5L8930DisplayState s = {.h5p = true, .fetch = g_array_new(false, false, sizeof(FbSeg))};
     UILayer u = {0};
     enum { W = 32, H = 48, BYTES = W * H * 4 };
     uint8_t out[BYTES];
@@ -74,7 +86,8 @@ int main(void)
         ui[0x90 / 4] = 1;
         ui[0x98 / 4] = table;
         assert(scanout_layer(&s, layer, W, H, &u));
-        assert(layer_fetch(&s, &u, out) == BYTES);
+        assert(layer_fetch(&s, &u, 0) == BYTES);
+        fetch_run(&s, out);
         for (unsigned i = 0; i < BYTES; i++)
             assert(out[i] == ((i * 7 + layer * 53) & 255));
         assert(h5p_ui_xlate(u.page_tables, 0x400000) == (hwaddr)-1);

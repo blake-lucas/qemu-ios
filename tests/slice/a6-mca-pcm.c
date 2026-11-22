@@ -9,8 +9,12 @@
 #include <stdio.h>
 #define I2S_RING 64
 typedef uint64_t hwaddr;
+/* This engine's host microphone (host-mic.c), off in these ports. */
+static void host_mic_flush(void)
+{
+}
 typedef struct {
-    bool mca, ctrl_run, audio_out, audio_in;
+    bool mca, ctrl_run, audio_out, audio_in, host_mic;
     unsigned port, head, tail, level, rx_pos, in_head, in_tail, in_level;
     uint32_t regs[1024];
     uint8_t ring[I2S_RING];

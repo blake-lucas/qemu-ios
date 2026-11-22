@@ -33,8 +33,14 @@ static void stl_le_p(void *ptr, uint32_t v)
     for (int i = 0; i < 4; i++)
         p[i] = v >> (i * 8);
 }
+/* This engine's host microphone (host-mic.c), off in these ports. */
+static bool host_mic_read_frame(uint8_t *frame)
+{
+    (void)frame;
+    return false;
+}
 typedef struct {
-    bool mca;
+    bool mca, host_mic;
     uint32_t regs[1024], tone_hz, in_rate, in_level, in_tail;
     uint64_t tone_frame;
     unsigned rx_pos;

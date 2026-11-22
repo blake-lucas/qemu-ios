@@ -24,11 +24,12 @@ typedef struct {
 } S5L8930DisplayState;
 #include "types.h"
 static uint8_t ram[0x4000];
-static void fb_read(S5L8930DisplayState *s, uint32_t va, uint8_t *dst,
-                    unsigned len, const uint32_t *tables)
+/* This engine plans a layer's reads (fb_plan) and runs them after; here a plan copies at once into `fetched`. */
+static uint8_t *planned;
+static void fb_plan(S5L8930DisplayState *s, uint32_t va, size_t off, size_t len, const uint32_t *tables)
 {
     assert(va + len <= sizeof(ram));
-    memcpy(dst, ram + va, len);
+    memcpy(planned + off, ram + va, len);
 }
 #include "slice.h"
 static unsigned corner(unsigned x, unsigned y)
@@ -65,7 +66,8 @@ int main(void)
             background[y * W + x] = 0xff0011cc;
         }
     }
-    assert(layer_fetch(&s, &layers[1], fetched) == sizeof(fetched));
+    planned = fetched;
+    assert(layer_fetch(&s, &layers[1], 0) == sizeof(fetched));
     blend(layers, on, fetched, W, H, out, background);
     for (unsigned y = 0; y < H; y++) {
         for (unsigned x = 0; x < W; x++) {
