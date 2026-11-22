@@ -36,28 +36,7 @@ static QemuCond gles_execution_cond;
 static bool gles_execution_initialized, gles_execution_busy;
 static __thread bool gles_execution_owner;
 
-/*
- * The vCPU whose thread has a host GL context current. An EGL context is current on one thread at a time
- * (eglMakeCurrent refuses one current elsewhere), where upstream's CGL lets every caller share it, and the A6's
- * two cores both call. A caller on another vCPU asks the binder to let it go, which the binder's thread does as
- * queued work at its next exit from guest code, and meanwhile leaves guest code itself and runs the call again
- * (the QEMU_CALL instruction restarts). It must not wait here for the binder: the binder may be starting
- * exclusive work (a broadcast TLB flush), which waits for this vCPU to leave guest code. Under the BQL.
- */
-static CPUState *gles_binder;
-static bool gles_binder_asked;
-
-static void gles_binder_release_work(CPUState *cpu, run_on_cpu_data data)
-{
-    if (gles_binder == cpu) {
-        gles_host_release_current();
-        gles_binder = NULL;
-    }
-    gles_binder_asked = false;
-}
-
-/* False: another vCPU's thread holds the host context; it has been asked for it, and the caller retries. */
-static bool gles_execution_enter(CPUState *cpu)
+static void gles_execution_enter(void)
 {
     assert(bql_locked());
     assert(!gles_execution_owner);
@@ -68,21 +47,12 @@ static bool gles_execution_enter(CPUState *cpu)
     while (gles_execution_busy) {               /* a call in progress ends without waiting on this vCPU */
         qemu_cond_wait_bql(&gles_execution_cond);
     }
-    if (gles_binder && gles_binder != cpu) {
-        if (!gles_binder_asked) {
-            gles_binder_asked = true;
-            async_run_on_cpu(gles_binder, gles_binder_release_work, RUN_ON_CPU_NULL);
-        }
-        return false;
-    }
     gles_execution_busy = gles_execution_owner = true;
-    return true;
 }
 
-static void gles_execution_leave(CPUState *cpu)
+static void gles_execution_leave(void)
 {
     assert(bql_locked() && gles_execution_owner);
-    gles_binder = cpu;                          /* the call left its context current on this thread */
     gles_execution_busy = gles_execution_owner = false;
     qemu_cond_broadcast(&gles_execution_cond);
 }
@@ -391,8 +361,8 @@ int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
      * GL calls without it (qemu_call_needs_bql): one vCPU drives the bridge there, so it needs no gate. */
     bool gate = bql_locked();
 
-    if (gate && !gles_execution_enter(cpu)) {
-        cpu_loop_exit(cpu);                     /* the A6's QEMU_CALL (ARM_CP_RAISES_EXC) runs again */
+    if (gate) {
+        gles_execution_enter();
     }
     /* Past the gate the call runs without the BQL, as the other boards run it: this bridge's GL queue thread
      * takes the BQL for some calls while the caller waits for it, so a caller holding it hangs the machine.
@@ -401,13 +371,23 @@ int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
     if (unlocked) {
         bql_unlock();
     }
+    /* The A6's stall check (MachineClass clock_waits_for_vcpus) slows the VM clock while a vCPU that isn't idle
+     * reaches no TB boundary. A vCPU in a GL call is waiting on the host renderer, not spinning on a guest lock:
+     * it counts as idle, or every llvmpipe draw of a few milliseconds would slow the guest's clock to 1/16. */
+    if (gate) {
+        qatomic_set(&cpu->idle, true);
+    }
     gf.armed = gf.pending = false;
     int64_t result = gles_handle_call(cpu, a);
+    if (gate) {
+        qatomic_set(&cpu->exec_seen, true);
+        qatomic_set(&cpu->idle, false);
+    }
     if (unlocked) {
         bql_lock();
     }
     if (gate) {
-        gles_execution_leave(cpu);
+        gles_execution_leave();
     }
     /* A guest data abort can longjmp out of this helper. Release the renderer
      * gate first, while still holding the BQL, so that fault retries cannot

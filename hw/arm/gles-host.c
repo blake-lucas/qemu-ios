@@ -830,13 +830,6 @@ void gles_host_set_a6(bool on)
 {
     gles_host_a6 = on;
 }
-
-void gles_host_release_current(void)
-{
-#ifdef GLES_HOST_EGL
-    CGLSetCurrentContext(NULL);
-#endif
-}
 #else
 extern bool gles_host_a6;
 #endif
