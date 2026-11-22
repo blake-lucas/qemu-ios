@@ -2014,6 +2014,12 @@ static bool sim_locked(const IosBbCore *bb)
     return bb->sim_present && (bb->pin_left == 0 || (bb->pin_on && !bb->pin_ok));
 }
 
+/* +XSMS readiness: a SIM in and unlocked (SMS service needs its storage and SMSC record). */
+static int sms_ready(const IosBbCore *bb)
+{
+    return bb->sim_present && !sim_locked(bb);
+}
+
 const char *ios_bb_sim_lock(const IosBbCore *bb)
 {
     if (bb->puk_left == 0) {
@@ -2686,6 +2692,26 @@ static void at_command_line(IosBbCore *bb, int ch, const char *line)
         }
         return;
     }
+    /*
+     * Infineon's SMS-ready state. iOS 6's CommCenterClassic (GsmSmsMessageModel) enables the URC
+     * with +XSMS=1 and asks +XSMS?, and takes SMS as available only once one says so: the URC's
+     * first field (+XSMS: 1) or the query reply's second (+XSMS: <n>,1), each compared with 1
+     * (10B329, the handlers at 0x89268 and 0x8e4e8). Until then it acknowledges an incoming
+     * +CMT with +CNMA and drops it, and Messages has no SMS to send with. Ready here is what
+     * calls need too: a SIM that is in and unlocked.
+     */
+    if ((arg = arg_after(cmd, "xsms=", NULL))) {
+        bb->xsms_n = atoi(arg);
+        bb->xsms_ch = ch;
+        bb->xsms_last = -1;                     /* the tick reports after this OK */
+        at_ok(bb, ch);
+        return;
+    }
+    if (strcmp(cmd, "xsms?") == 0) {
+        chan_printf(bb, ch, "\r\n+XSMS: %d,%d\r\n", bb->xsms_n, sms_ready(bb));
+        at_ok(bb, ch);
+        return;
+    }
     if ((arg = arg_after(cmd, "cnma", NULL))) {
         at_ok(bb, ch);                          /* PDU-mode CNMA takes no parameters */
         return;
@@ -3181,6 +3207,10 @@ void ios_bb_tick(IosBbCore *bb, int64_t now_ms)
         }
         bb->temp_due_ms = now_ms + bb->temp_period_ms;
     }
+    if (bb->xsms_n == 1 && bb->ch[bb->xsms_ch].open && sms_ready(bb) != bb->xsms_last) {
+        bb->xsms_last = sms_ready(bb);
+        chan_printf(bb, bb->xsms_ch, "\r\n+XSMS: %d\r\n", bb->xsms_last);
+    }
     if (bb->xsim_due_ms && now_ms >= bb->xsim_due_ms) {
         bb->xsim_due_ms = 0;
         if (bb->ch[bb->xsim_ch].open) {
@@ -3373,6 +3403,7 @@ void ios_bb_reset(IosBbCore *bb)
     bb->xciev_ch = 2;
     bb->xsim_ch = 3;
     bb->sms_ch = 3;
+    bb->xsms_last = -1;
     bb->cops_format = 2;
     bb->next_call_id = 1;
     bb->ceer_cause = 16;                         /* normal call clearing */
