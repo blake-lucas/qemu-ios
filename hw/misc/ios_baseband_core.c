@@ -2694,11 +2694,12 @@ static void at_command_line(IosBbCore *bb, int ch, const char *line)
     }
     /*
      * Infineon's SMS-ready state. iOS 6's CommCenterClassic (GsmSmsMessageModel) enables the URC
-     * with +XSMS=1 and asks +XSMS?, and takes SMS as available only once one says so: the URC's
-     * first field (+XSMS: 1) or the query reply's second (+XSMS: <n>,1), each compared with 1
-     * (10B329, the handlers at 0x89268 and 0x8e4e8). Until then it acknowledges an incoming
-     * +CMT with +CNMA and drops it, and Messages has no SMS to send with. Ready here is what
-     * calls need too: a SIM that is in and unlocked.
+     * with +XSMS=1 and asks +XSMS?, and posts kEventXSMSReady once one says so: the URC's first
+     * field (+XSMS: 1) or the query reply's second (+XSMS: <n>,1), each compared with 1 (10B329,
+     * the handlers at 0x89268 and 0x8e4e8). On that event GsmSmsMessageModel lists the SIM's
+     * stored texts (+CMGL, 0x9d322); without it an iPhone 4 6.1.3 never sends +cmgl, though live
+     * +CMTs still reach Messages (with 0c11c7199b, which had no +XSMS). Ready here is what calls
+     * need too: a SIM that is in and unlocked.
      */
     if ((arg = arg_after(cmd, "xsms=", NULL))) {
         bb->xsms_n = atoi(arg);
