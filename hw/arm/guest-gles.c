@@ -89,8 +89,9 @@ static void gles_execution_leave(CPUState *cpu)
 
 bool gles_native_begin(void)
 {
-    /* Direct host-side tests do not enter through the guest executor. */
-    if (!gles_execution_owner) {
+    /* Direct host-side tests do not enter through the guest executor; a call past the gate may already run
+     * without the BQL (qc_handle_gles). */
+    if (!gles_execution_owner || !bql_locked()) {
         return false;
     }
     assert(bql_locked());
@@ -393,8 +394,18 @@ int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
     if (gate && !gles_execution_enter(cpu)) {
         cpu_loop_exit(cpu);                     /* the A6's QEMU_CALL (ARM_CP_RAISES_EXC) runs again */
     }
+    /* Past the gate the call runs without the BQL, as the other boards run it: this bridge's GL queue thread
+     * takes the BQL for some calls while the caller waits for it, so a caller holding it hangs the machine.
+     * Context setup and teardown keep it (qemu_call_needs_bql). */
+    bool unlocked = gate && !(a->slot >= GLES_OP_NEW_SHAREGROUP && a->slot <= GLES_OP_DELETE_CONTEXT);
+    if (unlocked) {
+        bql_unlock();
+    }
     gf.armed = gf.pending = false;
     int64_t result = gles_handle_call(cpu, a);
+    if (unlocked) {
+        bql_lock();
+    }
     if (gate) {
         gles_execution_leave(cpu);
     }
