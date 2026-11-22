@@ -1251,8 +1251,8 @@ static uint32_t h2fmi_fifo_bulk(void *opaque, hwaddr addr, uint8_t *buf, uint32_
                                 bool to_device)
 {
     S5L8930H2FMIState *s = opaque;
-    H2FMIBus *b = &s->bus[(addr - S5L8930_H2FMI_BASE) / H2FMI_WINDOW % H2FMI_BUSES];
-    hwaddr reg = (addr - S5L8930_H2FMI_BASE) % H2FMI_WINDOW;
+    H2FMIBus *b = &s->bus[(addr - s->mmio_base) / H2FMI_WINDOW % H2FMI_BUSES];
+    hwaddr reg = (addr - s->mmio_base) % H2FMI_WINDOW;
     bool data = reg == FMI_DATA;
     uint32_t done = 0;
 
@@ -1332,7 +1332,11 @@ static void s5l8930_h2fmi_realize(DeviceState *dev, Error **errp)
     if (s->cdma) {
         s5l8930_cdma_set_source(s->cdma, s->mmio_base,
                                 H2FMI_BUSES * H2FMI_WINDOW, h2fmi_fifo_avail, s);
-        s5l8930_cdma_set_bulk(s->cdma, S5L8930_H2FMI_BASE, h2fmi_fifo_bulk);
+        /* The A6's PPN transfers keep the per-access path: its PPN modes (aux reads, feature writes, status)
+         * are decided in h2fmi_read/h2fmi_write, which the bulk copy skips. */
+        if (!s->ppn) {
+            s5l8930_cdma_set_bulk(s->cdma, s->mmio_base, h2fmi_fifo_bulk);
+        }
     }
 }
 
