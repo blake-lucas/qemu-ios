@@ -897,7 +897,7 @@ static void s5l8920_init(MachineState *machine)
     qdev_prop_set_uint8(dev, "version", 1);     /* DT cdma-version */
     qdev_prop_set_uint64(dev, "dram-size", s->board->dram_size);
     qdev_prop_set_uint32(dev, "paced-base", S5L8920_I2S0_FIFO);
-    qdev_prop_set_uint32(dev, "paced-ports", 1);
+    qdev_prop_set_uint32(dev, "paced-ports", 2);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, S5L8920_CDMA_BASE);
@@ -1126,6 +1126,12 @@ static void s5l8920_init(MachineState *machine)
      */
     dev = qdev_new(TYPE_S5L8930_I2S);
     qdev_prop_set_bit(dev, "audio-out", true);
+    /*
+     * The phone's or computer's microphone reaches this port's RX FIFO (+4 of its FIFO window,
+     * read by the capture chain while CTRL bit 1 runs receive; s5l8930_i2s.c). It was left out
+     * because a 3GS recorded silence, which was the four-byte FIFO window reading 0.
+     */
+    qdev_prop_set_bit(dev, "host-mic", true);
     qdev_prop_set_bit(dev, "ctrl-run", true);   /* AppleS5L8920XI2SController starts TX with CTRL bit 0 */
     qdev_prop_set_uint64(dev, "nco-base", S5L8920_AUDIO_COMPLEX);
     qdev_prop_set_uint32(dev, "nco-ref-hz", S5L8920_NCOREF_HZ);
@@ -1136,6 +1142,23 @@ static void s5l8920_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, S5L8920_I2S0_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, S5L8920_I2S0_FIFO);
+
+    /*
+     * I2S1, the Voice device (DT audio1, registers at 0x84501400). Un1box found that on 3GS iOS 6
+     * mediaserverd builds its virtual audio device from both controllers, and with only i2s0
+     * present the audio session had no input ("Connect a microphone" in Voice Memos). Not checked
+     * here: 5.1.1 records through i2s0 and never touches this port. Nothing plays through it
+     * (audio-out is off: it is the telephony path); its RX FIFO takes the same microphone.
+     */
+    dev = qdev_new(TYPE_S5L8930_I2S);
+    qdev_prop_set_uint8(dev, "port", 1);
+    qdev_prop_set_bit(dev, "host-mic", true);
+    qdev_prop_set_bit(dev, "ctrl-run", true);
+    qdev_prop_set_uint64(dev, "nco-base", S5L8920_AUDIO_COMPLEX);
+    qdev_prop_set_uint32(dev, "nco-ref-hz", S5L8920_NCOREF_HZ);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, S5L8920_I2S0_BASE + 0x1000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, S5L8920_I2S0_FIFO + 0x1000);
 
     /* USB device mode: the S5L8720's DWC OTG core and PHY; the built-in host enumerates it. */
     dev = qdev_new(TYPE_IPOD_TOUCH_USB_PHYS);

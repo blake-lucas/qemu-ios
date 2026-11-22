@@ -333,6 +333,32 @@ static bool i2s_tx_running(S5L8930I2SState *s)
 }
 
 /*
+ * Receive runs: RXCOM = 6 on the A4's controller; CTRL bit 1 on the S5L8920's. The 3GS (5.1.1
+ * AppleS5L8920XI2SController) sets it beside bit 0 when an app opens the input (0x07900101 ->
+ * 0x07900103: Voice Memos does as it comes to the front, for its level meter), and its capture
+ * chain then reads the RX FIFO at +4 of the port's FIFO window; the codec is not touched.
+ */
+static bool i2s_rx_running(S5L8930I2SState *s)
+{
+    return s->ctrl_run ? s->regs[I2S_CTRL >> 2] & 2 : s->regs[I2S_RXCOM >> 2] == I2S_CMD_RUN;
+}
+
+static void i2s_rx_changed(S5L8930I2SState *s, bool run)
+{
+    if (run) {
+        i2s_set_in_rate(s, s5l8930_i2s_rate(s->port));
+        s->rx_pos = 0;
+    } else if (s->host_mic) {
+        /* A stopped recording's unread frames would play back as a burst at the head of the
+         * next one, a second or a day later. */
+        host_mic_flush();
+    }
+    if (s->voice_in) {
+        audio_be_set_active_in(s->audio_be, s->voice_in, run);
+    }
+}
+
+/*
  * A paced CDMA chain's span for the TX FIFO at fifo, all at once: the same bytes i2s_push takes a
  * register write at a time. Each of those went through the memory API under the BQL, ~44K a
  * second of 44.1 kHz stereo, ~8% of the main loop's time on a Pixel 10 in a game. 0 if fifo is
@@ -444,22 +470,16 @@ static void i2s_write(void *opaque, hwaddr offset, uint64_t value,
         }
         return;
     }
-    s->regs[offset >> 2] = value;
-    if (offset == I2S_RXCOM && s->audio_out) {
-        bool run = value == I2S_CMD_RUN;
+    bool rx_was = i2s_rx_running(s);
 
-        if (run) {
-            i2s_set_in_rate(s, s5l8930_i2s_rate(s->port));
-            s->rx_pos = 0;
-        } else {
-            /* A stopped recording's unread frames would play back as a burst at the head of the
-             * next one, a second or a day later. */
-            if (s->host_mic) {
-                host_mic_flush();
-            }
-        }
-        if (s->voice_in) {
-            audio_be_set_active_in(s->audio_be, s->voice_in, run);
+    s->regs[offset >> 2] = value;
+    if (offset == (s->ctrl_run ? I2S_CTRL : I2S_RXCOM) && (s->audio_out || s->host_mic)) {
+        bool run = i2s_rx_running(s);
+
+        /* The A4's driver writes RXCOM = 6 to start each recording; act on every such write as
+         * before. CTRL is rewritten for TX too: only a change of bit 1 is a receive start or stop. */
+        if (!s->ctrl_run || run != rx_was) {
+            i2s_rx_changed(s, run);
         }
     }
     if (offset == (s->ctrl_run ? I2S_CTRL : I2S_TXCOM) && s->voice) {
@@ -470,14 +490,31 @@ static void i2s_write(void *opaque, hwaddr offset, uint64_t value,
     }
 }
 
+/*
+ * The S5L8920 gives each port a FIFO window of its own at the DT's i2sN address (i2s0 at
+ * 0x84500000), apart from the control registers at +0x400. Its TX FIFO is the window's base, where
+ * CDMA writes, and its RX FIFO the next word: the 3GS's capture chain reads +4 a halfword at a time
+ * (left, then right) for as long as receive runs. The window was four bytes that read 0, so a 3GS
+ * recorded silence while the port ran (Un1box's patch 0014 widened the window and read +0x38, the
+ * A4's control-block offset, which the 3GS doesn't use).
+ */
+#define I2S_FIFO_RX     0x04
+
 static uint64_t i2s_fifo_read(void *opaque, hwaddr offset, unsigned size)
 {
+    S5L8930I2SState *s = opaque;
+
+    if (offset == I2S_FIFO_RX && i2s_rx_running(s)) {
+        return i2s_rx_read(s, size);
+    }
     return 0;
 }
 
 static void i2s_fifo_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
-    i2s_write(opaque, I2S_TXFIFO, value, size);
+    if (offset == 0) {
+        i2s_write(opaque, I2S_TXFIFO, value, size);
+    }
 }
 
 static const MemoryRegionOps i2s_fifo_ops = {
@@ -540,7 +577,7 @@ static void s5l8930_i2s_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &i2s_ops, s, TYPE_S5L8930_I2S,
                           I2S_REGS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
-    memory_region_init_io(&s->fifo, obj, &i2s_fifo_ops, s, "s5l8930.i2s-fifo", 4);
+    memory_region_init_io(&s->fifo, obj, &i2s_fifo_ops, s, "s5l8930.i2s-fifo", 0x400);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->fifo);
 }
 
