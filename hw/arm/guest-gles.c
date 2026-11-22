@@ -356,10 +356,18 @@ static int64_t gles_handle_call(CPUState *cpu, qc_gles_args_t *a)
 
 int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
 {
-    gles_execution_enter();
+    /* The gate serializes the A6's two vCPUs, whose QEMU_CALL holds the BQL. The other boards' QEMU_CALL runs
+     * GL calls without it (qemu_call_needs_bql): one vCPU drives the bridge there, so it needs no gate. */
+    bool gate = bql_locked();
+
+    if (gate) {
+        gles_execution_enter();
+    }
     gf.armed = gf.pending = false;
     int64_t result = gles_handle_call(cpu, a);
-    gles_execution_leave();
+    if (gate) {
+        gles_execution_leave();
+    }
     /* A guest data abort can longjmp out of this helper. Release the renderer
      * gate first, while still holding the BQL, so that fault retries cannot
      * strand the gate or let another caller overwrite the pending fault. */
