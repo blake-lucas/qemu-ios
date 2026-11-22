@@ -160,6 +160,8 @@ typedef struct IosBbCore {
     int xsigstr_ch;
     int cgreg_n, cgreg_ch;
     int xciev_ch, xsim_ch, call_ch, sms_ch;   /* learned from where each is enabled */
+    int xsms_n, xsms_ch;       /* +XSMS=1 (Infineon, iOS 6): "SMS ready" URCs wanted, on xsms_ch */
+    int xsms_last;             /* readiness last reported by +XSMS, -1 none yet */
     int s0;                    /* auto-answer register (at s0=n) */
     int last_rssi, last_batt;  /* what the host was last told, to send +XCIEV on change only */
     bool sim_last;            /* last SIM presence pushed, to send +XSIM on change only */
