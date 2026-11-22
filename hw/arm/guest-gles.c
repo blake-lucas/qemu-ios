@@ -39,28 +39,25 @@ static __thread bool gles_execution_owner;
 /*
  * The vCPU whose thread has a host GL context current. An EGL context is current on one thread at a time
  * (eglMakeCurrent refuses one current elsewhere), where upstream's CGL lets every caller share it, and the A6's
- * two cores both call. A caller on another vCPU asks the binder to let it go: the binder's thread unbinds as
- * queued work at its next exit from guest code, or at once if it is itself waiting here. Under the BQL.
+ * two cores both call. A caller on another vCPU asks the binder to let it go, which the binder's thread does as
+ * queued work at its next exit from guest code, and meanwhile leaves guest code itself and runs the call again
+ * (the QEMU_CALL instruction restarts). It must not wait here for the binder: the binder may be starting
+ * exclusive work (a broadcast TLB flush), which waits for this vCPU to leave guest code. Under the BQL.
  */
 static CPUState *gles_binder;
 static bool gles_binder_asked;
 
-static void gles_binder_unbind(void)
-{
-    gles_host_release_current();
-    gles_binder = NULL;
-    gles_binder_asked = false;
-    qemu_cond_broadcast(&gles_execution_cond);
-}
-
 static void gles_binder_release_work(CPUState *cpu, run_on_cpu_data data)
 {
     if (gles_binder == cpu) {
-        gles_binder_unbind();
+        gles_host_release_current();
+        gles_binder = NULL;
     }
+    gles_binder_asked = false;
 }
 
-static void gles_execution_enter(CPUState *cpu)
+/* False: another vCPU's thread holds the host context; it has been asked for it, and the caller retries. */
+static bool gles_execution_enter(CPUState *cpu)
 {
     assert(bql_locked());
     assert(!gles_execution_owner);
@@ -68,18 +65,18 @@ static void gles_execution_enter(CPUState *cpu)
         qemu_cond_init(&gles_execution_cond);
         gles_execution_initialized = true;
     }
-    while (gles_execution_busy || (gles_binder && gles_binder != cpu)) {
-        if (gles_binder == cpu && gles_binder_asked) {
-            gles_binder_unbind();               /* another vCPU waits for the context this thread holds */
-            continue;
-        }
-        if (!gles_execution_busy && gles_binder && gles_binder != cpu && !gles_binder_asked) {
+    while (gles_execution_busy) {               /* a call in progress ends without waiting on this vCPU */
+        qemu_cond_wait_bql(&gles_execution_cond);
+    }
+    if (gles_binder && gles_binder != cpu) {
+        if (!gles_binder_asked) {
             gles_binder_asked = true;
             async_run_on_cpu(gles_binder, gles_binder_release_work, RUN_ON_CPU_NULL);
         }
-        qemu_cond_wait_bql(&gles_execution_cond);
+        return false;
     }
     gles_execution_busy = gles_execution_owner = true;
+    return true;
 }
 
 static void gles_execution_leave(CPUState *cpu)
@@ -393,8 +390,8 @@ int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
      * GL calls without it (qemu_call_needs_bql): one vCPU drives the bridge there, so it needs no gate. */
     bool gate = bql_locked();
 
-    if (gate) {
-        gles_execution_enter(cpu);
+    if (gate && !gles_execution_enter(cpu)) {
+        cpu_loop_exit(cpu);                     /* the A6's QEMU_CALL (ARM_CP_RAISES_EXC) runs again */
     }
     gf.armed = gf.pending = false;
     int64_t result = gles_handle_call(cpu, a);
