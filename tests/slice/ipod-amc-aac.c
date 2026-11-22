@@ -555,6 +555,26 @@ int main(void) {
         loud6 += v != 0;
     }
     assert(loud6>100);
+    /* The 3GS's 5.1.1 (n88ap-9B206) plays a mono voice memo through the same program: a 4 KiB job of
+     * 1024 32-bit samples, from slots that stay 8 KiB apart (0x18100, 0x1a100). The second slot's job
+     * read as slot 2 of 2 and was refused, and playback stopped after its first frame. */
+    assert(d->channels == 1 && !g_queue_is_empty(&d->output_sizes));
+    static const uint32_t job5[] = { 0, 0x1000, 0x1a100, 0, AMC_PORT_LOCAL_21, 3 };
+    for (unsigned i=0;i<6;i++) stl_le_p(aperture+0x3448c+i*4,job5[i]);
+    stw_le_p(aperture+0x18000+0xe,0); stw_le_p(aperture+0x18000+0x10,0);
+    b.port_len = 0;
+    frame = GPOINTER_TO_UINT(g_queue_peek_head(&d->output_sizes));
+    assert(frame == 0x800 && d->pcm->len - d->cursor >= frame);
+    uint8_t expect5[0x800];
+    memcpy(expect5, d->pcm->data + d->cursor, frame);
+    ipod_touch_amc_write(&b, AMC_E0_HEAD, 0x34406, 4);
+    assert(b.xfers == 1);
+    amc_decode_tick(&b);
+    assert(!b.xfers && b.port_len == 0x1000);                  /* slot 1, taken */
+    assert(lduw_le_p(aperture+0x18000+0xe) == 1 && lduw_le_p(aperture+0x18000+0x10) == frame/2);
+    for (unsigned i=0;i<frame/2;i++) {
+        assert((int32_t)ldl_le_p(b.port+4*i) == (int16_t)lduw_le_p(expect5+2*i)*256);
+    }
     amc_decoder_close(&b);
     /* 3.1 on the 3GS (n88ap-7E18) runs AMC 2.1 without engine 0: it enables the DE's completion and
      * takes each frame from its slot, as AMC 2.0 does. */

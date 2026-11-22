@@ -692,6 +692,17 @@ static void s5l8920_cdma_kick(void *opaque)
     s5l8930_cdma_kick(DEVICE(opaque));
 }
 
+/*
+ * The AMC's port took what CDMA wrote to it: the AAC encoder program's PCM, which Voice Memos
+ * streams in a frame at a time. The chain completes then, as on the A4 (ipad1.c); without this it
+ * stayed running, the driver's DMA command stayed active, and its next frame failed to set up
+ * (AppleAMC-170.4 asserts at AppleAMCDriver_r2.cpp:2148), so a recording could not be stopped.
+ */
+static void s5l8920_amc_port_sink(void *opaque)
+{
+    s5l8930_cdma_sink_done(DEVICE(opaque), S5L8920_AMC_PORT_BASE, AMC_PORT_SIZE);
+}
+
 static void s5l8920_bt_rxdma(void *opaque, int n, int level)
 {
     S5L8920MachineState *s = opaque;
@@ -946,6 +957,7 @@ static void s5l8920_init(MachineState *machine)
         sysbus_connect_irq(sbd, 0, s5l8920_irq(s, S5L8920_IRQ_AMC + 7));
         sysbus_mmio_map(sbd, 1, S5L8920_AMC_PORT_BASE);
         IPOD_TOUCH_AMC(dev)->port_kick = s5l8920_cdma_kick;
+        IPOD_TOUCH_AMC(dev)->port_sink = s5l8920_amc_port_sink;
         IPOD_TOUCH_AMC(dev)->port_opaque = cdma;
         s5l8930_cdma_set_source(cdma, S5L8920_AMC_PORT_BASE, AMC_PORT_SIZE,
                                 ipod_touch_amc_port_avail, dev);
