@@ -514,6 +514,7 @@ typedef struct {
     GLenum drawable_depth_format;      /* native capability-selected private storage */
     GLuint fbo, tex, depth, sync_fbo;   /* sync_fbo: gles_surface_writeback's scratch */
     GLuint copy_fbo;                    /* gles_surface_copy's draw side */
+    GLuint fb_next, rb_next;            /* gles_guest_gen_low's count, from 1 as on the device */
     uint32_t drawable_width, drawable_height;
     /* Set once the guest shim reports its CA layer size. Shims that predate
      * GLES_OP_DRAWABLE_STORAGE keep the legacy panel-sized crop. */
@@ -1239,6 +1240,43 @@ static bool gles_guest_names(GLuint *ids, uint32_t n)
     return ok;
 }
 
+/*
+ * A driver may number a new framebuffer or renderbuffer past the highest name
+ * in use. With the drawable's FBO at GLES_PRIVATE_NAME, such a driver hands
+ * the guest names in the private range, and every bind of them is refused, so
+ * CoreAnimation never reaches its display surfaces. Each such name is given
+ * back and replaced by the next free one from this context's own count;
+ * binding it creates it, as for the private names themselves.
+ */
+static void gles_guest_gen_low(GLuint *ids, uint32_t n, bool renderbuffer)
+{
+    static unsigned logged[2];
+    GLuint *next = renderbuffer ? &gh.rb_next : &gh.fb_next;
+
+    for (uint32_t i = 0; i < n; i++) {
+        GLuint high = ids[i];
+
+        if (gles_guest_name_ok(high)) {
+            continue;
+        }
+        if (renderbuffer) {
+            glDeleteRenderbuffersEXT(1, &high);
+        } else {
+            glDeleteFramebuffersEXT(1, &high);
+        }
+        do {
+            if (++*next >= GLES_PRIVATE_NAME) {
+                *next = 1;
+            }
+        } while (renderbuffer ? glIsRenderbufferEXT(*next) : glIsFramebufferEXT(*next));
+        ids[i] = *next;
+        if (logged[renderbuffer]++ < 8) {
+            fprintf(stderr, "[gles] driver named a %s %#x, in the private range: the guest gets %u\n",
+                    renderbuffer ? "renderbuffer" : "framebuffer", high, ids[i]);
+        }
+    }
+}
+
 static bool gles_is_drawable(uint32_t name)
 {
     return !name || g_hash_table_contains(gh.fbo_drawable,
@@ -1413,6 +1451,7 @@ static bool gles_host_init(void)
     gh.tex = gles_private_name(glIsTexture);
     glBindTexture(GL_TEXTURE_2D, gh.tex);
     GLES_DRAWABLE_INIT_RECORD("bind-color");
+    fprintf(stderr, "[gles] private names: framebuffer %#x, texture %#x\n", gh.fbo, gh.tex);
     /*
      * Storage for the color attachment, from one of two places. An IOSurface
      * gives the CPU a mapped view of the very memory the GPU renders into, so
@@ -7459,7 +7498,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
 
     case GLES_SLOT_BIND_TEXTURE:                /* target, texture */
         if (!gles_guest_name_ok(a[1])) {
-            gles_refuse("name:private:%u", slot);
+            if (gles_refuse("name:private:%u", slot)) fprintf(stderr, "[gles] guest named %#x\n", a[1]);
             return gles_reject(GL_INVALID_OPERATION);
         }
         glBindTexture(a[0], a[1]);
@@ -9031,16 +9070,16 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         } else {
             glGenFramebuffersEXT(n, ids);
         }
-        if (a[1] && n) {
-            gles_guest_rw(cpu, a[1], (uint8_t *)ids,
-                                n * sizeof(GLuint), 1);
+        gles_guest_gen_low(ids, n, slot == GLES_SLOT_GEN_RENDERBUFFERS);
+        if (a[1] && n && gles_guest_rw(cpu, a[1], (uint8_t *)ids, n * sizeof(GLuint), 1) != 0) {
+            gles_refuse("gen-write:%u", slot);
         }
         return 0;
     }
 
     case GLES_SLOT_BIND_RENDERBUFFER:    /* target, renderbuffer */
         if (!gles_guest_name_ok(a[1])) {
-            gles_refuse("name:private:%u", slot);
+            if (gles_refuse("name:private:%u", slot)) fprintf(stderr, "[gles] guest named %#x\n", a[1]);
             return gles_reject(GL_INVALID_OPERATION);
         }
         gh.bound_renderbuffer = a[1];
@@ -9049,7 +9088,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
 
     case GLES_SLOT_BIND_FRAMEBUFFER:     /* target, framebuffer */
         if (!gles_guest_name_ok(a[1])) {
-            gles_refuse("name:private:%u", slot);
+            if (gles_refuse("name:private:%u", slot)) fprintf(stderr, "[gles] guest named %#x\n", a[1]);
             return gles_reject(GL_INVALID_OPERATION);
         }
         if (gles_sync_surface(cpu)) return -1;
