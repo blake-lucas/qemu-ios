@@ -321,10 +321,29 @@ static void a6_wlan_reset(void *opaque, int pin, int level)
     qemu_set_irq(qdev_get_gpio_in(s->gpio, 57), ready);
 }
 
+/* A positional read of the restore image; MinGW has no pread. */
+static ssize_t a6_restore_pread(int fd, void *buf, size_t n, uint64_t off)
+{
+#ifdef _WIN32
+    OVERLAPPED ov = { .Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32) };
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    DWORD got = 0;
+
+    if (h == INVALID_HANDLE_VALUE ||
+        (!ReadFile(h, buf, n, &got, &ov) && GetLastError() != ERROR_HANDLE_EOF)) {
+        return -1;
+    }
+    return got;
+#else
+    return pread(fd, buf, n, off);
+#endif
+}
+
 /* The existing qemu-ios guest-services ABI, shared with the other machines.
  * Graphics uses the common host executor and request validation. The optional
  * factory-imaging transport supplies one read-only stream only when explicitly
  * configured; its writes use the guest's native block/FTL drivers. */
+
 static void a6_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri,
                          uint64_t value)
 {
@@ -363,7 +382,7 @@ static void a6_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri,
         if (n && n <= 65536 && off <= s->restore_size &&
             n <= s->restore_size - off) {
             g_autofree uint8_t *buffer = g_malloc(n);
-            ssize_t count = pread(s->restore_fd, buffer, n, off);
+            ssize_t count = a6_restore_pread(s->restore_fd, buffer, n, off);
             if (count >= 0 && !guest_copy(cpu, q.args.ag.buffer_guest_ptr,
                                           buffer, count, true)) {
                 q.retval = count;
@@ -1487,7 +1506,7 @@ static void a6_init(MachineState *machine)
     gles_host_set_a6(true);
     if (s->restore_image) {
         struct stat st;
-        s->restore_fd = open(s->restore_image, O_RDONLY | O_CLOEXEC);
+        s->restore_fd = qemu_open_old(s->restore_image, O_RDONLY | O_BINARY);
         if (s->restore_fd < 0 || fstat(s->restore_fd, &st) ||
             !S_ISREG(st.st_mode)) {
             error_report("Cannot open regular restore-image file");
