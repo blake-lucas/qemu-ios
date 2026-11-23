@@ -3526,7 +3526,7 @@ static void gles_draw_record(const char *what, uint32_t mode, uint32_t count, ui
     n->draw_call = n->gl_calls;
 #ifdef GLES_HOST_EGL_ES
     static unsigned total;
-    if (gh.api_version == 2 && gh.draws_recorded < 2 && total < 400) {
+    if (gh.api_version == 2 && gh.draws_recorded < 6 && total < 600) {
         GLint current = 0, linked = -1, fb = 0, type = 0, name = 0, texture = 0, active = 0;
         GLenum st;
 
@@ -3548,11 +3548,17 @@ static void gles_draw_record(const char *what, uint32_t mode, uint32_t count, ui
         }
         glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+        /* Units 0-3 as the bridge tracks them (host names; 0 none). */
+        unsigned units[4] = { 0 };
+        for (unsigned u = 0; u < 4 && gles_egl_current; u++) {
+            GLESEGLTexture *t = gles_egl_current->texture_units[u].object_2d;
+            units[u] = t ? t->native_name : 0;
+        }
         fprintf(stderr, "[gles-draw] ctx=%08x %s mode=0x%x count=%u program=%u (host %u, current %d, "
                 "linked %d, fetch %d) attribs=0x%x fb=%u (host %d, status 0x%x, color 0x%x:%d) "
-                "texture unit %d=%d\n", n->gl_ctx, what, mode, count, gh.program, program, current,
-                linked, n->draw_fetch, attribs, gh.bound_framebuffer, fb, st, type, name,
-                active - GL_TEXTURE0, texture);
+                "texture unit %d=%d units %u,%u,%u,%u\n", n->gl_ctx, what, mode, count, gh.program, program,
+                current, linked, n->draw_fetch, attribs, gh.bound_framebuffer, fb, st, type, name,
+                active - GL_TEXTURE0, texture, units[0], units[1], units[2], units[3]);
     }
 #endif
 }
@@ -7883,12 +7889,27 @@ static unsigned gles_feedback_begin(GLESFeedbackUndo undo[4])
     unsigned n = 0;
     static unsigned said;
 
-    if (gh.api_version != 2 || !gh.fb_color_texture || !gles_egl_current) {
+    GLint fb = 0, attached = 0, type = 0, level = 0;
+
+    if (gh.api_version != 2 || !gles_egl_current) {
+        return 0;
+    }
+    /* Asked at the draw, not from the noted target: the A6's forwarded calls
+     * can change attachments without passing the bridge's bookkeeping (a loop
+     * on the Pixel went uncopied that way). Only the bound target's color name
+     * is asked unless it matches a unit. */
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+    if (!fb) {
+        return 0;
+    }
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &attached);
+    if (!attached) {
         return 0;
     }
     for (unsigned unit = 0; unit < G_N_ELEMENTS(gles_egl_current->texture_units) && n < 4; unit++) {
         GLESEGLTexture *t = gles_egl_current->texture_units[unit].object_2d;
-        if (t && t->native_name == gh.fb_color_texture) {
+        if (t && t->native_name == (GLuint)attached) {
             target = t;
             undo[n].unit = unit;
             undo[n].native = t->native_name;
@@ -7896,6 +7917,15 @@ static unsigned gles_feedback_begin(GLESFeedbackUndo undo[4])
         }
     }
     if (!n) {
+        return 0;
+    }
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if (type == GL_TEXTURE) {
+        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                              GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
+    }
+    if (type != GL_TEXTURE || level != 0) {     /* a renderbuffer of that name, or another level */
         return 0;
     }
     gles_native_save_errors();      /* the guest's errors stay the guest's */
