@@ -25,8 +25,16 @@ extern unsigned long strlen(const char *);
 extern Boolean CFNumberGetValue(CFTypeRef, CFIndex, void *);
 extern unsigned long CFNumberGetTypeID(void);
 extern void *memcpy(void *, const void *, unsigned long);
-extern void syslog(int, const char *, ...);
-#define AS_LOG(...) syslog(5 /* LOG_NOTICE */, "LightTouch AppSync: " __VA_ARGS__)
+// To the system log through CFLog (os_log underneath): a sandboxed daemon's syslog(3) may reach nothing.
+extern void CFLog(int, CFStringRef, ...);
+static void as_log(const char *text) {
+    static CFStringRef format;
+    if (!format) format = CFStringCreateWithCString(0, "LightTouch AppSync: %@", 0x08000100);
+    CFStringRef message = CFStringCreateWithCString(0, text, 0x08000100);
+    if (format && message) CFLog(4 /* kCFLogLevelWarning */, format, message);
+    if (message) CFRelease((CFTypeRef)message);
+}
+#define AS_LOG(...) do { char as_line[512]; snprintf(as_line, sizeof as_line, __VA_ARGS__); as_log(as_line); } while (0)
 
 // iOS 10 or later: CoreFoundation 1348 came with 10.0. (Not sysctl: a sandboxed installd may not read it.)
 static int as_ios10(void) {
