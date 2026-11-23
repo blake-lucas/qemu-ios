@@ -98,15 +98,33 @@ static void gles_fetch_link(GLuint program)
 static unsigned gles_fetch_capabilities(void)
 {
 #if defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE)
+    /* LT_GLES_FETCH=off hides framebuffer fetch from the guest (iOS 10's
+     * shaders then do without gl_LastFragData), to tell a host compiler's
+     * trouble with them from anything else. Said once per process. */
+    static int told;
     const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
     const char *name = "GL_EXT_shader_framebuffer_fetch", *p = extensions;
+    const char *knob = getenv("LT_GLES_FETCH");
+    unsigned found = 0;
+
     while (p && (p = strstr(p, name))) {
         if ((p == extensions || p[-1] == ' ') &&
-            (!p[strlen(name)] || p[strlen(name)] == ' '))
-            return 1;
+            (!p[strlen(name)] || p[strlen(name)] == ' ')) {
+            found = 1;
+            break;
+        }
         p += strlen(name);
     }
-    return 0;
+    if (found && knob && !strcmp(knob, "off")) {
+        found = 0;
+    }
+    if (!told) {
+        told = 1;
+        fprintf(stderr, "[gles] framebuffer fetch for the guest: %s (renderer %s%s)\n",
+                found ? "on" : "off", (const char *)glGetString(GL_RENDERER),
+                knob && !strcmp(knob, "off") ? ", LT_GLES_FETCH=off" : "");
+    }
+    return found;
 #else
     GLint units = 0;
     glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);

@@ -3383,28 +3383,48 @@ static void gles_check_draw(const char *what, uint32_t mode, uint32_t count)
             GLint tex = 0, sb = 0, db = 0;
             GLfloat col[4] = { 0, 0, 0, 0 };
 
+            /* GL_BLEND_SRC/DST, GL_CURRENT_COLOR, GL_TEXTURE_2D and
+             * GL_LIGHTING are ES 1 state: an ES 2 context has none of them,
+             * so there they are not asked (an INVALID_ENUM per draw, blamed
+             * on the draw by strict mode, and a query no ES 2 driver needs to
+             * survive: PowerVR's ES 3.2 died somewhere in this window). */
+            bool es1 = gh.api_version != 2;
+            GLint tex2d = 0, lighting = 0;
+
             glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
-            glGetIntegerv(GL_BLEND_SRC, &sb);
-            glGetIntegerv(GL_BLEND_DST, &db);
-            glGetFloatv(GL_CURRENT_COLOR, col);
+            if (es1) {
+                glGetIntegerv(GL_BLEND_SRC, &sb);
+                glGetIntegerv(GL_BLEND_DST, &db);
+                glGetFloatv(GL_CURRENT_COLOR, col);
+                tex2d = glIsEnabled(GL_TEXTURE_2D);
+                lighting = glIsEnabled(GL_LIGHTING);
+            } else {
+                glGetIntegerv(GL_BLEND_SRC_RGB, &sb);
+                glGetIntegerv(GL_BLEND_DST_RGB, &db);
+            }
             fprintf(stderr, "[gles]   offscreen draw %s mode=0x%x count=%u "
                     "tex2d=%d bound_tex=%d color=(%.2f %.2f %.2f %.2f) "
                     "blend=%d(0x%x,0x%x) lighting=%d texunits=0x%02x\n",
-                    what, mode, count, glIsEnabled(GL_TEXTURE_2D), tex,
+                    what, mode, count, tex2d, tex,
                     col[0], col[1], col[2], col[3], glIsEnabled(GL_BLEND),
-                    sb, db, glIsEnabled(GL_LIGHTING), gles_texcoord_mask());
+                    sb, db, lighting, gles_texcoord_mask());
         }
     }
     if (!gh.vis_captured) {
         gh.vis_captured = true;
-        glGetFloatv(GL_PROJECTION_MATRIX, gh.vis_proj);
-        glGetFloatv(GL_MODELVIEW_MATRIX, gh.vis_mv);
+        if (gh.api_version != 2) {      /* ES 1 state, as above */
+            glGetFloatv(GL_PROJECTION_MATRIX, gh.vis_proj);
+            glGetFloatv(GL_MODELVIEW_MATRIX, gh.vis_mv);
+            glGetIntegerv(GL_BLEND_SRC, &gh.vis_src);
+            glGetIntegerv(GL_BLEND_DST, &gh.vis_dst);
+            gh.vis_tex2d = glIsEnabled(GL_TEXTURE_2D);
+        } else {
+            glGetIntegerv(GL_BLEND_SRC_RGB, &gh.vis_src);
+            glGetIntegerv(GL_BLEND_DST_RGB, &gh.vis_dst);
+        }
         glGetIntegerv(GL_DEPTH_FUNC, &gh.vis_func);
-        glGetIntegerv(GL_BLEND_SRC, &gh.vis_src);
-        glGetIntegerv(GL_BLEND_DST, &gh.vis_dst);
         gh.vis_depth = glIsEnabled(GL_DEPTH_TEST);
         gh.vis_blend = glIsEnabled(GL_BLEND);
-        gh.vis_tex2d = glIsEnabled(GL_TEXTURE_2D);
         gh.vis_cull  = glIsEnabled(GL_CULL_FACE);
         gh.vis_units = gles_texcoord_mask();
         gh.vis_fb = gh.bound_framebuffer;
