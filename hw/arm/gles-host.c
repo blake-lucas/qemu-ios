@@ -660,6 +660,8 @@ typedef struct {
     bool fb_incomplete;
     GLenum fb_status;
     unsigned draws_recorded;    /* [gles-draw] lines this context has printed */
+    GLuint fb_color_texture;    /* the target's color attachment when it is a texture (host name), ES hosts */
+    GLuint feedback_copy;       /* gles_feedback_begin's stand-in texture (host name) */
 
     uint64_t draws;
     /* Draws split by WHERE they landed. "The screen is blank but the app is
@@ -3408,6 +3410,18 @@ static bool gles_draw_target_ok(const char *what, uint32_t mode, uint32_t count)
         gh.fb_dirty = false;
         gh.fb_status = st;
         gh.fb_incomplete = st != GL_FRAMEBUFFER_COMPLETE;
+        gh.fb_color_texture = 0;
+        if (gh.api_version == 2 && !gh.fb_incomplete && gles_host_fbo(gh.bound_framebuffer)) {
+            GLint type = 0, name = 0;
+
+            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                  GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+            if (type == GL_TEXTURE) {
+                glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                      GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+            }
+            gh.fb_color_texture = name;
+        }
         if (gh.fb_incomplete && gles_refuse("fb-incomplete:0x%x", st)) {
             fprintf(stderr, "[gles] DRAWING INTO INCOMPLETE framebuffer %u (host %u, "
                     "status 0x%x) -- this draw produces nothing\n",
@@ -7826,6 +7840,112 @@ static bool gles_es2_emit_vertices(uint32_t count)
 }
 #endif
 
+#ifdef GLES_HOST_EGL_ES
+/*
+ * A draw whose color target is a texture that is also bound to a texture unit
+ * (a rendering feedback loop). GL leaves its result undefined but it is not an
+ * error, and iOS 10's CoreAnimation does it: it allocates a 1x1 texture with
+ * glTexImage2D, which leaves it bound to unit 0, attaches it to a framebuffer
+ * and draws a triangle into it (measured on the Poco: [gles-draw] ... color
+ * 0x1702:1 ... texture unit 0=1). Adreno draws. PowerVR's glDrawArrays reads
+ * through NULL in AttachAllUsedResourcesToCurrentSurface (GLES3EmitState,
+ * DrawArraysAutoIndices), the step that ties the draw's textures to its render
+ * target: a Pixel 10 died there preparing an iPhone 5 and starting one.
+ *
+ * So for that draw the unit gets a copy of the target's current contents (what
+ * a feedback read sees on hardware that allows it, and the same texels when the
+ * program never samples the unit), with the original's filtering and wrapping,
+ * and the original goes back right after. Draws without a loop are untouched.
+ */
+typedef struct GLESFeedbackUndo {
+    unsigned unit;
+    GLuint native;
+} GLESFeedbackUndo;
+
+static unsigned gles_feedback_begin(GLESFeedbackUndo undo[4])
+{
+    GLESEGLTexture *target = NULL;
+    GLint active = GL_TEXTURE0, min = GL_LINEAR, mag = GL_LINEAR, ws = GL_REPEAT, wt = GL_REPEAT;
+    unsigned n = 0;
+    static unsigned said;
+
+    if (gh.api_version != 2 || !gh.fb_color_texture || !gles_egl_current) {
+        return 0;
+    }
+    for (unsigned unit = 0; unit < G_N_ELEMENTS(gles_egl_current->texture_units) && n < 4; unit++) {
+        GLESEGLTexture *t = gles_egl_current->texture_units[unit].object_2d;
+        if (t && t->native_name == gh.fb_color_texture) {
+            target = t;
+            undo[n].unit = unit;
+            undo[n].native = t->native_name;
+            n++;
+        }
+    }
+    if (!n) {
+        return 0;
+    }
+    gles_native_save_errors();      /* the guest's errors stay the guest's */
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    glActiveTexture(GL_TEXTURE0 + undo[0].unit);
+    GLES_DRIVER_RAW(glGetTexParameteriv)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &min);
+    GLES_DRIVER_RAW(glGetTexParameteriv)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &mag);
+    GLES_DRIVER_RAW(glGetTexParameteriv)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws);
+    GLES_DRIVER_RAW(glGetTexParameteriv)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wt);
+    if (!gh.feedback_copy) {
+        GLES_DRIVER_RAW(glGenTextures)(1, &gh.feedback_copy);
+    }
+    GLES_DRIVER_RAW(glBindTexture)(GL_TEXTURE_2D, gh.feedback_copy);
+    /* One level: a mipmapping filter would leave the copy incomplete. */
+    if (min == GL_NEAREST_MIPMAP_NEAREST || min == GL_NEAREST_MIPMAP_LINEAR) {
+        min = GL_NEAREST;
+    } else if (min == GL_LINEAR_MIPMAP_NEAREST || min == GL_LINEAR_MIPMAP_LINEAR) {
+        min = GL_LINEAR;
+    }
+    GLES_DRIVER_RAW(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min);
+    GLES_DRIVER_RAW(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag);
+    GLES_DRIVER_RAW(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws);
+    GLES_DRIVER_RAW(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt);
+    if (target->width && target->height) {
+        /* The target is the read framebuffer too (ES 2 has one binding). */
+        GLES_DRIVER_RAW(glCopyTexImage2D)(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, target->width, target->height, 0);
+        if (gles_native_driver_error() != GL_NO_ERROR) {     /* a target without alpha */
+            GLES_DRIVER_RAW(glCopyTexImage2D)(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, target->width, target->height, 0);
+        }
+    }
+    for (unsigned i = 1; i < n; i++) {
+        glActiveTexture(GL_TEXTURE0 + undo[i].unit);
+        GLES_DRIVER_RAW(glBindTexture)(GL_TEXTURE_2D, gh.feedback_copy);
+    }
+    glActiveTexture(active);
+    while (gles_native_driver_error() != GL_NO_ERROR) {
+        /* ours, not the guest's */
+    }
+    if (said < 8) {
+        said++;
+        fprintf(stderr, "[gles] feedback loop: framebuffer %u draws into texture %u (host %u, %ux%u) "
+                "that unit %u samples; the draw samples a copy (PowerVR crashed on such a draw)\n",
+                gh.bound_framebuffer, target->name, target->native_name, target->width, target->height,
+                undo[0].unit);
+    }
+    return n;
+}
+
+static void gles_feedback_end(const GLESFeedbackUndo *undo, unsigned n)
+{
+    GLint active = GL_TEXTURE0;
+
+    if (!n) {
+        return;
+    }
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    for (unsigned i = 0; i < n; i++) {
+        glActiveTexture(GL_TEXTURE0 + undo[i].unit);
+        GLES_DRIVER_RAW(glBindTexture)(GL_TEXTURE_2D, undo[i].native);
+    }
+    glActiveTexture(active);
+}
+#endif
+
 static int64_t gles_es2_draw(CPUState *cpu, bool elements, const uint32_t *a)
 {
     uint32_t mode = a[0], count, nverts, first = 0, isz = 0, i, bound = 0;
@@ -7956,12 +8076,23 @@ static int64_t gles_es2_draw(CPUState *cpu, bool elements, const uint32_t *a)
         }
     }
 #endif
-    else if (elements) {
-        gles_draw_record("glDrawElements(ES2)", mode, count, bound);
-        glDrawElements(mode, count, isz == 1 ? GL_UNSIGNED_BYTE : GL_UNSIGNED_SHORT, idx);
-    } else {
-        gles_draw_record("glDrawArrays(ES2)", mode, count, bound);
-        glDrawArrays(mode, 0, count);            /* `first` applied by the fetch */
+    else {
+#ifdef GLES_HOST_EGL_ES
+        GLESFeedbackUndo undo[4];
+        unsigned looped;
+#endif
+        gles_draw_record(elements ? "glDrawElements(ES2)" : "glDrawArrays(ES2)", mode, count, bound);
+#ifdef GLES_HOST_EGL_ES
+        looped = gles_feedback_begin(undo);
+#endif
+        if (elements) {
+            glDrawElements(mode, count, isz == 1 ? GL_UNSIGNED_BYTE : GL_UNSIGNED_SHORT, idx);
+        } else {
+            glDrawArrays(mode, 0, count);        /* `first` applied by the fetch */
+        }
+#ifdef GLES_HOST_EGL_ES
+        gles_feedback_end(undo, looped);
+#endif
     }
     if (diagnostic) {
         GLint viewport[4], pack;
