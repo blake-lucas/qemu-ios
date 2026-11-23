@@ -508,6 +508,18 @@ typedef struct {
     GLuint saved, partial;
 } GLESQuery;
 
+/*
+ * Matrix stacks deeper than the host's (gles_matrix_push): one per stack the guest has, modelview, projection and a
+ * texture stack per unit. The host holds the bottom of each stack as far as it can; past its depth the bridge keeps
+ * the saved matrices here, newest last, and the host's live matrix stays the current one.
+ */
+#define GLES_KEPT_MATRICES 16      /* every guest GPU's deepest stack: the MBX's and SGX's modelview, 16 */
+#define GLES_MATRIX_STACKS (2 + GLES_MAX_TEXUNITS)
+typedef struct GLESMatrixStack {
+    uint32_t kept;
+    GLfloat m[GLES_KEPT_MATRICES][16];
+} GLESMatrixStack;
+
 typedef struct {
     GLESGroup *group;
     GHashTable *surfaces, *pvrtc;
@@ -780,6 +792,11 @@ typedef struct {
      * glGetFramebufferAttachmentParameteriv: the drawable's attachments never reach the host. */
     GHashTable *fb_attach;
     GHashTable *fetch_programs;
+    /* gles_matrix_push: the matrices each stack keeps past the host's depth, how many in all, and the host's
+     * maximum depth per kind (modelview, projection, texture; 0 until asked). */
+    GLESMatrixStack matrix_stack[GLES_MATRIX_STACKS];
+    uint32_t matrices_kept;
+    GLint host_stack_max[3];
 } GLESHost;
 
 /* Old guest engines retain their legacy context. New engines pass opaque
@@ -1636,6 +1653,10 @@ static bool gles_host_init(void)
     gh.pointsize.client_state = GL_POINT_SIZE_ARRAY_OES;
     gh.pointsize.size = 1;
     gles_palette_reset(&gh);
+    for (unsigned k = 0; k < GLES_MATRIX_STACKS; k++) {
+        gh.matrix_stack[k].kept = 0;
+    }
+    gh.matrices_kept = 0;
 
     gh.drawable_width = GLES_FB_WIDTH;
     gh.drawable_height = GLES_FB_HEIGHT;
@@ -5176,36 +5197,186 @@ static bool gles_vao_bind(GLESHost *h, uint32_t name)
  */
 
 /*
- * Did that push/pop actually take?
+ * The matrix stacks, as deep as the guest's GPU has them.
  *
- * Desktop GL only guarantees a PROJECTION stack two deep, and ES guarantees the
- * same -- but an implementation that refuses the push leaves the matrix the app
- * believed it had saved sitting in the live slot. The matching pop then
- * underflows, the app carries on, and every later matrix is silently composed
- * onto the wrong base. Nothing else reports it: the error is raised here and
- * drained by the next draw check long before anyone looks.
+ * ES 1.1 only promises a texture and projection stack two deep, and Adreno's ES 1.1 driver stops there: its texture
+ * stack is 2 deep (projection 4, modelview 16; Adreno 650, and the issue's log on an Adreno 618), where the MBX's is 4
+ * (projection 2, modelview 16; the front end's gles_gpus.h). Field & Stream Fishing nests its texture matrix three deep for its text and sprites, so on
+ * Adreno the innermost push was refused, the matching pop then undid the outer one instead, and every later texture
+ * matrix was composed onto the wrong base: scrambled and missing text, HUD boxes in flat color, the shore in
+ * misaligned strips (GitHub issue 13).
+ *
+ * So the host holds the bottom of each stack while it has room, and the bridge keeps the matrices pushed past that
+ * (GLESMatrixStack), saving the live one on a push and loading it back on a pop. A stack within the host's depth goes
+ * to the host exactly as before. The live matrix is always the host's, so every other matrix call is unchanged; the
+ * depth queries add what the bridge keeps, and the maximum depths read at least GLES_KEPT_MATRICES, which the front
+ * end lowers to the guest GPU's own. A snapshot saves the host's stacks only: one taken with matrices kept here
+ * resumes without them (the desktop hosts that save snapshots have deep stacks: Mesa's modelview is 32 deep).
+ *
+ * IT_GLES_HOST_STACK_DEPTH=N treats every host stack as N deep, to exercise this on a host with deep stacks.
+ */
+static const GLenum gles_stack_depth_pname[3] = {
+    GL_MODELVIEW_STACK_DEPTH, GL_PROJECTION_STACK_DEPTH, GL_TEXTURE_STACK_DEPTH
+};
+static const GLenum gles_stack_max_pname[3] = {
+    GL_MAX_MODELVIEW_STACK_DEPTH, GL_MAX_PROJECTION_STACK_DEPTH, GL_MAX_TEXTURE_STACK_DEPTH
+};
+static const GLenum gles_stack_matrix_pname[3] = {
+    GL_MODELVIEW_MATRIX, GL_PROJECTION_MATRIX, GL_TEXTURE_MATRIX
+};
+
+/* The stack of kind 0 (modelview), 1 (projection) or 2 (texture, the active unit's): its GLESMatrixStack index, or
+ * -1 for a texture unit past GLES_MAX_TEXUNITS. */
+static int gles_matrix_stack_index(int kind)
+{
+    GLint unit = GL_TEXTURE0;
+
+    if (kind < 2) {
+        return kind;
+    }
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+    unit -= GL_TEXTURE0;
+    return unit >= 0 && unit < (GLint)GLES_MAX_TEXUNITS ? 2 + unit : -1;
+}
+
+/* The kind of stack the matrix mode names (gles_matrix_stack_index), or -1 for another mode. */
+static int gles_matrix_mode_kind(void)
+{
+    GLint mode = 0;
+
+    glGetIntegerv(GL_MATRIX_MODE, &mode);
+    switch (mode) {
+    case GL_MODELVIEW: return 0;
+    case GL_PROJECTION: return 1;
+    case GL_TEXTURE: return 2;
+    default: return -1;
+    }
+}
+
+/* How deep the host's stacks of `kind` go (IT_GLES_HOST_STACK_DEPTH lowers it). */
+static GLint gles_host_stack_max(int kind)
+{
+    if (!gh.host_stack_max[kind]) {
+        const char *cap = getenv("IT_GLES_HOST_STACK_DEPTH");
+        GLint max = 0;
+
+        glGetIntegerv(gles_stack_max_pname[kind], &max);
+        if (cap && atoi(cap) > 0 && atoi(cap) < max) {
+            max = atoi(cap);
+        }
+        gh.host_stack_max[kind] = max > 0 ? max : 1;
+    }
+    return gh.host_stack_max[kind];
+}
+
+/* The guest's answer for a stack depth or maximum depth pname. */
+static GLint gles_matrix_stack_get(GLenum pname)
+{
+    for (int kind = 0; kind < 3; kind++) {
+        if (pname == gles_stack_max_pname[kind]) {
+            return MAX(gles_host_stack_max(kind), GLES_KEPT_MATRICES);
+        }
+        if (pname == gles_stack_depth_pname[kind]) {
+            GLint depth = 0;
+            int k = gles_matrix_stack_index(kind);
+
+            glGetIntegerv(pname, &depth);
+            return depth + (k >= 0 ? (GLint)gh.matrix_stack[k].kept : 0);
+        }
+    }
+    return 0;
+}
+
+/*
+ * Did a push/pop the host made actually take? An implementation that refuses the push leaves the matrix the app
+ * believed it had saved in the live slot; the matching pop then underflows, and every later matrix is silently
+ * composed onto the wrong base. Nothing else reports it: the error is raised here and drained by the next draw check
+ * long before anyone looks. The error is kept for the guest's glGetError.
  */
 static void gles_matrix_stack_check(const char *op)
 {
     GLenum e = glGetError();
 
-    if (e == GL_NO_ERROR || !gles_refuse("matrix-stack:%s", op)) {
+    if (e == GL_NO_ERROR) {
+        return;
+    }
+    gles_reject(e);                     /* the guest's glGetError reads it, as the device's would */
+    if (!gles_refuse("matrix-stack:%s", op)) {
         return;
     }
     {
         GLint mode = 0, depth = 0, maxd = 0;
+        int kind = gles_matrix_mode_kind();
+
         glGetIntegerv(GL_MATRIX_MODE, &mode);
-        if (mode == GL_PROJECTION) {
-            glGetIntegerv(GL_PROJECTION_STACK_DEPTH, &depth);
-            glGetIntegerv(GL_MAX_PROJECTION_STACK_DEPTH, &maxd);
-        } else {
-            glGetIntegerv(GL_MODELVIEW_STACK_DEPTH, &depth);
-            glGetIntegerv(GL_MAX_MODELVIEW_STACK_DEPTH, &maxd);
+        if (kind >= 0) {
+            glGetIntegerv(gles_stack_depth_pname[kind], &depth);
+            glGetIntegerv(gles_stack_max_pname[kind], &maxd);
         }
         fprintf(stderr, "[gles] %s FAILED: GL error 0x%x, mode=0x%x "
-                "depth=%d/%d -- the matrix stack is now out of step with the "
+                "host depth=%d/%d -- the matrix stack is now out of step with the "
                 "guest's\n", op, e, mode, depth, maxd);
     }
+}
+
+/* glPushMatrix: on the host while it has room, else kept here. */
+static void gles_matrix_push(void)
+{
+    int kind = gles_matrix_mode_kind();
+    int k = kind >= 0 ? gles_matrix_stack_index(kind) : -1;
+    GLESMatrixStack *s;
+    GLint depth = 0, max;
+
+    if (k < 0) {
+        glPushMatrix();
+        gles_matrix_stack_check("glPushMatrix");
+        return;
+    }
+    s = &gh.matrix_stack[k];
+    max = gles_host_stack_max(kind);
+    if (!s->kept) {
+        glGetIntegerv(gles_stack_depth_pname[kind], &depth);
+        if (depth < max) {
+            glPushMatrix();
+            gles_matrix_stack_check("glPushMatrix");
+            return;
+        }
+    }
+    if (max + (GLint)s->kept >= MAX(max, GLES_KEPT_MATRICES)) {
+        gles_reject(GL_STACK_OVERFLOW);
+        return;
+    }
+    {
+        static bool said[3];
+        if (!said[kind]) {
+            said[kind] = true;
+            fprintf(stderr, "[gles] %s matrix stack: the guest pushed past the host's %d; the bridge keeps the "
+                    "rest\n", kind == 0 ? "modelview" : kind == 1 ? "projection" : "texture", max);
+        }
+    }
+    glGetFloatv(gles_stack_matrix_pname[kind], s->m[s->kept]);
+    s->kept++;
+    gh.matrices_kept++;
+}
+
+/* glPopMatrix: the newest matrix kept here, else the host's. */
+static void gles_matrix_pop(void)
+{
+    if (gh.matrices_kept) {
+        int kind = gles_matrix_mode_kind();
+        int k = kind >= 0 ? gles_matrix_stack_index(kind) : -1;
+
+        if (k >= 0 && gh.matrix_stack[k].kept) {
+            GLESMatrixStack *s = &gh.matrix_stack[k];
+
+            s->kept--;
+            gh.matrices_kept--;
+            glLoadMatrixf(s->m[s->kept]);
+            return;
+        }
+    }
+    glPopMatrix();
+    gles_matrix_stack_check("glPopMatrix");
 }
 
 static void gles_trace_matrix_op(const char *op, uint32_t arg)
@@ -9333,6 +9504,13 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         case 0x8DFA: v.i[0] = 1; break;             /* SHADER_COMPILER */
         case 0x8DF9: v.i[0] = 0; break;             /* NUM_SHADER_BINARY_FORMATS */
         case 0x8D57: v.i[0] = 0; break;             /* MAX_SAMPLES_APPLE: no multisampling here */
+        case GL_MODELVIEW_STACK_DEPTH: case GL_PROJECTION_STACK_DEPTH: case GL_TEXTURE_STACK_DEPTH:
+        case GL_MAX_MODELVIEW_STACK_DEPTH: case GL_MAX_PROJECTION_STACK_DEPTH: case GL_MAX_TEXTURE_STACK_DEPTH:
+            if (gh.api_version != 2) {
+                v.i[0] = gles_matrix_stack_get(pname);  /* with what gles_matrix_push keeps */
+                break;
+            }
+            goto forward;
         case GL_MATRIX_MODE:
             if (gh.palette_mode) {
                 v.i[0] = GL_MATRIX_PALETTE_OES;
@@ -9340,6 +9518,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             }
             /* fall through */
         default:
+        forward:
             emulated = false;
             if (boolean) {
                 glGetBooleanv(pname, v.b);
@@ -9426,14 +9605,12 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
     /* ---- matrix stack ---- */
     case GLES_SLOT_PUSH_MATRIX:
         gles_trace_matrix_op("glPushMatrix", 0);
-        glPushMatrix();
-        gles_matrix_stack_check("glPushMatrix");
+        gles_matrix_push();
         return 0;
 
     case GLES_SLOT_POP_MATRIX:
         gles_trace_matrix_op("glPopMatrix", 0);
-        glPopMatrix();
-        gles_matrix_stack_check("glPopMatrix");
+        gles_matrix_pop();
         return 0;
 
     case GLES_SLOT_TRANSLATEF:                  /* x,y,z */
