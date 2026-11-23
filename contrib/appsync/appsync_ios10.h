@@ -213,10 +213,14 @@ static void as_say_status(void *ctx) {
     if (ctx) dispatch_after_f(dispatch_time(0, 240ll * 1000000000), dispatch_get_global_queue(0, 0), 0, as_say_status);
 }
 
-// The outermost "*.app" directory of `file` (an executable or a bundle path), re-hashed once per call.
+// The outermost "*.app" directory of `file` (an executable or a bundle path), re-hashed once per call. Only an app
+// installd is installing: one in its staging folder (it validates installed and built-in apps too).
+extern char *strstr(const char *, const char *);
 static void as_rehash_bundle(CFStringRef path) {
     char file[1024];
-    if (!path || !CFStringGetCString(path, file, sizeof file, 0x08000100)) return;
+    if (!path || CFGetTypeID(path) != CFStringGetTypeID() ||
+        !CFStringGetCString(path, file, sizeof file, 0x08000100)) return;
+    if (!strstr(file, "/com.apple.mobile.installd.staging/")) return;
     unsigned end = 0;
     for (unsigned i = 0; file[i]; i++) {
         if ((file[i + 1] == '/' || !file[i + 1]) && i >= 4 && !memcmp(file + i - 3, ".app", 4)) { end = i + 1; break; }

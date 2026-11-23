@@ -60,6 +60,21 @@ extern void *dlsym(void *, const char *);
 #ifndef RTLD_DEFAULT
 #define RTLD_DEFAULT ((void *)-2L)
 #endif
+extern void *dlopen(const char *, int);
+
+// The original of a hooked function: the next definition after this library (inserted, interposing: every
+// iOS before 10). On iOS 10 this library is loaded by installd's and amfid's own load command and rebinds their
+// imports, and dyld there answered the lookups with the hook itself (installd recursed until its stack ran
+// out), so a lookup that names the hook is never taken: then the defining library's own export, or nothing.
+static void *as_original(const char *library, const char *name, const void *hook) {
+    void *p = dlsym(RTLD_NEXT, name);
+    if (p && p != hook) return p;
+    void *h = dlopen(library, 0x10 | 0x1); // RTLD_NOLOAD | RTLD_LAZY: only if the program has it already
+    p = h ? dlsym(h, name) : 0;
+    return p != hook ? p : 0;
+}
+#define AS_LIBMIS "/usr/lib/libmis.dylib"
+#define AS_SECURITY "/System/Library/Frameworks/Security.framework/Security"
 
 // iOS 6 installd also requires the code-signing identifier and entitlements.
 // Those keys are absent before iOS 6, so they are resolved at runtime.
@@ -227,10 +242,8 @@ static void signature_info(CFStringRef path, CFStringRef *ident, CFTypeRef *ents
 
 static int as_MISValidateSignatureAndCopyInfo(void *path, void *options,
                                              CFDictionaryRef *info) {
-    int (*real)(void *, void *, CFDictionaryRef *) =
-        dlsym(RTLD_NEXT, "MISValidateSignatureAndCopyInfo");
-    // Rebound (iOS 10) rather than interposed: this library loads after libmis, so look everywhere.
-    if (!real) real = dlsym(RTLD_DEFAULT, "MISValidateSignatureAndCopyInfo");
+    int (*real)(void *, void *, CFDictionaryRef *) = as_original(AS_LIBMIS, "MISValidateSignatureAndCopyInfo",
+        (const void *)as_MISValidateSignatureAndCopyInfo);
     int ios10 = as_ios10();
     if (ios10 && in_installd()) as_rehash_bundle((CFStringRef)path);
     // Copy APIs may leave the out parameter untouched on failure.
@@ -277,9 +290,8 @@ static int is_appsync_certificate(CFTypeRef value) {
 // Keep real certificates and errors intact. Only our synthetic signing-info
 // certificate may use CFData as a stand-in when legacy Security rejects it.
 static SecCertificateRef as_SecCertificateCreateWithData(CFAllocatorRef a, CFDataRef d) {
-    SecCertificateRef (*real)(CFAllocatorRef, CFDataRef) =
-        dlsym(RTLD_NEXT, "SecCertificateCreateWithData");
-    if (!real) real = dlsym(RTLD_DEFAULT, "SecCertificateCreateWithData");
+    SecCertificateRef (*real)(CFAllocatorRef, CFDataRef) = as_original(AS_SECURITY, "SecCertificateCreateWithData",
+        (const void *)as_SecCertificateCreateWithData);
     SecCertificateRef result = real ? real(a, d) : 0;
     if (!result && in_installd() && is_appsync_certificate((CFTypeRef)d))
         result = (SecCertificateRef)CFRetain((CFTypeRef)d);
@@ -289,9 +301,8 @@ static SecCertificateRef as_SecCertificateCreateWithData(CFAllocatorRef a, CFDat
 static CFStringRef as_SecCertificateCopySubjectSummary(SecCertificateRef c) {
     if (in_installd() && is_appsync_certificate((CFTypeRef)c))
         return CFStringCreateWithCString(kCFAllocatorDefault, "AppSync", 0x0600);
-    CFStringRef (*real)(SecCertificateRef) =
-        dlsym(RTLD_NEXT, "SecCertificateCopySubjectSummary");
-    if (!real) real = dlsym(RTLD_DEFAULT, "SecCertificateCopySubjectSummary");
+    CFStringRef (*real)(SecCertificateRef) = as_original(AS_SECURITY, "SecCertificateCopySubjectSummary",
+        (const void *)as_SecCertificateCopySubjectSummary);
     return real ? real(c) : 0;
 }
 
