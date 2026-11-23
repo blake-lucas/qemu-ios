@@ -43,6 +43,7 @@ extern bool it_profile_on;
 #include "system/ramblock.h"
 #include "system/ramlist.h"
 #include "system/physmem.h"
+#include "exec/cputlb.h"
 #include "system/tcg.h"
 #include "exec/tb-flush.h"
 #include "tcg/tcg.h"
@@ -5910,10 +5911,24 @@ uint64_t gles_host_ram_gen(uint64_t addr, uint64_t len)
     return gen;
 }
 
+static bool gles_dirty_batch(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_GL_DIRTY_BATCH");
+
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    return on;
+}
+
 /* Whether any of `s`'s pages was written since its texture was uploaded. */
 static bool gles_surface_changed(GLESSurface *s)
 {
     bool changed = !s->npages;
+    g_autofree ram_addr_t *start = NULL, *len = NULL;  /* the runs cleared, re-armed in one walk below */
+    unsigned ncleared = 0;
 
     for (unsigned i = 0, j; i < s->npages; i = j) {
         /* one bitmap scan per physically contiguous run */
@@ -5942,9 +5957,25 @@ static bool gles_surface_changed(GLESSurface *s)
         if (!any) {
             continue;
         }
-        /* one clear per run: each clear walks every TLB entry to re-arm write tracking */
-        physical_memory_test_and_clear_dirty(s->pages[i], (ram_addr_t)(j - i) * TARGET_PAGE_SIZE,
-                                             DIRTY_MEMORY_VGA, NULL);
+        /* The bits per run; the TLBs re-arm write tracking once for all runs (each walk visits every entry of
+         * every vCPU, and a scattered surface is hundreds of runs). LT_GL_DIRTY_BATCH=off: a walk per run (A/B). */
+        if (!gles_dirty_batch()) {
+            physical_memory_test_and_clear_dirty(s->pages[i], (ram_addr_t)(j - i) * TARGET_PAGE_SIZE,
+                                                 DIRTY_MEMORY_VGA, NULL);
+            continue;
+        }
+        if (physical_memory_test_and_clear_dirty_bits(s->pages[i], (ram_addr_t)(j - i) * TARGET_PAGE_SIZE,
+                                                      DIRTY_MEMORY_VGA)) {
+            if (!start) {
+                start = g_new(ram_addr_t, s->npages);
+                len = g_new(ram_addr_t, s->npages);
+            }
+            start[ncleared] = s->pages[i];
+            len[ncleared++] = (ram_addr_t)(j - i) * TARGET_PAGE_SIZE;
+        }
+    }
+    if (ncleared) {
+        tlb_reset_dirty_ranges_all(start, len, ncleared);
     }
     for (unsigned i = 0; i < s->npages && !changed; i++) {
         size_t page = s->pages[i] >> TARGET_PAGE_BITS;
