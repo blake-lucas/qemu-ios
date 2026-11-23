@@ -3390,13 +3390,13 @@ static void gles_check_fb_complete(void)
 /* ---------------------------------------------------------------- draw target
  *
  * GL says a draw into an incomplete framebuffer draws nothing and raises
- * GL_INVALID_FRAMEBUFFER_OPERATION, and Adreno does exactly that. PowerVR's
- * glDrawArrays doesn't check first: a Pixel 10 preparing an iPhone 5 died in
- * AttachAllUsedResourcesToCurrentSurface (GLES3EmitState, DrawArraysAutoIndices)
- * reading through NULL, inside the guest's glDrawArrays, in a boot whose
+ * GL_INVALID_FRAMEBUFFER_OPERATION. On ES hosts the bridge asks before the
+ * draw and does that itself rather than trust every driver to: the iPhone 5's
  * framebuffers go incomplete when the bridge refuses an IOSurface render
- * target (surface:render:420f, then fb-incomplete 0x8cd7). So on ES hosts the
- * bridge asks before the draw and does what GL specifies itself. A complete
+ * target (surface:render:420f, then fb-incomplete 0x8cd7). (Suspected first
+ * for the Pixel 10's crash in PowerVR's glDrawArrays; the draw record showed
+ * that draw's target complete and a feedback loop instead: gles_feedback_begin.)
+ * It also notes the target's color texture for gles_feedback_begin. A complete
  * target costs nothing extra (the check only runs when the target changed); an
  * incomplete one is asked again at every draw, so a stale answer can only let a
  * draw through, never drop a valid one.
@@ -3432,7 +3432,7 @@ static bool gles_draw_target_ok(const char *what, uint32_t mode, uint32_t count)
         if (gles_refuse("draw-skipped:fb-incomplete:0x%x", gh.fb_status)) {
             fprintf(stderr, "[gles] %s(mode=0x%x, count=%u) into incomplete framebuffer %u "
                     "(host %u, status 0x%x) not sent to the host: GL_INVALID_FRAMEBUFFER_OPERATION, "
-                    "as GL specifies (PowerVR crashed on such a draw)\n", what, mode, count,
+                    "as GL specifies\n", what, mode, count,
                     gh.bound_framebuffer, gles_host_fbo(gh.bound_framebuffer), gh.fb_status);
         }
         gles_reject(GL_INVALID_FRAMEBUFFER_OPERATION);
@@ -7920,10 +7920,28 @@ static unsigned gles_feedback_begin(GLESFeedbackUndo undo[4])
     while (gles_native_driver_error() != GL_NO_ERROR) {
         /* ours, not the guest's */
     }
+    {
+        /* How often, so a loop on every frame shows in the log: each copy is
+         * a texture-sized read. */
+        static uint64_t copies, pixels, reported;
+        static int64_t next;
+        int64_t now = g_get_monotonic_time();
+
+        copies++;
+        pixels += (uint64_t)target->width * target->height;
+        if (now >= next && copies != reported) {
+            if (next) {
+                fprintf(stderr, "[gles] feedback loops: %" PRIu64 " draws sampled a copy so far "
+                        "(%" PRIu64 " pixels copied)\n", copies, pixels);
+            }
+            reported = copies;
+            next = now + 10 * G_USEC_PER_SEC;
+        }
+    }
     if (said < 8) {
         said++;
         fprintf(stderr, "[gles] feedback loop: framebuffer %u draws into texture %u (host %u, %ux%u) "
-                "that unit %u samples; the draw samples a copy (PowerVR crashed on such a draw)\n",
+                "that unit %u samples; the draw samples a copy (PowerVR's glDrawArrays crashed on such a draw)\n",
                 gh.bound_framebuffer, target->name, target->native_name, target->width, target->height,
                 undo[0].unit);
     }
