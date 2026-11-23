@@ -3428,6 +3428,8 @@ static bool gles_draw_target_ok(const char *what, uint32_t mode, uint32_t count)
     return true;
 }
 
+static GLuint gles_glsl_host(uint32_t guest);
+
 /* Host shaders whose source reads gl_LastFragData, and host programs linked
  * from one: for the draw record and the crash note. */
 static GHashTable *gles_fetch_shaders, *gles_fetch_programs;
@@ -3520,7 +3522,7 @@ static void gles_draw_record(const char *what, uint32_t mode, uint32_t count, ui
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
         fprintf(stderr, "[gles-draw] ctx=%08x %s mode=0x%x count=%u program=%u (host %u, current %d, "
                 "linked %d, fetch %d) attribs=0x%x fb=%u (host %d, status 0x%x, color 0x%x:%d) "
-                "texture unit %d=%d\n", gles_cur_ctx, what, mode, count, gh.program, program, current,
+                "texture unit %d=%d\n", n->gl_ctx, what, mode, count, gh.program, program, current,
                 linked, n->draw_fetch, attribs, gh.bound_framebuffer, fb, st, type, name,
                 active - GL_TEXTURE0, texture);
     }
