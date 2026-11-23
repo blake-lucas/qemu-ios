@@ -28,6 +28,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(LIS302DLState, LIS302DL)
 /* LIS331DLH (ST datasheet): WHO_AM_I 0x32, CTRL_REG2 BOOT is bit 7. */
 #define ACCEL_WHOAMI_LIS331DLH 0x32
 #define ACCEL_CTRL_REG2_BOOT_LIS331 0x80
+/* LIS3DSH (WHO_AM_I 0x3F): the iPhone 5's "accelerometer,ap3dsh". Its own register map, a 32-sample FIFO and an
+ * INT1 pin (lis3dsh_* in ipod_touch_lis302dl.c); the attitude, host-motion and mount model is the shared one. */
+#define ACCEL_WHOAMI_LIS3DSH 0x3F
+#define LIS3DSH_FIFO_SLOTS 32
 
 #define ACCEL_CTRL_REG1_XEN 0x01
 #define ACCEL_CTRL_REG1_YEN 0x02
@@ -66,6 +70,15 @@ typedef struct LIS302DLState {
     int64_t host_gyro_until_ns;    /* the host's acceleration holds; its rotation rate lapses */
     double host_acceleration[3], host_angular_velocity[3];
     int64_t last_sample_ns, shake_start_ns;
+    /* LIS3DSH only (whoami 0x3F): registers 0x00-0x3f, the FIFO (slot i is ds_fifo[3 * i ..]), the latest sample,
+     * the output-data-rate timer and the INT1/INT2 pins (gpio-out 0/1, at the pin's level) */
+    uint8_t ds_regs[0x40];
+    uint8_t ds_level;
+    bool ds_ovrn;
+    int16_t ds_fifo[LIS3DSH_FIFO_SLOTS * 3];
+    int16_t ds_sample[3];
+    QEMUTimer *ds_timer;
+    qemu_irq ds_pin[2];
     int64_t trace_last_poll_ns, trace_last_report_ns;
     uint32_t trace_polls;
     int64_t trace_poll_sum_ns;

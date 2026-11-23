@@ -22,6 +22,9 @@
 #include "hw/arm/exynos4210.h"
 #include "hw/arm/s5l8930.h"
 #include "hw/arm/ipod_touch_buttons.h"
+#include "hw/arm/ipod_touch_lis302dl.h"
+#include "hw/arm/ipod-attitude.h"
+#include "qapi/visitor.h"
 #include "hw/arm/ipod_touch_mipi_dsi.h"
 #include "hw/arm/ipod_touch_spi.h"
 #include "hw/arm/ipod_touch_usb_otg.h"
@@ -260,6 +263,12 @@ struct S5L8950State {
     uint64_t pmgr_transition_done;
     bool pmgr_transition_pending;
     A6I2C *i2c[3];
+    /* the motion sensors (a6_motion_init): the accelerometer carries the
+     * attitude and the host's samples the gyro and compass read */
+    LIS302DLState *accel;
+    DeviceState *gyro, *compass;
+    double accel_pitch, accel_roll;     /* degrees, as the app sends them */
+    bool accel_flat;
     unsigned unimplemented, unimplemented_iop;
     QemuConsole *console;
     uint32_t framebuffer;
@@ -1323,9 +1332,126 @@ static const uint8_t a6_n42_product_id[20] = {
 static void a6_dt_identity(uint8_t *image, size_t length, uint32_t load,
                            uint32_t arguments)
 {
+    /*
+     * iBoot fills the gyro's and the accelerometer's sensitivity matrices
+     * (the first 9 of 10 words, 16.16) from the unit's syscfg, as on the A4
+     * boards (ipad1.c); the IPSW DT reserves them zeroed, and 14G61's
+     * AppleAP3DSH and AppleAP3GDL take a zeroed one as singular. A nominal
+     * part's identity.
+     */
+    static const uint32_t unit_cal[9] = { 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x10000 };
+    uint32_t cal[9];
+
+    for (int i = 0; i < 9; i++) {
+        stl_le_p(&cal[i], unit_cal[i]);
+    }
+    a4_dt_edit(image, length, load, arguments,
+               &(A4DTEdit){"gyro", "gyro-sensitivity-calibration", cal, sizeof(cal)});
+    a4_dt_edit(image, length, load, arguments,
+               &(A4DTEdit){"accelerometer", "accel-sensitivity-calibration", cal, sizeof(cal)});
     a4_dt_edit(image, length, load, arguments,
                &(A4DTEdit){"product", "product-id", a6_n42_product_id,
                            sizeof(a6_n42_product_id)});
+}
+
+/*
+ * The N42 DT's motion sensors (14G61's drivers found nothing on the buses
+ * before: AppleAKM8963 "could not probe the hw at the I2C address", the gyro
+ * freed): a LIS3DSH accelerometer (i2c1 0x1d, "accelerometer,ap3dsh", INT1
+ * GPIO30, INT2 GPIO228), an L3G-family gyro (i2c0 0x6a, "gyro,ap3gdl", the
+ * A4 boards' model, INT1 GPIO225, INT2 GPIO67) and an AK8963 compass (i2c1
+ * 0x0c, "compass,akm8963"). Each reads through its DT node's "orientation",
+ * as the guest's driver does (ios_dt_mount). The accelerometer takes the
+ * app's attitude (accel-pitch/-roll/-pose) and the host's samples
+ * (qemu_ios_portable_motion finds it by type); the gyro reads its turn
+ * (lis302dl_motion_rate) and the compass its pose, as on the A4 boards.
+ */
+static void a6_motion_init(S5L8950State *s, DeviceState *gpio)
+{
+    Object *machine = OBJECT(s);
+    I2CSlave *accel = i2c_slave_new(TYPE_LIS302DL, 0x1d);
+    I2CSlave *gyro = i2c_slave_new(TYPE_S5L8930_L3G4200D, 0x6a);
+    I2CSlave *compass = i2c_slave_new(TYPE_S5L8930_AK8963, 0x0c);
+    static const unsigned pins[] = { 30, 228, 225, 67 };
+
+    for (int i = 0; i < ARRAY_SIZE(pins); i++) {
+        s5l8930_gpio_set_rest_level(gpio, pins[i], false);  /* active-high lines, inactive */
+    }
+    qdev_prop_set_uint8(DEVICE(accel), "whoami", ACCEL_WHOAMI_LIS3DSH);
+    qdev_prop_set_string(DEVICE(accel), "dt-orientation", "01000000000100000000ff00");
+    i2c_slave_realize_and_unref(accel, s->i2c[1]->bus, &error_fatal);
+    s->accel = LIS302DL(accel);
+    s->accel->motion = true;                    /* the gyro sees each attitude change as a turn */
+    lis302dl_apply_orientation(s->accel, 1);    /* init ran before the mount was set */
+    qdev_connect_gpio_out(DEVICE(accel), 0, qdev_get_gpio_in(gpio, 30));
+    qdev_connect_gpio_out(DEVICE(accel), 1, qdev_get_gpio_in(gpio, 228));
+
+    qdev_prop_set_string(DEVICE(gyro), "dt-orientation", "ff000000000100000000ff00");
+    i2c_slave_realize_and_unref(gyro, s->i2c[0]->bus, &error_fatal);
+    s->gyro = DEVICE(gyro);
+    s5l8930_l3g_set_accel(s->gyro, s->accel);
+    qdev_connect_gpio_out(s->gyro, 0, qdev_get_gpio_in(gpio, 225));
+    qdev_connect_gpio_out(s->gyro, 1, qdev_get_gpio_in(gpio, 67));
+
+    i2c_slave_realize_and_unref(compass, s->i2c[1]->bus, &error_fatal);
+    s->compass = DEVICE(compass);
+    s5l8930_ak8973_set_accel(s->compass, s->accel);
+
+    /* The iPod's and the A4's names: qom-set /machine compass-heading N (degrees);
+     * accel-orientation (UIDeviceOrientation 1-6), raw counts and a shake. */
+    object_property_add_alias(machine, "compass-heading", OBJECT(compass), "heading");
+    object_property_add_alias(machine, "accel-orientation", OBJECT(accel), "orientation");
+    object_property_add_alias(machine, "accel-x", OBJECT(accel), "x");
+    object_property_add_alias(machine, "accel-y", OBJECT(accel), "y");
+    object_property_add_alias(machine, "accel-z", OBJECT(accel), "z");
+    object_property_add_alias(machine, "accel-shake", OBJECT(accel), "shake");
+}
+
+static void a6_get_accel_angle(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    S5L8950State *s = S5L8950_MACHINE(obj);
+    double value = !strcmp(name, "accel-pitch") ? s->accel_pitch : s->accel_roll;
+
+    visit_type_number(v, name, &value, errp);
+}
+
+static void a6_set_accel_angle(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    S5L8950State *s = S5L8950_MACHINE(obj);
+    double value;
+
+    if (!visit_type_number(v, name, &value, errp)) {
+        return;
+    }
+    if (!isfinite(value) || value < -180 || value > 180) {
+        error_setg(errp, "%s must be finite and between -180 and 180 degrees", name);
+        return;
+    }
+    *(!strcmp(name, "accel-pitch") ? &s->accel_pitch : &s->accel_roll) = value;
+    if (s->accel) {
+        lis302dl_apply_attitude(s->accel, s->accel_pitch, s->accel_roll, s->accel_flat);
+    }
+}
+
+static char *a6_get_accel_pose(Object *obj, Error **errp)
+{
+    return g_strdup(S5L8950_MACHINE(obj)->accel_flat ? "flat" : "upright");
+}
+
+static void a6_set_accel_pose(Object *obj, const char *value, Error **errp)
+{
+    S5L8950State *s = S5L8950_MACHINE(obj);
+
+    if (strcmp(value, "flat") && strcmp(value, "upright")) {
+        error_setg(errp, "accel-pose must be upright or flat");
+        return;
+    }
+    s->accel_flat = !strcmp(value, "flat");
+    if (s->accel) {
+        lis302dl_apply_attitude(s->accel, s->accel_pitch, s->accel_roll, s->accel_flat);
+    }
 }
 
 static void a6_reset(void *opaque)
@@ -1647,6 +1773,7 @@ static void a6_init(MachineState *machine)
         s5l8930_gpio_set_rest_level(gpio, 31, false);
         qdev_connect_gpio_out(DEVICE(tristar), 0, qdev_get_gpio_in(gpio, 31));
     }
+    a6_motion_init(s, gpio);
     if (s->usb_host_probe) {
         /* N42's DT advertises the A4 PHY and S5L8900 device-controller
          * compatibility strings, at 36000000/36100000 and IRQ11. Reuse
@@ -2215,6 +2342,11 @@ static void a6_class_init(ObjectClass *klass, const void *data)
     object_class_property_set_description(klass, "usb-tcp-addr",
         "the host USB bridge the device-mode core dials (host:port or a unix socket path); unset: IT_USB_TCP");
     object_class_property_add_bool(klass, "ppn", a6_get_ppn, a6_set_ppn);
+    object_class_property_add(klass, "accel-pitch", "number", a6_get_accel_angle,
+                              a6_set_accel_angle, NULL, NULL);
+    object_class_property_add(klass, "accel-roll", "number", a6_get_accel_angle,
+                              a6_set_accel_angle, NULL, NULL);
+    object_class_property_add_str(klass, "accel-pose", a6_get_accel_pose, a6_set_accel_pose);
     object_class_property_add_bool(klass, "camera", a6_get_camera,
                                    a6_set_camera);
     object_class_property_add_bool(klass, "display-probe", a6_get_display_probe,

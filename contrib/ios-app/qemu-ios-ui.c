@@ -1045,8 +1045,10 @@ void qemu_ios_ui_vm_started(void)
     ios.attached = true;
     ios_add_frame_counter_property();
     qemu_register_reset(ios_sequence_reset, NULL);
+    /* The boards with a gyro (QEMU_IOS_CAP_GYRO): the A4s' and the iPhone 5's (s5l8950.c a6_motion_init) */
     portable_has_gyro = object_dynamic_cast(qdev_get_machine(), MACHINE_TYPE_NAME("iPod-Touch-4G")) ||
-                        object_dynamic_cast(qdev_get_machine(), MACHINE_TYPE_NAME("iPhone-4"));
+                        object_dynamic_cast(qdev_get_machine(), MACHINE_TYPE_NAME("iPhone-4")) ||
+                        object_dynamic_cast(qdev_get_machine(), MACHINE_TYPE_NAME("iPhone-5"));
     qatomic_set(&ios_vm_alive, 1);
 }
 
@@ -1074,8 +1076,8 @@ static const QemuIosDeviceInfo ios_devices[] = {
     { "ipad1",         "k48ap", 1024,  768, 1, 1, false, true,  true,  true,  A4_PANEL },
     { "iPod-Touch-4G", "n81ap",  640,  960, 2, 0, false, true,  false, false, A4_PANEL },
     { "iPhone-4",      "n90ap",  640,  960, 2, 0, true,  true,  true,  false, A4_PANEL },
-    /* The A6's EHCI carries its modem and Wi-Fi, no keyboard; no compass or panel= modeled */
-    { "iPhone-5",      "n42ap",  640, 1136, 2, 0, true,  false, false, false, A6_PANEL },
+    /* The A6's EHCI carries its modem and Wi-Fi, no keyboard; the AK8963 compass (s5l8950.c a6_motion_init); no panel= */
+    { "iPhone-5",      "n42ap",  640, 1136, 2, 0, true,  false, true,  false, A6_PANEL },
 };
 
 const QemuIosDeviceInfo *qemu_ios_device_info(const char *machine)
@@ -1742,7 +1744,8 @@ int qemu_ios_portable_board(const char *machine, QemuIosPortableBoard *out)
     out->scale = d->screen_scale; out->orientation = d->default_orientation;
     out->max_contacts = 5;
     out->capabilities = QEMU_IOS_CAP_ACCEL | QEMU_IOS_CAP_MULTITOUCH | QEMU_IOS_CAP_FRAME_COPY;
-    if (!strcmp(d->board, "n81ap") || !strcmp(d->board, "n90ap")) out->capabilities |= QEMU_IOS_CAP_GYRO;
+    if (!strcmp(d->board, "n81ap") || !strcmp(d->board, "n90ap") || !strcmp(d->board, "n42ap"))
+        out->capabilities |= QEMU_IOS_CAP_GYRO;
     /* boards whose codec model reports a headphone jack: machine option headphones=on */
     if (!strcmp(d->board, "n81ap")) out->capabilities |= QEMU_IOS_CAP_HEADPHONES;
     return QEMU_IOS_OK;

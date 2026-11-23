@@ -222,6 +222,8 @@ void s5l8930_ltc4099_set_charging(DeviceState *dev, bool charging);
 #define TYPE_S5L8930_AK8973 "s5l8930.ak8973"
 /* AK8975B at 0x0c on i2c0 (the iPhone 4's): the same "heading" and pose. */
 #define TYPE_S5L8930_AK8975 "s5l8930.ak8975"
+/* AK8963C at 0x0c on i2c1 (the iPhone 5's, "compass,akm8963"): the AK8975's with a 14/16-bit output and continuous modes. */
+#define TYPE_S5L8930_AK8963 "s5l8930.ak8963"
 /* L3G4200D gyroscope at 0x68 on i2c2 ("gyro,ap3gdl"); gpio-out 0/1 = INT1/INT2 pin levels. */
 #define TYPE_S5L8930_L3G4200D "s5l8930.l3g4200d"
 /* The accelerometer whose gravity vector gives the compass its pose. */

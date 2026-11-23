@@ -31,8 +31,8 @@ static bool lis302dl_debug(void)
     return trace_event_get_state_backends(TRACE_LIS302DL_LOG);
 }
 
-/* The mounted sensor's reading of a device vector g (in g), in 1/64 g. */
-static void lis302dl_mounted(LIS302DLState *s, const double g[3], int out[3])
+/* The mounted sensor's reading of a device vector g (in g), in g. */
+static void lis302dl_mount(LIS302DLState *s, const double g[3], double out[3])
 {
     if (s->dt_orientation && !s->axis[0]) {
         if (!ios_dt_mount(s->dt_orientation, true, s->axis)) {
@@ -49,7 +49,18 @@ static void lis302dl_mounted(LIS302DLState *s, const double g[3], int out[3])
             int a = (s->axis[i] < 0 ? -s->axis[i] : s->axis[i]) - 1;
             v = s->axis[i] < 0 ? -g[a] : g[a];
         }
-        out[i] = lround(64 * v);
+        out[i] = v;
+    }
+}
+
+/* The mounted sensor's reading of a device vector g (in g), in 1/64 g. */
+static void lis302dl_mounted(LIS302DLState *s, const double g[3], int out[3])
+{
+    double m[3];
+
+    lis302dl_mount(s, g, m);
+    for (int i = 0; i < 3; i++) {
+        out[i] = lround(64 * m[i]);
     }
 }
 
@@ -267,6 +278,220 @@ void lis302dl_set_axis_value(LIS302DLState *s, char axis, int v)
     }
 }
 
+/* ---- LIS3DSH (WHO_AM_I 0x3F): the iPhone 5's "accelerometer,ap3dsh" ----
+ *
+ * 14G61's AppleAP3DSH probes WHO_AM_I (0x0f) for 0x3f, reads the part's
+ * temperature (OUT_T, 0x0c), and runs it at 400 Hz with the FIFO in stream
+ * mode: INT1 wakes handleInterrupt1, which reads FIFO_SRC (0x2f) and, with
+ * WTM set, reads FSS samples (1-31) in one burst from OUT_X_L (0x28), at most
+ * 128 bytes. So the outputs wrap 0x2d -> 0x28 while the FIFO is on, and a
+ * slot pops when OUT_Z_H is read, as the gyro model's do (s5l8930_i2c.c).
+ * Counts are 16-bit at the full scale CTRL_REG5 selects (datasheet
+ * sensitivities, 0.06 mg/digit at +-2 g). The pins are at their level: INT1
+ * carries data-ready (CTRL_REG3 DR_EN) and the FIFO's empty/watermark/overrun
+ * routes (CTRL_REG6 P1_*), active high with IEA; INT2's state machines are
+ * not modelled (the pin rests inactive).
+ */
+#define DS_OUT_T        0x0c
+#define DS_INFO1        0x0d
+#define DS_CTRL4        0x20    /* ODR[7:4] BDU Zen Yen Xen */
+#define DS_CTRL3        0x23    /* DR_EN IEA IEL INT2_EN INT1_EN VFILT - STRT */
+#define DS_CTRL5        0x24    /* BW[7:6] FSCALE[5:3] ST[2:1] SIM */
+#define DS_CTRL6        0x25    /* BOOT FIFO_EN WTM_EN ADD_INC P1_EMPTY P1_WTM P1_OVERRUN P2_BOOT */
+#define DS_STATUS       0x27
+#define DS_OUT_X_L      0x28
+#define DS_OUT_Z_H      0x2d
+#define DS_FIFO_CTRL    0x2e    /* FMODE[7:5] WTMP[4:0] */
+#define DS_FIFO_SRC     0x2f    /* WTM OVRN EMPTY FSS[4:0] */
+
+static bool lis3dsh(const LIS302DLState *s)
+{
+    return s->whoami == ACCEL_WHOAMI_LIS3DSH;
+}
+
+static unsigned lis3dsh_mode(LIS302DLState *s)
+{
+    return s->ds_regs[DS_CTRL6] & 0x40 ? s->ds_regs[DS_FIFO_CTRL] >> 5 : 0;
+}
+
+/* The device's acceleration as the part reads it, in counts at the selected full scale. */
+static void lis3dsh_measure(LIS302DLState *s, int64_t now)
+{
+    static const double mg_per_digit[8] = { 0.06, 0.12, 0.18, 0.24, 0.73, 0.73, 0.73, 0.73 };
+    double g[3], m[3], cpg = 1000.0 / mg_per_digit[(s->ds_regs[DS_CTRL5] >> 3) & 7];
+    int64_t elapsed = now - s->shake_start_ns;
+
+    if (s->host_fields & 1) {
+        for (int i = 0; i < 3; i++) {
+            g[i] = -s->host_acceleration[i] / 9.80665;
+        }
+    } else if (lis302dl_moving(s, now)) {
+        lis302dl_gravity(s, now, g);
+    } else {
+        ipod_attitude_gravity(s->pitch_mdeg / 1000.0, s->roll_mdeg / 1000.0, s->flat_pose, g);
+    }
+    lis302dl_mount(s, g, m);
+    if (s->shake_start_ns >= 0 && elapsed >= 0 && elapsed < 200000000) {
+        double impulse = (elapsed / 20000000) & 1 ? -2 : 2;
+        m[0] = impulse;
+        m[1] = -impulse;
+        m[2] = impulse / 2;
+    } else {
+        s->shake_start_ns = -1;
+    }
+    for (int i = 0; i < 3; i++) {
+        /* a few counts of noise (the part's is ~0.1 mg rms); see lis302dl_sample's PRNG */
+        uint32_t x = s->noise_state ? s->noise_state : 0x302d1;
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        s->noise_state = x;
+        s->ds_sample[i] = CLAMP(lround(m[i] * cpg) + (int)(x % 5) - 2, INT16_MIN, INT16_MAX);
+    }
+}
+
+static uint8_t lis3dsh_fifo_src(LIS302DLState *s)
+{
+    uint8_t wtm = s->ds_regs[DS_FIFO_CTRL] & 0x1f;
+
+    /* WTM only with samples to read: AppleAP3DSH reads FSS of them and does nothing for 0, so a flag up on an
+     * empty FIFO would hold INT1 asserted (the gyro model's storm). FSS has five bits: a full FIFO reads 31. */
+    return (s->ds_level && s->ds_level >= MAX(wtm, 1) ? 0x80 : 0) | (s->ds_ovrn ? 0x40 : 0) |
+           (s->ds_level ? 0 : 0x20) | MIN(s->ds_level, 0x1f);
+}
+
+static void lis3dsh_update(LIS302DLState *s)
+{
+    uint8_t c3 = s->ds_regs[DS_CTRL3], c6 = s->ds_regs[DS_CTRL6], src = lis3dsh_fifo_src(s);
+    bool high = c3 & 0x40;
+    bool int1 = (c3 & 0x08) &&
+                (((c3 & 0x80) && (s->ds_regs[DS_STATUS] & 0x08)) || ((c6 & 0x04) && (src & 0x80)) ||
+                 ((c6 & 0x02) && (src & 0x40)) || ((c6 & 0x08) && (src & 0x20)));
+
+    qemu_set_irq(s->ds_pin[0], int1 == high);
+    qemu_set_irq(s->ds_pin[1], !high);
+}
+
+/* The sample at the head of the FIFO (or the latest one) into OUT_X..OUT_Z. */
+static void lis3dsh_load_out(LIS302DLState *s)
+{
+    const int16_t *v = lis3dsh_mode(s) && s->ds_level ? s->ds_fifo : s->ds_sample;
+
+    for (int i = 0; i < 3; i++) {
+        stw_le_p(&s->ds_regs[DS_OUT_X_L + 2 * i], v[i]);
+    }
+}
+
+static void lis3dsh_pop(LIS302DLState *s)
+{
+    if (lis3dsh_mode(s) && s->ds_level) {
+        memmove(s->ds_fifo, s->ds_fifo + 3, sizeof(s->ds_sample) * --s->ds_level);
+        s->ds_ovrn = false;
+    }
+    s->ds_regs[DS_STATUS] = 0;
+    lis3dsh_load_out(s);
+}
+
+static void lis3dsh_schedule(LIS302DLState *s)
+{
+    /* CTRL_REG4 ODR: power down, 3.125, 6.25, 12.5, 25, 50, 100, 400, 800, 1600 Hz */
+    static const int64_t period_ns[16] = {
+        0, 320000000, 160000000, 80000000, 40000000, 20000000, 10000000, 2500000, 1250000, 625000,
+    };
+    int64_t period = period_ns[s->ds_regs[DS_CTRL4] >> 4];
+
+    if (period && s->ds_timer) {
+        timer_mod(s->ds_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period);
+    } else if (s->ds_timer) {
+        timer_del(s->ds_timer);
+    }
+}
+
+static void lis3dsh_tick(void *opaque)
+{
+    LIS302DLState *s = opaque;
+    unsigned mode = lis3dsh_mode(s);
+
+    lis3dsh_measure(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (mode) {
+        if (s->ds_level == LIS3DSH_FIFO_SLOTS) {
+            s->ds_ovrn = true;
+            if (mode != 1) {             /* stream modes drop the oldest; FIFO mode stops */
+                memmove(s->ds_fifo, s->ds_fifo + 3, sizeof(s->ds_sample) * --s->ds_level);
+            }
+        }
+        if (s->ds_level < LIS3DSH_FIFO_SLOTS) {
+            memcpy(s->ds_fifo + 3 * s->ds_level++, s->ds_sample, sizeof(s->ds_sample));
+        }
+    }
+    s->ds_regs[DS_STATUS] = (s->ds_regs[DS_STATUS] & 0x08 ? 0xf0 : 0) | 0x0f;
+    lis3dsh_load_out(s);
+    lis3dsh_update(s);
+    lis3dsh_schedule(s);
+}
+
+static void lis3dsh_reset(LIS302DLState *s)
+{
+    if (s->ds_timer) {
+        timer_del(s->ds_timer);
+    }
+    memset(s->ds_regs, 0, sizeof(s->ds_regs));
+    s->ds_regs[DS_INFO1] = 0x21;
+    s->ds_regs[ACCEL_WHOAMI] = ACCEL_WHOAMI_LIS3DSH;
+    s->ds_regs[DS_CTRL4] = 0x07;         /* axes enabled, powered down */
+    s->ds_regs[DS_CTRL6] = 0x10;         /* ADD_INC */
+    s->ds_level = 0;
+    s->ds_ovrn = false;
+    memset(s->ds_sample, 0, sizeof(s->ds_sample));
+}
+
+static uint8_t lis3dsh_recv(LIS302DLState *s)
+{
+    uint8_t reg = s->cmd & 0x3f, v;
+    bool inc = (s->cmd & 0x80) || (s->ds_regs[DS_CTRL6] & 0x10);
+
+    v = reg == DS_FIFO_SRC ? lis3dsh_fifo_src(s) : s->ds_regs[reg];
+    if (lis302dl_debug()) {
+        TRACE_PRINTF(trace_lis302dl_log, "lis3dsh: read 0x%02x -> 0x%02x\n", reg, v);
+    }
+    if (inc) {
+        s->cmd = (s->cmd & 0x80) | (reg == DS_OUT_Z_H && lis3dsh_mode(s) ? DS_OUT_X_L : (reg + 1) & 0x3f);
+    }
+    if (reg == DS_OUT_Z_H) {
+        lis3dsh_pop(s);
+        lis3dsh_update(s);
+    }
+    return v;
+}
+
+static void lis3dsh_send(LIS302DLState *s, uint8_t data)
+{
+    uint8_t reg = s->cmd & 0x3f;
+
+    if (lis302dl_debug()) {
+        TRACE_PRINTF(trace_lis302dl_log, "lis3dsh: write 0x%02x <- 0x%02x\n", reg, data);
+    }
+    if ((s->cmd & 0x80) || (s->ds_regs[DS_CTRL6] & 0x10)) {
+        s->cmd = (s->cmd & 0x80) | ((reg + 1) & 0x3f);
+    }
+    if ((reg >= 0x10 && reg <= 0x1f) || (reg >= DS_CTRL4 && reg <= DS_CTRL6) || reg == DS_FIFO_CTRL ||
+        (reg >= 0x40 && reg <= 0x7f)) {
+        s->ds_regs[reg] = data;
+    }
+    if (reg == DS_CTRL6 && (data & 0x80)) {
+        s->ds_regs[DS_CTRL6] &= 0x7f;      /* BOOT reloads trim and clears itself */
+    }
+    if (reg == DS_FIFO_CTRL || reg == DS_CTRL6) {
+        if (!lis3dsh_mode(s)) {             /* bypass empties the FIFO */
+            s->ds_level = 0;
+            s->ds_ovrn = false;
+        }
+        lis3dsh_load_out(s);
+    }
+    lis3dsh_update(s);
+    if (reg == DS_CTRL4) {
+        lis3dsh_schedule(s);
+    }
+}
+
 static int lis302dl_event(I2CSlave *i2c, enum i2c_event event)
 {
     LIS302DLState *s = LIS302DL(i2c);
@@ -282,6 +507,9 @@ static uint8_t lis302dl_recv(I2CSlave *i2c)
     LIS302DLState *s = LIS302DL(i2c);
     uint8_t ret;
 
+    if (lis3dsh(s)) {
+        return lis3dsh_recv(s);
+    }
     /* Bit 7 of the pointer is the auto-increment flag on both parts; the
      * LIS331DLH driver sets it for its 16-bit OUT_X_L/H bursts. */
     uint8_t reg = s->cmd & 0x7f;
@@ -362,6 +590,10 @@ static int lis302dl_send(I2CSlave *i2c, uint8_t data)
     if (!s->pointer_set) {
         s->cmd = data;
         s->pointer_set = true;
+        return 0;
+    }
+    if (lis3dsh(s)) {
+        lis3dsh_send(s, data);
         return 0;
     }
 
@@ -493,6 +725,39 @@ static int lis302dl_post_load(void *opaque, int version)
     return 0;
 }
 
+static bool lis3dsh_needed(void *opaque)
+{
+    return lis3dsh(opaque);
+}
+
+static int lis3dsh_post_load(void *opaque, int version_id)
+{
+    LIS302DLState *s = opaque;
+
+    if (s->ds_level > LIS3DSH_FIFO_SLOTS) {
+        return -EINVAL;                     /* lis3dsh_pop moves ds_level slots */
+    }
+    lis3dsh_schedule(s);
+    return 0;
+}
+
+/* The LIS3DSH's own registers and FIFO, only where the part is one (other boards' states are unchanged). */
+static const VMStateDescription vmstate_lis3dsh = {
+    .name = "lis302dl/lis3dsh",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = lis3dsh_needed,
+    .post_load = lis3dsh_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(ds_regs, LIS302DLState, 0x40),
+        VMSTATE_UINT8(ds_level, LIS302DLState),
+        VMSTATE_BOOL(ds_ovrn, LIS302DLState),
+        VMSTATE_INT16_ARRAY(ds_fifo, LIS302DLState, LIS3DSH_FIFO_SLOTS * 3),
+        VMSTATE_INT16_ARRAY(ds_sample, LIS302DLState, 3),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 /* Shake is transient host input, not retained after restore: a restore
  * lands with the accelerometer at rest at its steady-state vector. */
 static const VMStateDescription vmstate_lis302dl = {
@@ -520,8 +785,34 @@ static const VMStateDescription vmstate_lis302dl = {
         VMSTATE_UINT32_V(rate_hz, LIS302DLState, 3),
         VMSTATE_UINT32_V(noise_state, LIS302DLState, 3),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_lis3dsh,
+        NULL
     }
 };
+
+static void lis302dl_realize(DeviceState *dev, Error **errp)
+{
+    LIS302DLState *s = LIS302DL(dev);
+
+    /* gpio-out 0/1: INT1/INT2, driven by the LIS3DSH only */
+    qdev_init_gpio_out(dev, s->ds_pin, 2);
+    if (lis3dsh(s)) {
+        s->ds_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, lis3dsh_tick, s);
+        lis3dsh_reset(s);
+    }
+}
+
+static void lis302dl_reset(DeviceState *dev)
+{
+    LIS302DLState *s = LIS302DL(dev);
+
+    if (lis3dsh(s)) {
+        lis3dsh_reset(s);
+        lis3dsh_update(s);
+    }
+}
 
 static const Property lis302dl_properties[] = {
     DEFINE_PROP_UINT8("whoami", LIS302DLState, whoami, ACCEL_WHOAMI_VALUE),
@@ -534,6 +825,8 @@ static void lis302dl_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &vmstate_lis302dl;
+    dc->realize = lis302dl_realize;
+    device_class_set_legacy_reset(dc, lis302dl_reset);
     device_class_set_props(dc, lis302dl_properties);
     I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
 
