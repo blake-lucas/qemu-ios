@@ -7877,6 +7877,10 @@ static bool gles_es2_emit_vertices(uint32_t count)
  * program never samples the unit), with the original's filtering and wrapping,
  * and the original goes back right after. Draws without a loop are untouched.
  */
+#ifndef GL_TEXTURE_WIDTH
+#define GL_TEXTURE_WIDTH  0x1000        /* ES 3.1 glGetTexLevelParameteriv */
+#define GL_TEXTURE_HEIGHT 0x1001
+#endif
 typedef struct GLESFeedbackUndo {
     unsigned unit;
     GLuint native;
@@ -7884,53 +7888,75 @@ typedef struct GLESFeedbackUndo {
 
 static unsigned gles_feedback_begin(GLESFeedbackUndo undo[4])
 {
-    GLESEGLTexture *target = NULL;
-    GLint active = GL_TEXTURE0, min = GL_LINEAR, mag = GL_LINEAR, ws = GL_REPEAT, wt = GL_REPEAT;
-    unsigned n = 0;
+    /* Everything here asks the host itself, through the raw driver entries,
+     * in host names: on the A6 the guest's binds and attachments are forwarded
+     * past the bridge's own tracking (texture_units said unit 0 held 3 or 1024
+     * while the host had the target bound there), so a loop detected from the
+     * tracking was found once by chance and missed after. */
+    typedef void (*GetLevel)(GLenum, GLint, GLenum, GLint *);
+    static GetLevel get_level;
+    static bool looked;
     static unsigned said;
+    GLint fb = 0, type = 0, attached = 0, level = 0, active = GL_TEXTURE0;
+    GLint min = GL_LINEAR, mag = GL_LINEAR, ws = GL_REPEAT, wt = GL_REPEAT, w = 0, h = 0;
+    unsigned n = 0;
 
-    GLint fb = 0, attached = 0, type = 0, level = 0;
-
-    if (gh.api_version != 2 || !gles_egl_current) {
+    if (gh.api_version != 2) {
         return 0;
     }
-    /* Asked at the draw, not from the noted target: the A6's forwarded calls
-     * can change attachments without passing the bridge's bookkeeping (a loop
-     * on the Pixel went uncopied that way). Only the bound target's color name
-     * is asked unless it matches a unit. */
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+    GLES_DRIVER_RAW(glGetIntegerv)(GL_FRAMEBUFFER_BINDING, &fb);
     if (!fb) {
         return 0;
     }
-    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &attached);
-    if (!attached) {
+    GLES_DRIVER_RAW(glGetFramebufferAttachmentParameteriv)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if (type != GL_TEXTURE) {                   /* the drawable's renderbuffer: one query, done */
         return 0;
     }
-    for (unsigned unit = 0; unit < G_N_ELEMENTS(gles_egl_current->texture_units) && n < 4; unit++) {
-        GLESEGLTexture *t = gles_egl_current->texture_units[unit].object_2d;
-        if (t && t->native_name == (GLuint)attached) {
-            target = t;
+    GLES_DRIVER_RAW(glGetFramebufferAttachmentParameteriv)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &attached);
+    GLES_DRIVER_RAW(glGetFramebufferAttachmentParameteriv)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                          GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
+    if (!attached || level != 0) {              /* the copy is of level 0 */
+        return 0;
+    }
+    gles_native_save_errors();                  /* the guest's errors stay the guest's */
+    GLES_DRIVER_RAW(glGetIntegerv)(GL_ACTIVE_TEXTURE, &active);
+    for (unsigned unit = 0; unit < GLES_MAX_TEXUNITS && n < 4; unit++) {
+        GLint bound = 0;
+
+        glActiveTexture(GL_TEXTURE0 + unit);
+        GLES_DRIVER_RAW(glGetIntegerv)(GL_TEXTURE_BINDING_2D, &bound);
+        if (bound == attached) {
             undo[n].unit = unit;
-            undo[n].native = t->native_name;
+            undo[n].native = (GLuint)bound;
             n++;
         }
     }
     if (!n) {
+        glActiveTexture(active);
+        while (gles_native_driver_error() != GL_NO_ERROR) {
+        }
         return 0;
     }
-    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
-    if (type == GL_TEXTURE) {
-        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                              GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
+    /* The target's size: ES 3.1's glGetTexLevelParameteriv (both phones'
+     * hosts are ES 3.2), else the viewport, which a pass into a texture sets
+     * to it. */
+    if (!looked) {
+        looked = true;
+        get_level = (GetLevel)eglGetProcAddress("glGetTexLevelParameteriv");
     }
-    if (type != GL_TEXTURE || level != 0) {     /* a renderbuffer of that name, or another level */
-        return 0;
-    }
-    gles_native_save_errors();      /* the guest's errors stay the guest's */
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
     glActiveTexture(GL_TEXTURE0 + undo[0].unit);
+    if (get_level) {
+        get_level(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+        get_level(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    }
+    if (w <= 0 || h <= 0) {
+        GLint vp[4] = { 0 };
+        GLES_DRIVER_RAW(glGetIntegerv)(GL_VIEWPORT, vp);
+        w = vp[0] == 0 ? vp[2] : 0;
+        h = vp[1] == 0 ? vp[3] : 0;
+    }
     GLES_DRIVER_RAW(glGetTexParameteriv)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &min);
     GLES_DRIVER_RAW(glGetTexParameteriv)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &mag);
     GLES_DRIVER_RAW(glGetTexParameteriv)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws);
@@ -7949,11 +7975,11 @@ static unsigned gles_feedback_begin(GLESFeedbackUndo undo[4])
     GLES_DRIVER_RAW(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag);
     GLES_DRIVER_RAW(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws);
     GLES_DRIVER_RAW(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt);
-    if (target->width && target->height) {
+    if (w > 0 && h > 0) {
         /* The target is the read framebuffer too (ES 2 has one binding). */
-        GLES_DRIVER_RAW(glCopyTexImage2D)(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, target->width, target->height, 0);
+        GLES_DRIVER_RAW(glCopyTexImage2D)(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, w, h, 0);
         if (gles_native_driver_error() != GL_NO_ERROR) {     /* a target without alpha */
-            GLES_DRIVER_RAW(glCopyTexImage2D)(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, target->width, target->height, 0);
+            GLES_DRIVER_RAW(glCopyTexImage2D)(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, w, h, 0);
         }
     }
     for (unsigned i = 1; i < n; i++) {
@@ -7972,7 +7998,7 @@ static unsigned gles_feedback_begin(GLESFeedbackUndo undo[4])
         int64_t now = g_get_monotonic_time();
 
         copies++;
-        pixels += (uint64_t)target->width * target->height;
+        pixels += (uint64_t)MAX(w, 0) * MAX(h, 0);
         if (now >= next && copies != reported) {
             if (next) {
                 fprintf(stderr, "[gles] feedback loops: %" PRIu64 " draws sampled a copy so far "
@@ -7982,12 +8008,11 @@ static unsigned gles_feedback_begin(GLESFeedbackUndo undo[4])
             next = now + 10 * G_USEC_PER_SEC;
         }
     }
-    if (said < 8) {
+    if (said < 16) {
         said++;
-        fprintf(stderr, "[gles] feedback loop: framebuffer %u draws into texture %u (host %u, %ux%u) "
+        fprintf(stderr, "[gles] feedback loop: framebuffer %u (host %d) draws into texture %d (%dx%d) "
                 "that unit %u samples; the draw samples a copy (PowerVR's glDrawArrays crashed on such a draw)\n",
-                gh.bound_framebuffer, target->name, target->native_name, target->width, target->height,
-                undo[0].unit);
+                gh.bound_framebuffer, fb, attached, w, h, undo[0].unit);
     }
     return n;
 }
@@ -7999,7 +8024,7 @@ static void gles_feedback_end(const GLESFeedbackUndo *undo, unsigned n)
     if (!n) {
         return;
     }
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    GLES_DRIVER_RAW(glGetIntegerv)(GL_ACTIVE_TEXTURE, &active);
     for (unsigned i = 0; i < n; i++) {
         glActiveTexture(GL_TEXTURE0 + undo[i].unit);
         GLES_DRIVER_RAW(glBindTexture)(GL_TEXTURE_2D, undo[i].native);
