@@ -3372,6 +3372,12 @@ static void gles_check_fb_complete(void)
      * The cost is one glCheckFramebufferStatus per render-target change rather
      * than per draw, which is nothing.
      */
+#ifdef GLES_HOST_EGL_ES
+    /* gles_draw_target_ok owns fb_dirty here: it checks before the draw and
+     * notes the target's color texture with it, so clearing the flag behind
+     * its back (a draw path it doesn't gate) would leave that note stale. */
+    return;
+#endif
     if (!gh.fb_dirty) {
         return;
     }
@@ -3417,8 +3423,16 @@ static bool gles_draw_target_ok(const char *what, uint32_t mode, uint32_t count)
             glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                                   GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
             if (type == GL_TEXTURE) {
+                GLint level = 0;
+
                 glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                                      GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+                                                      GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
+                /* gles_feedback_begin copies level 0: a draw into another
+                 * level that samples the same texture is left as it was. */
+                if (level == 0) {
+                    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+                }
             }
             gh.fb_color_texture = name;
         }
