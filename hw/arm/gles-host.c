@@ -595,6 +595,7 @@ typedef struct {
     uint32_t palette_current;
     float palette[GLES_MAX_PALETTE][16];
     float *skin;
+    GLfloat skin_modelview[16];     /* the guest's modelview while a skinned draw runs on identity */
     size_t skin_size;
 
     /* Scratch for glDrawElements' index list. */
@@ -2234,6 +2235,7 @@ static void gles_draw_tex(float x, float y, float z, float w, float h)
     GLint vp[4], mode = 0, active = 0;
     float s0[GLES_MAX_TEXUNITS], s1[GLES_MAX_TEXUNITS];
     float t0[GLES_MAX_TEXUNITS], t1[GLES_MAX_TEXUNITS];
+    GLfloat projection[16], modelview[16];
     bool on[GLES_MAX_TEXUNITS];
     unsigned u;
     float zn;
@@ -2270,12 +2272,13 @@ static void gles_draw_tex(float x, float y, float z, float w, float h)
     glPushAttrib(GL_ENABLE_BIT);
     glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE);
+    /* Saved and loaded back rather than pushed: a guest may have filled the host's stacks (gles_matrix_push). */
     glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
+    glGetFloatv(GL_PROJECTION_MATRIX, projection);
     glLoadIdentity();
     glOrtho(vp[0], vp[0] + vp[2], vp[1], vp[1] + vp[3], -1, 1);
     glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
+    glGetFloatv(GL_MODELVIEW_MATRIX, modelview);
     glLoadIdentity();
 
     glBegin(GL_QUADS);
@@ -2295,9 +2298,9 @@ static void gles_draw_tex(float x, float y, float z, float w, float h)
     }
     glEnd();
 
-    glPopMatrix();
+    glLoadMatrixf(modelview);
     glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
+    glLoadMatrixf(projection);
     glMatrixMode(mode);
     glPopAttrib();
 #else
@@ -2421,7 +2424,7 @@ static uint32_t gles_skin(CPUState *cpu, uint32_t first, uint32_t count)
     }
     glGetIntegerv(GL_MATRIX_MODE, &mode);
     glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
+    glGetFloatv(GL_MODELVIEW_MATRIX, gh.skin_modelview);   /* not pushed: the guest may have filled the stack */
     glLoadIdentity();
     glMatrixMode(mode);
     return 1u | (normals ? 4u : 0) | 1u << GLES_SKIN_BIT;
@@ -3634,7 +3637,7 @@ static void gles_unbind_arrays(uint32_t bound)
         GLint mode = GL_MODELVIEW;
         glGetIntegerv(GL_MATRIX_MODE, &mode);
         glMatrixMode(GL_MODELVIEW);
-        glPopMatrix();
+        glLoadMatrixf(gh.skin_modelview);
         glMatrixMode(mode);
     }
     gh.t_arrays += gles_t() - t0;
@@ -5212,6 +5215,10 @@ static bool gles_vao_bind(GLESHost *h, uint32_t name)
  * depth queries add what the bridge keeps, and the maximum depths read at least GLES_KEPT_MATRICES, which the front
  * end lowers to the guest GPU's own. A snapshot saves the host's stacks only: one taken with matrices kept here
  * resumes without them (the desktop hosts that save snapshots have deep stacks: Mesa's are 32, 32 and 10).
+ *
+ * The bridge's own matrix changes (gles_palette_call, gles_skin, gles_draw_tex) save and load back the live matrix
+ * rather than push it, so a guest that fills a stack (Field & Stream Fishing's reel scene pushes its modelview without
+ * popping until the host's 32 are full) can't make them overwrite its matrices.
  *
  * IT_GLES_HOST_STACK_DEPTH=N treats every host stack as N deep, to exercise this on a host with deep stacks.
  */
@@ -8272,10 +8279,13 @@ static bool gles_palette_op(uint32_t slot)
 
 /* A gles_palette_op slot in MATRIX_PALETTE_OES mode: the call itself, run on the host's modelview loaded with the
  * current palette matrix, which takes the result; the modelview and the host's matrix mode are put back. The
- * palette has no stack (the extension: "Not required"), so a push overflows and a pop underflows it. */
+ * palette has no stack (the extension: "Not required"), so a push overflows and a pop underflows it. The modelview
+ * is saved and loaded back, not pushed: Field & Stream Fishing's reel scene leaves the modelview stack full (it
+ * pushes more than it pops), and a refused push here wrote the palette matrix over the guest's modelview. */
 static int64_t gles_palette_call(CPUState *cpu, uint32_t slot, uint32_t ctx, uint32_t argc, const uint32_t *a)
 {
     GLint mode = GL_MODELVIEW;
+    GLfloat modelview[16];
     int64_t r;
 
     if (slot == GLES_SLOT_PUSH_MATRIX || slot == GLES_SLOT_POP_MATRIX) {
@@ -8283,13 +8293,13 @@ static int64_t gles_palette_call(CPUState *cpu, uint32_t slot, uint32_t ctx, uin
     }
     glGetIntegerv(GL_MATRIX_MODE, &mode);
     glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
+    glGetFloatv(GL_MODELVIEW_MATRIX, modelview);
     glLoadMatrixf(gh.palette[gh.palette_current]);
     gh.palette_mode = false;
     r = gles_host_call_1(cpu, slot, ctx, argc, a);
     gh.palette_mode = true;
     glGetFloatv(GL_MODELVIEW_MATRIX, gh.palette[gh.palette_current]);
-    glPopMatrix();
+    glLoadMatrixf(modelview);
     glMatrixMode(mode);
     return r;
 }
