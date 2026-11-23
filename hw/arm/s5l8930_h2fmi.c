@@ -1332,9 +1332,12 @@ static void s5l8930_h2fmi_realize(DeviceState *dev, Error **errp)
     if (s->cdma) {
         s5l8930_cdma_set_source(s->cdma, s->mmio_base,
                                 H2FMI_BUSES * H2FMI_WINDOW, h2fmi_fifo_avail, s);
-        /* The A6's PPN transfers keep the per-access path: its PPN modes (aux reads, feature writes, status)
-         * are decided in h2fmi_read/h2fmi_write, which the bulk copy skips. */
-        if (!s->ppn) {
+        /* PPN too: the bulk copy only takes the DATA and META windows, with the same FIFO push/pop and
+         * h2fmi_write_check/h2fmi_drain the per-access path runs after each word, so the PPN modes (aux
+         * reads, feature writes, the sequencer's tasks) see the same bytes; status and sequencer registers
+         * stay per-access. LT_PPN_BULK=off keeps a word per access (A/B). */
+        const char *ppn_bulk = getenv("LT_PPN_BULK");
+        if (!s->ppn || !(ppn_bulk && (!strcmp(ppn_bulk, "off") || !strcmp(ppn_bulk, "0")))) {
             s5l8930_cdma_set_bulk(s->cdma, s->mmio_base, h2fmi_fifo_bulk);
         }
     }
