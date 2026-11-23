@@ -17,6 +17,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "qemu/main-loop.h"
 #include "accel/tcg/probe.h"
 #include "accel/tcg/cpu-mmu-index.h"
 #include "exec/target_page.h"
@@ -25,6 +26,56 @@
 #include "hw/arm/gles-present.h"
 
 void (*gles_present_wait_hook)(void);
+
+/* The BQL protects guest access and renderer bookkeeping. Native drawing
+ * needs neither, but another GL caller must not change the active context or
+ * reuse its scratch arrays while it runs. Waiters release the BQL, allowing
+ * timers, network I/O and other vCPUs to progress during that native work.
+ * Reset and migration stop all vCPUs before touching renderer state. */
+static QemuCond gles_execution_cond;
+static bool gles_execution_initialized, gles_execution_busy;
+static __thread bool gles_execution_owner;
+
+static void gles_execution_enter(void)
+{
+    assert(bql_locked());
+    assert(!gles_execution_owner);
+    if (!gles_execution_initialized) {
+        qemu_cond_init(&gles_execution_cond);
+        gles_execution_initialized = true;
+    }
+    while (gles_execution_busy) {               /* a call in progress ends without waiting on this vCPU */
+        qemu_cond_wait_bql(&gles_execution_cond);
+    }
+    gles_execution_busy = gles_execution_owner = true;
+}
+
+static void gles_execution_leave(void)
+{
+    assert(bql_locked() && gles_execution_owner);
+    gles_execution_busy = gles_execution_owner = false;
+    qemu_cond_broadcast(&gles_execution_cond);
+}
+
+bool gles_native_begin(void)
+{
+    /* Direct host-side tests do not enter through the guest executor; a call past the gate may already run
+     * without the BQL (qc_handle_gles). */
+    if (!gles_execution_owner || !bql_locked()) {
+        return false;
+    }
+    assert(bql_locked());
+    bql_unlock();
+    return true;
+}
+
+void gles_native_end(bool unlocked)
+{
+    if (unlocked) {
+        bql_lock();
+        assert(gles_execution_owner);
+    }
+}
 
 /*
  * Guest memory behind the pointers a GL call hands the host (client arrays,
@@ -226,7 +277,7 @@ static int64_t gles_run_batch(CPUState *cpu, qc_gles_args_t *a)
     return 0;
 }
 
-int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
+static int64_t gles_handle_call(CPUState *cpu, qc_gles_args_t *a)
 {
     if (a->slot == GLES_OP_BATCH) {
         return gles_run_batch(cpu, a);
@@ -277,7 +328,6 @@ int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
             if (!gf.pending) {
                 gles_host_refuse("guest-read:spill:%u", a->slot);
             }
-            gles_guest_fault_in(cpu);
             return -1;
         }
     }
@@ -302,8 +352,48 @@ int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
     }
 
     int64_t r = gles_host_call(cpu, a->slot, a->ctx, argc, args);
-    gles_guest_fault_in(cpu);
     return r;
+}
+
+int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
+{
+    /* The gate serializes the A6's two vCPUs, whose QEMU_CALL holds the BQL. The other boards' QEMU_CALL runs
+     * GL calls without it (qemu_call_needs_bql): one vCPU drives the bridge there, so it needs no gate. */
+    bool gate = bql_locked();
+
+    if (gate) {
+        gles_execution_enter();
+    }
+    /* Past the gate the call runs without the BQL, as the other boards run it: this bridge's GL queue thread
+     * takes the BQL for some calls while the caller waits for it, so a caller holding it hangs the machine.
+     * Context setup and teardown keep it (qemu_call_needs_bql). */
+    bool unlocked = gate && !(a->slot >= GLES_OP_NEW_SHAREGROUP && a->slot <= GLES_OP_DELETE_CONTEXT);
+    if (unlocked) {
+        bql_unlock();
+    }
+    /* The A6's stall check (MachineClass clock_waits_for_vcpus) slows the VM clock while a vCPU that isn't idle
+     * reaches no TB boundary. A vCPU in a GL call is waiting on the host renderer, not spinning on a guest lock:
+     * it counts as idle, or every llvmpipe draw of a few milliseconds would slow the guest's clock to 1/16. */
+    if (gate) {
+        qatomic_set(&cpu->idle, true);
+    }
+    gf.armed = gf.pending = false;
+    int64_t result = gles_handle_call(cpu, a);
+    if (gate) {
+        qatomic_set(&cpu->exec_seen, true);
+        qatomic_set(&cpu->idle, false);
+    }
+    if (unlocked) {
+        bql_lock();
+    }
+    if (gate) {
+        gles_execution_leave();
+    }
+    /* A guest data abort can longjmp out of this helper. Release the renderer
+     * gate first, while still holding the BQL, so that fault retries cannot
+     * strand the gate or let another caller overwrite the pending fault. */
+    gles_guest_fault_in(cpu);
+    return result;
 }
 
 void qc_gles_dump_stats(void)

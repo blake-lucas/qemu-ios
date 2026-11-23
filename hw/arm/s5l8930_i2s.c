@@ -38,6 +38,7 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include "qemu/log.h"
+#include "qemu/host-utils.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -101,11 +102,15 @@ struct S5L8930I2SState {
 
     uint32_t regs[I2S_REGS_SIZE / 4];
     bool audio_out;                 /* property: this port reaches the host (out and in) */
+    bool audio_in;                  /* MCA capture endpoint, separate from speaker feedback */
     /* property "ctrl-run": the S5L8920's controller, which its driver starts with CTRL bit 0
      * (0x7900101) and stops by clearing it (0x7900000, then 0), leaving +0x08 at its frame
      * format (0x78057805); the A4's starts with TXCOM = 6. */
     bool ctrl_run;
     bool host_mic;                  /* property: the frontend's microphone is this port's input */
+    bool mca;                      /* A6 MCA register layout, shared PCM backend */
+    uint32_t frame_rate;            /* virtual external frame clock for MCA */
+    unsigned out_channels, out_bytes;
     uint8_t port;                   /* property: i2s<port>, selects its NCO */
     Clock *lrclk;                   /* in: the codec's frame clock, followed while the port is the slave */
     CS42L58State *codec;            /* link: the codec this port feeds, whose output volume the host hears */
@@ -122,7 +127,7 @@ struct S5L8930I2SState {
     uint32_t in_head, in_tail, in_level;
     uint64_t tone_frame;            /* frames of the synthetic tone handed out */
     unsigned in_rate;
-    uint8_t rx_frame[4];            /* the stereo S16 frame being read out */
+    uint8_t rx_frame[32 * 4];        /* up to 32 MCA slots, S16 or padded S32 */
     unsigned rx_pos;                /* bytes of rx_frame already read */
 
     AudioBackend *audio_be;
@@ -132,7 +137,25 @@ struct S5L8930I2SState {
 
 /* Each port's block, for the CDMA's pacing. ponytail: one machine per process;
  * a link property from the CDMA if that ever changes. */
-static S5L8930I2SState *i2s_ports[3];
+static S5L8930I2SState *i2s_ports[8];
+
+/* Original AppleAE2MCA programs +8 with TX/RX padding and +24/+38
+ * with the active channel masks (11A465, 80bd5ace/5c7c/5d00). */
+static unsigned i2s_channels(S5L8930I2SState *s, bool input)
+{
+    return s->mca ? MAX(1, ctpop32(s->regs[(input ? 0x38 : 0x24) >> 2])) : 2;
+}
+
+static unsigned i2s_sample_bytes(S5L8930I2SState *s, bool input)
+{
+    return s->mca && ((s->regs[8 >> 2] >> (input ? 8 : 0)) & 0xff) < 16 ? 4 : 2;
+}
+
+unsigned s5l8930_i2s_frame_bytes(unsigned port, bool input)
+{
+    S5L8930I2SState *s = port < ARRAY_SIZE(i2s_ports) ? i2s_ports[port] : NULL;
+    return s ? i2s_channels(s, input) * i2s_sample_bytes(s, input) : 4;
+}
 
 /*
  * The S5L8920's frame rate: the audio complex's NCO makes MCLK from its
@@ -170,6 +193,40 @@ static bool i2s_frame_master(S5L8930I2SState *s)
                        : !(s->regs[I2S_TXCON >> 2] & I2S_TXCON_EXT_CLK);
 }
 
+/*
+ * The A6 MCA's frame rate. Its clock comes from outside (the speaker port's NCO is never programmed and the CS42L65's
+ * writes are the same at every rate), so the one place the guest's rate reaches the port is its FIFO watermarks:
+ * 14G61 AppleAE2MCA (810c0f90, written at 810bfe5e/810bfe72) sets +0x20 (TX) and +0x34 (RX) bits 16-31 to one less
+ * than (rate * channels / 2000 + 3) & ~3, so 44 (0x2b) for stereo 44.1 kHz and 48 (0x2f) for 48 kHz, as the Bedtime
+ * wake sounds play. The first standard rate both programmed watermarks agree with, 44.1 kHz first where they can't
+ * tell (mono TX: 24 for both); frame-rate until the guest has programmed one, or if none fits.
+ */
+static unsigned i2s_mca_rate(S5L8930I2SState *s)
+{
+    static const unsigned rates[] = {44100, 48000, 8000, 16000, 32000, 22050, 24000, 11025, 12000, 88200, 96000};
+    static const unsigned config[] = {0x20, 0x34};
+    bool programmed = false;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(rates); i++) {
+        bool fits = true;
+
+        for (unsigned d = 0; d < ARRAY_SIZE(config); d++) {
+            uint32_t v = s->regs[config[d] >> 2];
+            unsigned mark = (rates[i] * i2s_channels(s, d) / 2000 + 3) & ~3u;
+
+            programmed |= v != 0;
+            fits &= !v || (v >> 16) + 1 == mark;
+        }
+        if (!programmed) {
+            break;
+        }
+        if (fits) {
+            return rates[i];
+        }
+    }
+    return s->frame_rate;
+}
+
 unsigned s5l8930_i2s_rate(unsigned port)
 {
     S5L8930I2SState *s;
@@ -181,6 +238,10 @@ unsigned s5l8930_i2s_rate(unsigned port)
     s = i2s_ports[port];
     if (!s) {
         return 44100;
+    }
+    if (s->mca) {
+        unsigned hz = clock_get_hz(s->lrclk);
+        return hz ? hz : i2s_mca_rate(s);
     }
     if (!i2s_frame_master(s) || s->nco_ref_hz) {
         /* ponytail: no clock connected or none driven yet plays at 44.1 kHz, where the hardware would stall.
@@ -233,36 +294,46 @@ static void i2s_set_in_rate(S5L8930I2SState *s, unsigned rate)
     }
 }
 
-/* Next captured stereo S16 frame: the tone, the host's input, or silence. */
+/* Capture stays stereo S16 at the shared QEMU backend. The virtual codec
+ * mirrors that pair into additional MCA receive slots; this supplies a host
+ * microphone, not a model of the physical device's microphone array. Next captured frame: the tone, the
+ * host's input, or silence; stereo S16, or the A6 MCA port's slots. */
 static void i2s_next_frame(S5L8930I2SState *s)
 {
+    uint8_t stereo[4] = {0};
+
     if (s->tone_hz) {
         double t = (double)s->tone_frame++ / (s->in_rate ? s->in_rate : 44100);
         int16_t v = TONE_AMPLITUDE * sin(2 * M_PI * s->tone_hz * t);
 
-        stw_le_p(s->rx_frame, v);
-        stw_le_p(s->rx_frame + 2, v);
-        return;
-    }
-    /* The frontend's microphone comes first, not as a fallback. A phone's engine has no real input
-     * voice -- the audio backend is `driver=none` -- but that backend's input voice still OPENS
-     * (audio/noaudio.c: max_voices_in, no_init_in, no_read) and then hands out silence paced at the
-     * port's rate, so the voice's ring below is never empty and a capture read out of it hears
-     * nothing. host_mic_read_frame() is false when the frontend pushed nothing (the Mac, where
-     * coreaudio -- not this ring -- is the input, or a phone with the switch off), and only then is
-     * the voice's ring, exactly as before. */
-    if (s->host_mic && host_mic_read_frame(s->rx_frame)) {
-        return;
-    }
-    if (s->in_level >= 4) {
+        stw_le_p(stereo, v);
+        stw_le_p(stereo + 2, v);
+    } else if (s->host_mic && host_mic_read_frame(stereo)) {
+        /* The frontend's microphone comes first, not as a fallback. A phone's engine has no real input
+         * voice -- the audio backend is `driver=none` -- but that backend's input voice still OPENS
+         * (audio/noaudio.c: max_voices_in, no_init_in, no_read) and then hands out silence paced at the
+         * port's rate, so the voice's ring below is never empty and a capture read out of it hears
+         * nothing. host_mic_read_frame() is false when the frontend pushed nothing (the Mac, where
+         * coreaudio -- not this ring -- is the input, or a phone with the switch off), and only then is
+         * the voice's ring, exactly as before. */
+    } else if (s->in_level >= 4) {
         for (int i = 0; i < 4; i++) {
-            s->rx_frame[i] = s->in_ring[s->in_tail];
+            stereo[i] = s->in_ring[s->in_tail];
             s->in_tail = (s->in_tail + 1) % I2S_RING;
         }
         s->in_level -= 4;
-        return;
     }
-    memset(s->rx_frame, 0, 4);
+    unsigned bytes = i2s_sample_bytes(s, true);
+    for (unsigned ch = 0; ch < i2s_channels(s, true); ch++) {
+        uint16_t sample = lduw_le_p(stereo + (ch % 2) * 2);
+        if (bytes == 4) {
+            /* Native Codec mono input advertises 16 valid bits in a four-byte
+             * word, signed, without the aligned-high format flag. */
+            stl_le_p(s->rx_frame + ch * bytes, (uint32_t)(int32_t)(int16_t)sample);
+        } else {
+            stw_le_p(s->rx_frame + ch * bytes, sample);
+        }
+    }
 }
 
 static uint64_t i2s_rx_read(S5L8930I2SState *s, unsigned size)
@@ -274,7 +345,8 @@ static uint64_t i2s_rx_read(S5L8930I2SState *s, unsigned size)
             i2s_next_frame(s);
         }
         v |= (uint64_t)s->rx_frame[s->rx_pos] << (8 * i);
-        s->rx_pos = (s->rx_pos + 1) % 4;
+        s->rx_pos = (s->rx_pos + 1) %
+                    (i2s_channels(s, true) * i2s_sample_bytes(s, true));
     }
     return v;
 }
@@ -329,6 +401,9 @@ static void i2s_out_cb(void *opaque, int free_bytes)
 
 static bool i2s_tx_running(S5L8930I2SState *s)
 {
+    if (s->mca) {
+        return s->regs[0x18 >> 2] & 1;
+    }
     return s->ctrl_run ? s->regs[I2S_CTRL >> 2] & 1 : s->regs[I2S_TXCOM >> 2] == I2S_CMD_RUN;
 }
 
@@ -392,11 +467,14 @@ uint32_t s5l8930_i2s_tx_bulk(hwaddr fifo, const uint8_t *buf, uint32_t len)
 
 static void i2s_set_rate(S5L8930I2SState *s, unsigned rate)
 {
+    unsigned channels = i2s_channels(s, false);
+    unsigned bytes = i2s_sample_bytes(s, false);
     struct audsettings as = {
-        .freq = rate, .nchannels = 2, .fmt = AUDIO_FORMAT_S16, .big_endian = false,
+        .freq = rate, .nchannels = channels,
+        .fmt = bytes == 4 ? AUDIO_FORMAT_S32 : AUDIO_FORMAT_S16, .big_endian = false,
     };
 
-    if (rate == s->rate) {
+    if (rate == s->rate && channels == s->out_channels && bytes == s->out_bytes) {
         return;
     }
     s->voice = audio_be_open_out(s->audio_be, s->voice, "s5l8930-i2s.out", s,
@@ -406,12 +484,21 @@ static void i2s_set_rate(S5L8930I2SState *s, unsigned rate)
         /* Reopened, the voice is inactive: a change while TX runs left it silent. */
         audio_be_set_active_out(s->audio_be, s->voice, i2s_tx_running(s));
         s->rate = rate;
+        s->out_channels = channels;
+        s->out_bytes = bytes;
     }
 }
 
 static uint64_t i2s_read(void *opaque, hwaddr offset, unsigned size)
 {
     S5L8930I2SState *s = opaque;
+
+    if (s->mca) {
+        if (offset == 0x3c) {
+            return s->audio_in && (s->regs[0x2c >> 2] & 1) ? i2s_rx_read(s, size) : 0;
+        }
+        return offset == 0x28 ? 0 : s->regs[offset >> 2];
+    }
 
     if (offset == I2S_CTRL) {
         /* Bit 1: TX drained. The stop path (7B500 c086f5ae) writes 0x300 to
@@ -463,6 +550,60 @@ static void i2s_write(void *opaque, hwaddr offset, uint64_t value,
                       unsigned size)
 {
     S5L8930I2SState *s = opaque;
+
+    if (s->mca) {
+        if (offset == 0x28) {
+            if (s->voice && i2s_tx_running(s)) {
+                i2s_push(s, value, size);
+            }
+            return;
+        }
+        if (offset == 0x40) { /* native interrupt handler uses W1C */
+            s->regs[offset >> 2] &= ~value;
+            return;
+        }
+        if (offset == 0x44 || offset == 0x48) {
+            /* Native setup writes 301 to +44 and waits for zero; TX stop
+             * writes 1 (80bd60ba). Reset the FIFO, retaining format words. */
+            if ((offset == 0x48 && (value & 1)) ||
+                (offset == 0x44 && (value & 0x101))) {
+                s->regs[0x18 >> 2] &= ~1u;
+                s->head = s->tail = s->level = 0;
+                if (s->voice) {
+                    audio_be_set_active_out(s->audio_be, s->voice, false);
+                }
+            }
+            if ((offset == 0x48 && (value & 1)) ||
+                (offset == 0x44 && (value & 0x202))) {
+                s->regs[0x2c >> 2] &= ~1u;
+                s->in_head = s->in_tail = s->in_level = s->rx_pos = 0;
+                if (s->voice_in) {
+                    audio_be_set_active_in(s->audio_be, s->voice_in, false);
+                }
+            }
+            return;
+        }
+        s->regs[offset >> 2] = value;
+        if (offset == 0x2c && s->audio_in) {
+            bool run = value & 1;
+            if (run) {
+                i2s_set_in_rate(s, s5l8930_i2s_rate(s->port));
+                s->rx_pos = 0;
+            }
+            if (s->voice_in) {
+                audio_be_set_active_in(s->audio_be, s->voice_in, run);
+            }
+        }
+        if (offset == 0x18 && s->audio_out) {
+            if (i2s_tx_running(s)) {
+                i2s_set_rate(s, s5l8930_i2s_rate(s->port));
+            }
+            if (s->voice) {
+                audio_be_set_active_out(s->audio_be, s->voice, i2s_tx_running(s));
+            }
+        }
+        return;
+    }
 
     if (offset == I2S_TXFIFO) {
         if (s->voice && i2s_tx_running(s)) {
@@ -539,17 +680,23 @@ static void s5l8930_i2s_realize(DeviceState *dev, Error **errp)
 {
     S5L8930I2SState *s = S5L8930_I2S(dev);
 
+    if (s->mca && (s->frame_rate < 8000 || s->frame_rate > 192000)) {
+        error_setg(errp, "MCA frame-rate must be between 8000 and 192000 Hz");
+        return;
+    }
     if (s->port < ARRAY_SIZE(i2s_ports)) {
         i2s_ports[s->port] = s;
     }
-    if (!s->audio_out) {
+    if (!s->audio_out && !s->audio_in) {
         return;
     }
     if (!audio_be_check(&s->audio_be, errp)) {
         warn_report("s5l8930 i2s: no audio backend; output dropped");
         return;
     }
-    i2s_set_rate(s, 44100);
+    if (s->audio_out) {
+        i2s_set_rate(s, 44100);
+    }
 }
 
 static void s5l8930_i2s_reset(DeviceState *dev)
@@ -607,8 +754,11 @@ static const VMStateDescription vmstate_s5l8930_i2s = {
 
 static const Property s5l8930_i2s_properties[] = {
     DEFINE_PROP_BOOL("audio-out", S5L8930I2SState, audio_out, false),
+    DEFINE_PROP_BOOL("audio-in", S5L8930I2SState, audio_in, false),
     DEFINE_PROP_BOOL("ctrl-run", S5L8930I2SState, ctrl_run, false),
     DEFINE_PROP_BOOL("host-mic", S5L8930I2SState, host_mic, false),
+    DEFINE_PROP_BOOL("mca", S5L8930I2SState, mca, false),
+    DEFINE_PROP_UINT32("frame-rate", S5L8930I2SState, frame_rate, 48000),
     DEFINE_PROP_UINT8("port", S5L8930I2SState, port, 0),
     DEFINE_PROP_UINT64("nco-base", S5L8930I2SState, nco_base, 0),
     DEFINE_PROP_UINT32("nco-ref-hz", S5L8930I2SState, nco_ref_hz, 0),

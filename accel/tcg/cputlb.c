@@ -1256,6 +1256,8 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
  * We must take tlb_c.lock to avoid racing with another vCPU update. The only
  * thing actually updated is the target TLB entry ->addr_write flags.
  */
+static void tlb_bank_note_reset_locked(CPUState *cpu, uintptr_t start, uintptr_t length);
+
 void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
 {
     int mmu_idx;
@@ -1285,10 +1287,16 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
                                          start, length);
         }
     }
-    /*
-     * Parked tables take the range when they come back (tlb_bank_catch_up_locked): walking them all here, from the
-     * main loop or a draw, under the lock the vCPU needs, is what cost the first banks attempt. Too many: drop it.
-     */
+    tlb_bank_note_reset_locked(cpu, start, length);
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+}
+
+/*
+ * Parked tables take the range when they come back (tlb_bank_catch_up_locked): walking them all here, from the
+ * main loop or a draw, under the lock the vCPU needs, is what cost the first banks attempt. Too many: drop it.
+ */
+static void tlb_bank_note_reset_locked(CPUState *cpu, uintptr_t start, uintptr_t length)
+{
     for (int b = 0; cpu->neg.tlb.c.banks && b < TLB_BANKS; b++) {
         TLBBank *bank = &cpu->neg.tlb.c.banks->b[b];
         unsigned r;
@@ -1311,6 +1319,66 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
         bank->reset_start[bank->nreset] = start;
         bank->reset_len[bank->nreset++] = length;
     }
+}
+
+/* Whether host address `host` lies in one of n sorted disjoint (start, length) ranges. */
+static bool tlb_ranges_hit(const uintptr_t *r, unsigned n, uintptr_t host)
+{
+    unsigned lo = 0, hi = n;
+
+    while (lo < hi) {       /* the last range starting at or below host */
+        unsigned mid = (lo + hi) / 2;
+
+        if (r[2 * mid] <= host) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo && host - r[2 * (lo - 1)] < r[2 * (lo - 1) + 1];
+}
+
+static void tlb_reset_dirty_ranges_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent, const uintptr_t *r, unsigned n)
+{
+    const uintptr_t addr = ent->addr_write;
+    int flags = addr | full->slow_flags[MMU_DATA_STORE];
+
+    flags &= TLB_INVALID_MASK | TLB_MMIO | TLB_DISCARD_WRITE | TLB_NOTDIRTY;
+    if (flags == 0 && tlb_ranges_hit(r, n, (addr & TARGET_PAGE_MASK) + ent->addend)) {
+        qatomic_set(&ent->addr_write, addr | TLB_NOTDIRTY);
+    }
+}
+
+/*
+ * tlb_reset_dirty for n sorted, disjoint ranges in one walk: GL's surface check clears a texture's dirty pages, a
+ * physically scattered IOSurface being hundreds of runs, each of which was a walk of every TLB entry. Parked tables
+ * take the span of the ranges (re-arming more than was cleared only costs a slow write).
+ */
+void tlb_reset_dirty_ranges(CPUState *cpu, const uintptr_t *r, unsigned n)
+{
+    if (!n) {
+        return;
+    }
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    if (unlikely(it_acct_on)) {
+        it_acct_reset_dirty++;
+    }
+    for (int mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+        CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+        CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+        unsigned int entries = tlb_n_entries(fast);
+
+        if (!((cpu->neg.tlb.c.dirty >> mmu_idx) & 1)) {
+            continue;
+        }
+        for (unsigned int i = 0; i < entries; i++) {
+            tlb_reset_dirty_ranges_locked(&desc->fulltlb[i], &fast->table[i], r, n);
+        }
+        for (unsigned int i = 0; i < CPU_VTLB_SIZE; i++) {
+            tlb_reset_dirty_ranges_locked(&desc->vfulltlb[i], &desc->vtable[i], r, n);
+        }
+    }
+    tlb_bank_note_reset_locked(cpu, r[0], r[2 * (n - 1)] + r[2 * (n - 1) + 1] - r[0]);
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 }
 

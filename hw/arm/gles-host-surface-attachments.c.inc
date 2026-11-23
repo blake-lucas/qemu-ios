@@ -17,7 +17,7 @@
              * other color attachment takes that meaning away again. */
             gles_set_drawable(gh.bound_framebuffer,
                               rb && !g_hash_table_contains(
-                                  gh.rb_sized, GUINT_TO_POINTER(rb)));
+                                  gh.rb_sized, GUINT_TO_POINTER(rb)) ? rb : 0);
         }
         gles_trace_attach("glFramebufferRenderbuffer", attach, rb);
         gles_note_attach(attach, GL_RENDERBUFFER_EXT, rb, 0, 0);
@@ -25,7 +25,12 @@
         if (gles_is_drawable(gh.bound_framebuffer)) {
             /* gh.fbo already carries the color target we present out of and a
              * matching depth buffer; re-attaching over either breaks the
-             * present path. */
+             * present path. The A6 keeps the native named attachment too, so a
+             * later allocation of this shared renderbuffer can stop using the
+             * surrogate. */
+            if (gles_a6) {
+                gles_record_drawable_attachment(a);
+            }
             return 0;
         }
         glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, attach,
@@ -49,7 +54,7 @@
         }
         if (a[1] == GL_COLOR_ATTACHMENT0_EXT) {
             if (gles_sync_surface(cpu)) return -1;
-            gles_set_drawable(gh.bound_framebuffer, false);
+            gles_set_drawable(gh.bound_framebuffer, 0);
         }
         gles_trace_attach("glFramebufferTexture2D", a[1], a[3]);
         gles_note_attach(a[1], GL_TEXTURE, a[3], a[4], a[2]);

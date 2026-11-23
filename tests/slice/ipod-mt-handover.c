@@ -30,6 +30,7 @@ typedef struct {} QEMUTimer;
 typedef struct {} IPodTouchSYSICState;
 typedef struct {} IPodTouchGPIOState;
 typedef int qemu_irq;
+#define qemu_irq_raise(irq) ((void)(irq))   /* the A6's hold-atn, off here */
 static uint64_t now = 1000000000;
 static uint64_t qemu_clock_get_ns(int clock) { return now; }
 static void timer_del(QEMUTimer *t) {}
