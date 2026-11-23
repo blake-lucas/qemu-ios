@@ -5,18 +5,22 @@
  * it for a buzz (0x4207) and stops it (0), and the other channels leave it be.
  * The 3GS wires channel 0, the iPhone 4 channel 1 (each DT's pwm/vibrator reg). The iPhone 4's motor also
  * runs from its driver's enable GPIO 0x0e07, the way 6.x and 7.x drive it (pmu/vib-pwm's function-enable).
+ * The iPhone 5 (S5L8950X) has only that path: its DT's pmu/vib-pwm enables GPIO 0x0b07.
  */
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
 
 #define PWM_BASE    0x83500000
 #define PWM_CTRL(n) (PWM_BASE + 0x18 + 4 * (n))
-#define GPIO_CFG(dt) (0xbfa00000 + 4 * (((dt) >> 8) * 8 + ((dt) & 0xff)))
+#define A4_GPIO_BASE 0xbfa00000
+#define A6_GPIO_BASE 0x3fa00000
+#define GPIO_CFG(base, dt) ((base) + 4 * (((dt) >> 8) * 8 + ((dt) & 0xff)))
 #define GPIO_OUT_LOW  0x2
 #define GPIO_OUT_HIGH 0x3
 
-static char *kboot;
+static char *kboot, *a6_kboot;
 
 static bool vibrating(QTestState *q)
 {
@@ -51,12 +55,17 @@ static void check(const char *machine, int channel, uint16_t enable)
     qtest_writel(q, PWM_CTRL(channel), 0);
     g_assert_false(vibrating(q));
     if (enable) {
-        qtest_writel(q, GPIO_CFG(enable), GPIO_OUT_HIGH);
+        qtest_writel(q, GPIO_CFG(A4_GPIO_BASE, enable), GPIO_OUT_HIGH);
         g_assert_true(vibrating(q));
-        qtest_writel(q, GPIO_CFG(enable), GPIO_OUT_LOW);
+        qtest_writel(q, GPIO_CFG(A4_GPIO_BASE, enable), GPIO_OUT_LOW);
         g_assert_false(vibrating(q));
     }
-    /* A machine reset stops it. */
+    /* A machine reset stops it, from the PWM or from the enable. */
+    if (enable) {
+        qtest_writel(q, GPIO_CFG(A4_GPIO_BASE, enable), GPIO_OUT_HIGH);
+        qtest_system_reset(q);
+        g_assert_false(vibrating(q));
+    }
     qtest_writel(q, PWM_CTRL(channel), 0x4207);
     qtest_system_reset(q);
     g_assert_false(vibrating(q));
@@ -66,25 +75,56 @@ static void check(const char *machine, int channel, uint16_t enable)
 static void n88(void) { check("n88", 0, 0); }
 static void n90(void) { check("iPhone-4", 1, 0x0e07); }
 
-int main(int argc, char **argv)
+/* The iPhone 5: the enable GPIO runs the motor, its neighbours don't, and a reset stops it. */
+static void n42(void)
 {
-    /* A K48KBOOT bundle with an empty image: the trailer only. */
-    static const uint8_t trailer[24] = {
-        'K', '4', '8', 'K', 'B', 'O', 'O', 'T',
-        0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40,
-        0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00,
-    };
-    int fd, ret;
+    QTestState *q = qtest_initf("-machine iPhone-5,kboot=%s -display none -audio driver=none -nic none", a6_kboot);
 
-    g_test_init(&argc, &argv, NULL);
-    fd = g_file_open_tmp("s5l8920-kboot-XXXXXX", &kboot, NULL);
+    g_assert_false(vibrating(q));
+    qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0b06), GPIO_OUT_HIGH);
+    qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0c00), GPIO_OUT_HIGH);
+    g_assert_false(vibrating(q));
+    qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0b07), GPIO_OUT_HIGH);
+    g_assert_true(vibrating(q));
+    qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0b07), GPIO_OUT_LOW);
+    g_assert_false(vibrating(q));
+    qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0b07), GPIO_OUT_HIGH);
+    qtest_system_reset(q);
+    g_assert_false(vibrating(q));
+    qtest_quit(q);
+}
+
+static char *kboot_file(uint32_t base)
+{
+    /* A K48KBOOT bundle with an empty image: the trailer only (load, entry, arguments, length). */
+    uint8_t trailer[24] = { 'K', '4', '8', 'K', 'B', 'O', 'O', 'T' };
+    char *path;
+    int fd;
+
+    for (int i = 0; i < 3; i++) {
+        stl_le_p(trailer + 8 + 4 * i, base);
+    }
+    fd = g_file_open_tmp("s5l8920-kboot-XXXXXX", &path, NULL);
     g_assert(fd >= 0);
     g_assert(write(fd, trailer, sizeof(trailer)) == sizeof(trailer));
     close(fd);
+    return path;
+}
+
+int main(int argc, char **argv)
+{
+    int ret;
+
+    g_test_init(&argc, &argv, NULL);
+    kboot = kboot_file(0x40000000);
+    a6_kboot = kboot_file(0x80000000);
     qtest_add_func("/s5l8920/pwm/n88-vibrator", n88);
     qtest_add_func("/s5l8920/pwm/n90-vibrator", n90);
+    qtest_add_func("/s5l8920/pwm/n42-vibrator", n42);
     ret = g_test_run();
     unlink(kboot);
+    unlink(a6_kboot);
     g_free(kboot);
+    g_free(a6_kboot);
     return ret;
 }

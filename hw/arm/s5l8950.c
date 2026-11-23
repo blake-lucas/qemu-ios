@@ -44,6 +44,7 @@
 #include "hw/arm/guest-package.h"
 #include "hw/arm/guest-pasteboard.h"
 #include "hw/arm/ipod-agent.h"
+#include "hw/misc/ios_vibrator.h"
 #include "qemu/guest-random.h"
 #include "target/arm/cpregs.h"
 #include "target/arm/arm-powerctl.h"
@@ -1556,6 +1557,14 @@ static void a6_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, 0x3fa00000);
     sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
                        qemu_allocate_irq(a6_irq, s, 119));
+    /*
+     * The vibration motor, as on the iPhone 4's 6.x: the N42 DT's pmu/vib-pwm
+     * (PMU PWM) has function-enable on GPIO 0x0b07 (port 11, pin 7), the motor
+     * driver's enable, which the PMU PWM driver raises for each buzz. The
+     * enable alone runs the motor; the PMU's PWM registers are not a gate.
+     */
+    qdev_connect_gpio_out(gpio, S5L8930_GPIO_PIN(0x0b07),
+                          ios_vibrator_line(OBJECT(machine)));
     /* N42 DT spi1: 0x32100000, IRQ 29; multi-touch,n41 ATN is
      * GPIO interrupt 201 (port 25, pin 1). The shared Samsung SPI model
      * accepts the native C1F57 firmware's 64452-byte download burst. */
