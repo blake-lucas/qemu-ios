@@ -237,6 +237,7 @@ static int as_MISValidateSignatureAndCopyInfo(void *path, void *options,
     if (info) *info = 0;
     int result = real ? real(path, options, info) : -1;
     if (ios10 && in_amfid()) return as_ios10_amfid(path, options, info, result);
+    if (ios10 && in_installd()) AS_LOG("installd: libmis says %#x%s", result, result ? "; supplying signing info" : "");
     if (!in_installd()) return result;
     if (info && !*info) {
         CFMutableDictionaryRef d = CFDictionaryCreateMutable(
@@ -298,11 +299,13 @@ static CFStringRef as_SecCertificateCopySubjectSummary(SecCertificateRef c) {
 #ifndef APPSYNC_TEST
 __attribute__((constructor)) static void as_ios10_bind(void) {
     if (as_darwin_major() < 16 || !(in_installd() || in_amfid())) return;
-    as_rebind("_MISValidateSignatureAndCopyInfo", (const void *)as_MISValidateSignatureAndCopyInfo);
+    int mis = as_rebind("_MISValidateSignatureAndCopyInfo", (const void *)as_MISValidateSignatureAndCopyInfo);
+    int sec = 0;
     if (in_installd()) {
-        as_rebind("_SecCertificateCreateWithData", (const void *)as_SecCertificateCreateWithData);
-        as_rebind("_SecCertificateCopySubjectSummary", (const void *)as_SecCertificateCopySubjectSummary);
+        sec += as_rebind("_SecCertificateCreateWithData", (const void *)as_SecCertificateCreateWithData);
+        sec += as_rebind("_SecCertificateCopySubjectSummary", (const void *)as_SecCertificateCopySubjectSummary);
     }
+    AS_LOG("loaded in %s; MIS imports rebound %d, Security %d", getprogname(), mis, sec);
 }
 #endif
 

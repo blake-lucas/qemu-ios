@@ -26,6 +26,8 @@ extern unsigned long strlen(const char *);
 extern Boolean CFNumberGetValue(CFTypeRef, CFIndex, void *);
 extern unsigned long CFNumberGetTypeID(void);
 extern void *memcpy(void *, const void *, unsigned long);
+extern void syslog(int, const char *, ...);
+#define AS_LOG(...) syslog(5 /* LOG_NOTICE */, "LightTouch AppSync: " __VA_ARGS__)
 
 static int as_darwin_major(void) {
     char release[32];
@@ -46,23 +48,24 @@ static unsigned le32(const unsigned char *p) {
 }
 
 // ---- rebinding the main executable's own imports (no interposition without insertion) ----------------------
-static void as_rebind(const char *symbol, const void *replacement) {
+static int as_rebind(const char *symbol, const void *replacement) {
+    int bound = 0;
     const unsigned char *mh = _dyld_get_image_header(0);
     long slide = _dyld_get_image_vmaddr_slide(0);
-    if (!mh || le32(mh) != 0xfeedface) return;
+    if (!mh || le32(mh) != 0xfeedface) return -1;
     unsigned ncmds = le32(mh + 16);
     const unsigned char *lc = mh + 28;
     unsigned link_vm = 0, link_off = 0, symoff = 0, nsyms = 0, stroff = 0, indoff = 0, nind = 0;
     int have_link = 0;
     for (unsigned i = 0; i < ncmds; i++) {
         unsigned cmd = le32(lc), size = le32(lc + 4);
-        if (size < 8) return;
+        if (size < 8) return -1;
         if (cmd == 1 && !memcmp(lc + 8, "__LINKEDIT", 11)) { link_vm = le32(lc + 24); link_off = le32(lc + 32); have_link = 1; }
         if (cmd == 2) { symoff = le32(lc + 8); nsyms = le32(lc + 12); stroff = le32(lc + 16); }
         if (cmd == 0xb) { indoff = le32(lc + 56); nind = le32(lc + 60); }
         lc += size;
     }
-    if (!have_link || !nsyms || !nind) return;
+    if (!have_link || !nsyms || !nind) return -1;
     const unsigned char *linkedit = (const unsigned char *)(slide + link_vm - link_off);
     const unsigned char *syms = linkedit + symoff;
     const char *strings = (const char *)linkedit + stroff;
@@ -85,11 +88,13 @@ static void as_rebind(const char *symbol, const void *replacement) {
                     unsigned long page = (unsigned long)slot & ~4095ul;
                     mprotect((void *)page, 4096, 3);
                     *slot = (void *)replacement;
+                    bound++;
                 }
             }
         }
         lc += size;
     }
+    return bound;
 }
 
 // ---- code directories ----------------------------------------------------------------------------------------
@@ -255,7 +260,14 @@ static int as_cdhash(CFStringRef path, CFDictionaryRef options, unsigned char ou
 static int as_ios10_amfid(void *path, void *options, CFDictionaryRef *info, int result) {
     unsigned char hash[20];
     const CFStringRef *key = dlsym(RTLD_DEFAULT, "kMISValidationInfoCdHash");
-    if (!result || !info || !key || !as_cdhash((CFStringRef)path, (CFDictionaryRef)options, hash)) return result;
+    if (!result) return result;
+    char file[256] = "";
+    if (path) CFStringGetCString((CFStringRef)path, file, sizeof file, 0x08000100);
+    if (!info || !key || !as_cdhash((CFStringRef)path, (CFDictionaryRef)options, hash)) {
+        AS_LOG("amfid: %s refused (%#x), no code directory to vouch for", file, result);
+        return result;
+    }
+    AS_LOG("amfid: %s refused (%#x); vouching for cdhash %02x%02x%02x%02x...", file, result, hash[0], hash[1], hash[2], hash[3]);
     if (*info) { CFRelease((CFTypeRef)*info); *info = 0; }
     CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
