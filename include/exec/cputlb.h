@@ -34,6 +34,9 @@ void tlb_unprotect_code(ram_addr_t ram_addr);
 #ifndef CONFIG_USER_ONLY
 void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length);
 void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length);
+/* ranges: n sorted, disjoint (host address, length) pairs */
+void tlb_reset_dirty_ranges(CPUState *cpu, const uintptr_t *ranges, unsigned n);
+void tlb_reset_dirty_ranges_all(const ram_addr_t *start, const ram_addr_t *length, unsigned n);
 #endif
 
 /**

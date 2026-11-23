@@ -876,6 +876,49 @@ void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length)
     }
 }
 
+static int host_range_cmp(const void *a, const void *b)
+{
+    const uintptr_t *x = a, *y = b;
+
+    return x[0] < y[0] ? -1 : x[0] > y[0];
+}
+
+/* tlb_reset_dirty_range_all for n RAM ranges at once: one walk of each vCPU's TLB instead of n. */
+void tlb_reset_dirty_ranges_all(const ram_addr_t *start, const ram_addr_t *length, unsigned n)
+{
+    g_autofree uintptr_t *r = g_new(uintptr_t, 2 * n);
+    unsigned m = 0;
+    CPUState *cpu;
+
+    assert(tcg_enabled());
+    if (!n) {
+        return;
+    }
+    RCU_READ_LOCK_GUARD();
+    for (unsigned i = 0; i < n; i++) {
+        ram_addr_t end = TARGET_PAGE_ALIGN(start[i] + length[i]), s = start[i] & TARGET_PAGE_MASK;
+        RAMBlock *block = qemu_get_ram_block(s);
+
+        assert(block == qemu_get_ram_block(end - 1));
+        r[2 * i] = (uintptr_t)ramblock_ptr(block, s - block->offset);
+        r[2 * i + 1] = length[i];    /* as tlb_reset_dirty_range_all passes it */
+    }
+    qsort(r, n, 2 * sizeof(uintptr_t), host_range_cmp);
+    for (unsigned i = 0; i < n; i++) {     /* merge touching or overlapping ranges */
+        if (m && r[2 * i] <= r[2 * (m - 1)] + r[2 * (m - 1) + 1]) {
+            uintptr_t end = MAX(r[2 * (m - 1)] + r[2 * (m - 1) + 1], r[2 * i] + r[2 * i + 1]);
+            r[2 * (m - 1) + 1] = end - r[2 * (m - 1)];
+        } else {
+            r[2 * m] = r[2 * i];
+            r[2 * m + 1] = r[2 * i + 1];
+            m++;
+        }
+    }
+    CPU_FOREACH(cpu) {
+        tlb_reset_dirty_ranges(cpu, r, m);
+    }
+}
+
 void physical_memory_dirty_bits_cleared(ram_addr_t start, ram_addr_t length)
 {
     if (tcg_enabled()) {
@@ -1076,10 +1119,31 @@ void physical_memory_set_dirty_range(ram_addr_t start, ram_addr_t length,
  * @return:
  * - Number of dirty guest pages found within [start, start + length).
  */
+static uint64_t physical_memory_clear_dirty_bits(ram_addr_t start, ram_addr_t length, unsigned client,
+                                                 unsigned long *bmap);
+
 uint64_t physical_memory_test_and_clear_dirty(ram_addr_t start,
                                               ram_addr_t length,
                                               unsigned client,
                                               unsigned long *bmap)
+{
+    uint64_t num_dirty = physical_memory_clear_dirty_bits(start, length, client, bmap);
+
+    if (num_dirty) {
+        physical_memory_dirty_bits_cleared(start, length);
+    }
+    return num_dirty;
+}
+
+/* physical_memory_test_and_clear_dirty without re-arming the TLBs: a caller clearing many ranges re-arms them in one
+ * walk afterwards (tlb_reset_dirty_ranges_all). */
+uint64_t physical_memory_test_and_clear_dirty_bits(ram_addr_t start, ram_addr_t length, unsigned client)
+{
+    return physical_memory_clear_dirty_bits(start, length, client, NULL);
+}
+
+static uint64_t physical_memory_clear_dirty_bits(ram_addr_t start, ram_addr_t length, unsigned client,
+                                                 unsigned long *bmap)
 {
     DirtyMemoryBlocks *blocks;
     unsigned long end, page, start_page;
@@ -1123,10 +1187,6 @@ uint64_t physical_memory_test_and_clear_dirty(ram_addr_t start,
         mr_offset = (ram_addr_t)(start_page << TARGET_PAGE_BITS) - ramblock->offset;
         mr_size = (end - start_page) << TARGET_PAGE_BITS;
         memory_region_clear_dirty_bitmap(ramblock->mr, mr_offset, mr_size);
-    }
-
-    if (num_dirty) {
-        physical_memory_dirty_bits_cleared(start, length);
     }
 
     return num_dirty;
