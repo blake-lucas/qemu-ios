@@ -69,6 +69,7 @@ The launch above also enables the modem and camera.
 | Touch | Shared SPI and multitouch model | SPI1 at 0x32100000, IRQ29; Zephyr profile, ATN GPIO201 |
 | I2C | PA Semi command-FIFO variant | Controllers at 0x33200000–0x33400000, IRQ18–20 |
 | PMU | D1972 model | I2C0 address 0x74, GPIO6 interrupt; ADC, thermal inputs, cable state, wake and shutdown |
+| Vibration motor | Shared `ios_vibrator` (`hw/misc/ios_vibrator.c`) | DT pmu/vib-pwm's function-enable, GPIO 0x0b07 (port 11, pin 7), wired as the motor (as the iPhone 4's 6.x enable); `qemu_ios_ui_vibrator` reads it. 10.3.4 parks the pin low at boot (AppleD1972PMUPWM's start) but never raises it: an incoming call and Settings' vibration previews write no PMU PWM register and leave the pin alone, so the request stops in userland (cause unknown) |
 | Battery | Shared HDQ/bq27540 | UART5 at 0x32a00000; virtual 1440 mAh pack with external charging power |
 | Accessory and backlight | TriStar and backlight models | I2C0 addresses 0x1a and 0x63 |
 | USB device | Shared PHY and DWC OTG | PHY at 0x36000000; OTG at 0x36100000, IRQ11 |
