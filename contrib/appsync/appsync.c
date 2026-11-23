@@ -62,13 +62,16 @@ extern void *dlsym(void *, const char *);
 #endif
 extern void *dlopen(const char *, int);
 
-// The original of a hooked function: the next definition after this library (inserted, interposing: every
-// iOS before 10). On iOS 10 this library is loaded by installd's and amfid's own load command and rebinds their
-// imports, and dyld there answered the lookups with the hook itself (installd recursed until its stack ran
-// out), so a lookup that names the hook is never taken: then the defining library's own export, or nothing.
+// The original of a hooked function. Every iOS before 10 inserts this library and interposes: the next definition
+// is the original. On iOS 10 (loaded by installd's and amfid's own load command) dyld answered these lookups with the
+// hook itself (installd recursed until its stack ran out), so the original comes from this library's interposition
+// table: dyld binds each entry's original to the real function and never interposes the table itself.
+static const void *as_interposed_original(const void *hook);
 static void *as_original(const char *library, const char *name, const void *hook) {
     void *p = dlsym(RTLD_NEXT, name);
     if (p && p != hook) return p;
+    const void *o = as_interposed_original(hook);
+    if (o && o != hook) return (void *)o;
     void *h = dlopen(library, 0x10 | 0x1); // RTLD_NOLOAD | RTLD_LAZY: only if the program has it already
     p = h ? dlsym(h, name) : 0;
     return p != hook ? p : 0;
@@ -306,6 +309,16 @@ static CFStringRef as_SecCertificateCopySubjectSummary(SecCertificateRef c) {
     return real ? real(c) : 0;
 }
 
+// iOS 10's installd also asks for the signer's organization: none for the stand-in (it isn't a certificate).
+// Rebound on iOS 10 only, never interposed: older Security may not export it, and an interposition entry's
+// original must bind.
+static CFTypeRef as_SecCertificateCopyOrganization(SecCertificateRef c) {
+    if (in_installd() && is_appsync_certificate((CFTypeRef)c)) return 0;
+    CFTypeRef (*real)(SecCertificateRef) = as_original(AS_SECURITY, "SecCertificateCopyOrganization",
+        (const void *)as_SecCertificateCopyOrganization);
+    return real ? real(c) : 0;
+}
+
 // iOS 10: the weak LC_LOAD_DYLIB FirmwareKit gives installd and amfid; their own imports are pointed here.
 #ifndef APPSYNC_TEST
 __attribute__((constructor)) static void as_ios10_bind(void) {
@@ -315,6 +328,7 @@ __attribute__((constructor)) static void as_ios10_bind(void) {
     if (in_installd()) {
         sec += as_rebind("_SecCertificateCreateWithData", (const void *)as_SecCertificateCreateWithData);
         sec += as_rebind("_SecCertificateCopySubjectSummary", (const void *)as_SecCertificateCopySubjectSummary);
+        sec += as_rebind("_SecCertificateCopyOrganization", (const void *)as_SecCertificateCopyOrganization);
     }
     snprintf(as_status, sizeof as_status, "loaded in %s; MIS imports rebound %d, Security %d", getprogname(), mis, sec);
     AS_LOG("%s", as_status);
@@ -333,4 +347,11 @@ __attribute__((used)) static const interpose_t as_interposers[]
     { (const void *)as_SecCertificateCopySubjectSummary, (const void *)SecCertificateCopySubjectSummary },
 };
 
+static const void *as_interposed_original(const void *hook) {
+    for (unsigned i = 0; i < sizeof as_interposers / sizeof as_interposers[0]; i++)
+        if (as_interposers[i].replacement == hook) return as_interposers[i].original;
+    return 0;
+}
+#else
+static const void *as_interposed_original(const void *hook) { (void)hook; return 0; }
 #endif
