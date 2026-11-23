@@ -10423,6 +10423,13 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
     }
 
     default:
+        /* On Android every ES2 core entry is NULL in an ES1 context's
+         * dispatch (see gles_native_BlendEquation), so an ES2 slot from an
+         * ES1 guest context would jump to address 0: it takes the unhandled
+         * path below instead. Desktop GL serves both. */
+#ifdef GLES_HOST_EGL_ES
+        if (gh.api_version == 2)
+#endif
         {
             int64_t r;
             if (gles_es2_call(cpu, slot, argc, a, &r)) {

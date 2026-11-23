@@ -461,6 +461,76 @@ static void gles_native_GenerateMipmap(GLenum target)
     if (gles_egl_current->api==2) glGenerateMipmap(target); else es1(target);
     gles_native_texture_finish(target,old);
 }
+/*
+ * ES1 blending extensions. iOS 3's ES 1.1 has OES_blend_subtract,
+ * OES_blend_equation_separate and OES_blend_func_separate, and a guest reaches
+ * them as glBlendEquationOES and friends. The ES2 core names must not serve an
+ * ES1 context here: since Android 10, libGLESv2's dispatch table for an ES1
+ * context holds NULL for every entry outside the ES1 list, so glBlendEquation
+ * in one jumps to address 0 (Critical Wave on an iPod touch 2G, issue 10). The
+ * OES entry is used only when the ES1 context lists the extension; without it
+ * the closest ES1 state is set and the difference is reported once.
+ */
+typedef enum { GLES_NATIVE_BLEND_SUBTRACT, GLES_NATIVE_BLEND_EQUATION_SEPARATE,
+               GLES_NATIVE_BLEND_FUNC_SEPARATE, GLES_NATIVE_BLEND_COUNT } GLESNativeBlend;
+static void *gles_native_blend_entry(GLESNativeBlend which)
+{
+    static const char *const extension[GLES_NATIVE_BLEND_COUNT]={
+        "GL_OES_blend_subtract","GL_OES_blend_equation_separate","GL_OES_blend_func_separate"};
+    static const char *const entry[GLES_NATIVE_BLEND_COUNT]={
+        "glBlendEquationOES","glBlendEquationSeparateOES","glBlendFuncSeparateOES"};
+    /* One driver per worker process, so its ES1 answer is the same for every context. */
+    static int checked[GLES_NATIVE_BLEND_COUNT];
+    static void *proc[GLES_NATIVE_BLEND_COUNT];
+    if (!checked[which]) {
+        const char *extensions=(const char *)glGetString(GL_EXTENSIONS);
+        if (gles_native_extension(extensions,extension[which]))
+            proc[which]=(void *)eglGetProcAddress(entry[which]);
+        checked[which]=1;
+        fprintf(stderr,"[gles-egl] GLES1 %s: %s\n",extension[which],
+                proc[which] ? "host entry" : "not on this host, approximated");
+    }
+    return proc[which];
+}
+static void gles_native_blend_approximated(GLESNativeBlend which, const char *what)
+{
+    static bool said[GLES_NATIVE_BLEND_COUNT];
+    if (said[which]) return;
+    said[which]=true;
+    fprintf(stderr,"[gles-egl] %s has no host ES1 equivalent; drawn as the nearest ES1 blend\n",what);
+}
+static void gles_native_BlendEquation(GLenum mode)
+{
+    typedef void (*Proc)(GLenum mode);
+    if (gles_egl_current->api==2) { glBlendEquation(mode); return; }
+    Proc es1=(Proc)gles_native_blend_entry(GLES_NATIVE_BLEND_SUBTRACT);
+    if (es1) { es1(mode); return; }
+    /* Without the extension the equation is always FUNC_ADD. */
+    if (mode!=GL_FUNC_ADD) {
+        gles_native_blend_approximated(GLES_NATIVE_BLEND_SUBTRACT,"a subtract blend equation");
+        gles_native_error(GL_INVALID_ENUM);
+    }
+}
+static void gles_native_BlendEquationSeparate(GLenum rgb, GLenum alpha)
+{
+    typedef void (*Proc)(GLenum rgb, GLenum alpha);
+    if (gles_egl_current->api==2) { glBlendEquationSeparate(rgb,alpha); return; }
+    Proc es1=(Proc)gles_native_blend_entry(GLES_NATIVE_BLEND_EQUATION_SEPARATE);
+    if (es1) { es1(rgb,alpha); return; }
+    if (rgb!=alpha)
+        gles_native_blend_approximated(GLES_NATIVE_BLEND_EQUATION_SEPARATE,"a separate alpha blend equation");
+    gles_native_BlendEquation(rgb);
+}
+static void gles_native_BlendFuncSeparate(GLenum src_rgb, GLenum dst_rgb, GLenum src_alpha, GLenum dst_alpha)
+{
+    typedef void (*Proc)(GLenum, GLenum, GLenum, GLenum);
+    if (gles_egl_current->api==2) { glBlendFuncSeparate(src_rgb,dst_rgb,src_alpha,dst_alpha); return; }
+    Proc es1=(Proc)gles_native_blend_entry(GLES_NATIVE_BLEND_FUNC_SEPARATE);
+    if (es1) { es1(src_rgb,dst_rgb,src_alpha,dst_alpha); return; }
+    if (src_rgb!=src_alpha || dst_rgb!=dst_alpha)
+        gles_native_blend_approximated(GLES_NATIVE_BLEND_FUNC_SEPARATE,"a separate alpha blend function");
+    glBlendFunc(src_rgb,dst_rgb);
+}
 static void gles_native_GenFramebuffers(GLsizei n, GLuint *names)
 {
     typedef void (*Proc)(GLsizei n, GLuint *names);
@@ -676,6 +746,12 @@ static void gles_native_GetFramebufferAttachmentParameteriv(GLenum target, GLenu
 #define glIsRenderbuffer gles_native_IsRenderbuffer
 #undef glGenerateMipmap
 #define glGenerateMipmap gles_native_GenerateMipmap
+#undef glBlendEquation
+#define glBlendEquation gles_native_BlendEquation
+#undef glBlendEquationSeparate
+#define glBlendEquationSeparate gles_native_BlendEquationSeparate
+#undef glBlendFuncSeparate
+#define glBlendFuncSeparate gles_native_BlendFuncSeparate
 #undef glGenFramebuffers
 #define glGenFramebuffers gles_native_GenFramebuffers
 #undef glBindFramebuffer
