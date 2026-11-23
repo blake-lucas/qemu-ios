@@ -223,13 +223,20 @@ static void signature_info(CFStringRef path, CFStringRef *ident, CFTypeRef *ents
     if (!bundle_signature_info(file, ident, ents)) executable_signature_info(path, ident, ents);
 }
 
+#include "appsync_ios10.h"
+
 static int as_MISValidateSignatureAndCopyInfo(void *path, void *options,
                                              CFDictionaryRef *info) {
     int (*real)(void *, void *, CFDictionaryRef *) =
         dlsym(RTLD_NEXT, "MISValidateSignatureAndCopyInfo");
+    // Rebound (iOS 10) rather than interposed: this library loads after libmis, so look everywhere.
+    if (!real) real = dlsym(RTLD_DEFAULT, "MISValidateSignatureAndCopyInfo");
+    int ios10 = as_darwin_major() >= 16;
+    if (ios10 && in_installd()) as_rehash_bundle((CFStringRef)path);
     // Copy APIs may leave the out parameter untouched on failure.
     if (info) *info = 0;
     int result = real ? real(path, options, info) : -1;
+    if (ios10 && in_amfid()) return as_ios10_amfid(path, options, info, result);
     if (!in_installd()) return result;
     if (info && !*info) {
         CFMutableDictionaryRef d = CFDictionaryCreateMutable(
@@ -271,6 +278,7 @@ static int is_appsync_certificate(CFTypeRef value) {
 static SecCertificateRef as_SecCertificateCreateWithData(CFAllocatorRef a, CFDataRef d) {
     SecCertificateRef (*real)(CFAllocatorRef, CFDataRef) =
         dlsym(RTLD_NEXT, "SecCertificateCreateWithData");
+    if (!real) real = dlsym(RTLD_DEFAULT, "SecCertificateCreateWithData");
     SecCertificateRef result = real ? real(a, d) : 0;
     if (!result && in_installd() && is_appsync_certificate((CFTypeRef)d))
         result = (SecCertificateRef)CFRetain((CFTypeRef)d);
@@ -282,8 +290,21 @@ static CFStringRef as_SecCertificateCopySubjectSummary(SecCertificateRef c) {
         return CFStringCreateWithCString(kCFAllocatorDefault, "AppSync", 0x0600);
     CFStringRef (*real)(SecCertificateRef) =
         dlsym(RTLD_NEXT, "SecCertificateCopySubjectSummary");
+    if (!real) real = dlsym(RTLD_DEFAULT, "SecCertificateCopySubjectSummary");
     return real ? real(c) : 0;
 }
+
+// iOS 10: the weak LC_LOAD_DYLIB FirmwareKit gives installd and amfid; their own imports are pointed here.
+#ifndef APPSYNC_TEST
+__attribute__((constructor)) static void as_ios10_bind(void) {
+    if (as_darwin_major() < 16 || !(in_installd() || in_amfid())) return;
+    as_rebind("_MISValidateSignatureAndCopyInfo", (const void *)as_MISValidateSignatureAndCopyInfo);
+    if (in_installd()) {
+        as_rebind("_SecCertificateCreateWithData", (const void *)as_SecCertificateCreateWithData);
+        as_rebind("_SecCertificateCopySubjectSummary", (const void *)as_SecCertificateCopySubjectSummary);
+    }
+}
+#endif
 
 // dyld interposition: replace/original pairs in __DATA,__interpose.
 #ifndef APPSYNC_TEST
