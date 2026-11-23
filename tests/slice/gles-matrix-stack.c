@@ -1,7 +1,7 @@
 /* The GL bridge's matrix stacks as deep as the guest's GPU has them, on a host whose stacks are shallower: a fake ES
  * 1.1 driver with Adreno's depths (modelview 16, projection 4, texture 2 per unit; the MBX's texture stack is 4).
  *
- * Field & Stream Fishing (GitHub issue 13) nests its texture matrix three deep: on Adreno the third push was refused,
+ * Field & Stream Fishing (GitHub issue 13) nests its texture matrix at least three deep: on Adreno the third push was refused,
  * the matching pop undid the second, and every later glyph and sprite was drawn with the wrong texture matrix. Each
  * sequence here runs through gles_matrix_push/pop against the shallow driver and, as the reference, straight against
  * a driver with deep stacks; the live matrices and the depths the guest reads must agree after every call.
@@ -12,7 +12,36 @@
  * SLICE:fns hw/arm/gles-host.c fn gles_reject gles_matrix_stack_index gles_matrix_mode_kind gles_host_stack_max
  * SLICE:fns hw/arm/gles-host.c fn gles_matrix_stack_get gles_matrix_stack_check gles_matrix_push gles_matrix_pop
  */
-#include <GL/gl.h>
+/* No GL header: the fake driver below is the GL these functions see, on any host the gate runs on. */
+typedef unsigned int GLenum;
+typedef int GLint;
+typedef float GLfloat;
+#define GL_NO_ERROR 0
+#define GL_STACK_OVERFLOW 0x0503
+#define GL_STACK_UNDERFLOW 0x0504
+#define GL_MATRIX_MODE 0x0BA0
+#define GL_MODELVIEW_STACK_DEPTH 0x0BA3
+#define GL_PROJECTION_STACK_DEPTH 0x0BA4
+#define GL_TEXTURE_STACK_DEPTH 0x0BA5
+#define GL_MODELVIEW_MATRIX 0x0BA6
+#define GL_PROJECTION_MATRIX 0x0BA7
+#define GL_TEXTURE_MATRIX 0x0BA8
+#define GL_MAX_MODELVIEW_STACK_DEPTH 0x0D36
+#define GL_MAX_PROJECTION_STACK_DEPTH 0x0D38
+#define GL_MAX_TEXTURE_STACK_DEPTH 0x0D39
+#define GL_MODELVIEW 0x1700
+#define GL_PROJECTION 0x1701
+#define GL_TEXTURE 0x1702
+#define GL_TEXTURE0 0x84C0
+#define GL_ACTIVE_TEXTURE 0x84E0
+void glMatrixMode(GLenum mode);
+void glActiveTexture(GLenum unit);
+GLenum glGetError(void);
+void glPushMatrix(void);
+void glPopMatrix(void);
+void glLoadMatrixf(const GLfloat *m);
+void glGetFloatv(GLenum pname, GLfloat *v);
+void glGetIntegerv(GLenum pname, GLint *v);
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>

@@ -5201,17 +5201,17 @@ static bool gles_vao_bind(GLESHost *h, uint32_t name)
  *
  * ES 1.1 only promises a texture and projection stack two deep, and Adreno's ES 1.1 driver stops there: its texture
  * stack is 2 deep (projection 4, modelview 16; Adreno 650, and the issue's log on an Adreno 618), where the MBX's is 4
- * (projection 2, modelview 16; the front end's gles_gpus.h). Field & Stream Fishing nests its texture matrix three deep for its text and sprites, so on
- * Adreno the innermost push was refused, the matching pop then undid the outer one instead, and every later texture
- * matrix was composed onto the wrong base: scrambled and missing text, HUD boxes in flat color, the shore in
- * misaligned strips (GitHub issue 13).
+ * (projection 2, modelview 16; the front end's gles_gpus.h). Field & Stream Fishing nests its texture matrix at least
+ * three deep for its text and sprites, so on Adreno the innermost push was refused, the matching pop then undid the
+ * outer one instead, and every later texture matrix was composed onto the wrong base: scrambled and missing text, HUD
+ * boxes in flat color, the shore in misaligned strips (GitHub issue 13).
  *
  * So the host holds the bottom of each stack while it has room, and the bridge keeps the matrices pushed past that
  * (GLESMatrixStack), saving the live one on a push and loading it back on a pop. A stack within the host's depth goes
  * to the host exactly as before. The live matrix is always the host's, so every other matrix call is unchanged; the
  * depth queries add what the bridge keeps, and the maximum depths read at least GLES_KEPT_MATRICES, which the front
  * end lowers to the guest GPU's own. A snapshot saves the host's stacks only: one taken with matrices kept here
- * resumes without them (the desktop hosts that save snapshots have deep stacks: Mesa's modelview is 32 deep).
+ * resumes without them (the desktop hosts that save snapshots have deep stacks: Mesa's are 32, 32 and 10).
  *
  * IT_GLES_HOST_STACK_DEPTH=N treats every host stack as N deep, to exercise this on a host with deep stacks.
  */
