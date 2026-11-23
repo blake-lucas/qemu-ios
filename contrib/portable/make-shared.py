@@ -61,7 +61,8 @@ for arg in expanded:
  if arg in ('-pie','-Wl,-pie') or arg.startswith('-Wl,--dynamic-list='):continue
  args.append(arg)
 (build/'portable.exports').write_text('{ global: qemu_ios_*; local: *; };\n')
-args+=['-shared','-Wl,-z,defs','-Wl,-z,max-page-size=16384','-Wl,--version-script='+str(build/'portable.exports'),'-Wl,-soname,libqemu-arm.so','-o',str(output)]
+# A GNU build ID names this exact library in crash reports (firmwarekit's crashlog, tombstones); the NDK's clang adds none.
+args+=['-shared','-Wl,--build-id=sha1','-Wl,-z,defs','-Wl,-z,max-page-size=16384','-Wl,--version-script='+str(build/'portable.exports'),'-Wl,-soname,libqemu-arm.so','-o',str(output)]
 (build/'portable-link.json').write_text(json.dumps(args,indent=2)+'\n')
 subprocess.run(args,cwd=build,check=True)
 tracked=subprocess.check_output(['git','ls-files','-z'],cwd=src).decode().split('\0')

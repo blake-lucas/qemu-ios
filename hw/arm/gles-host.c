@@ -10662,6 +10662,40 @@ void gles_host_reset(void)
 #endif
 }
 
+/*
+ * What the GL bridge was doing, for a crash report. firmwarekit's oneshot (the
+ * preparation's boots) reads it from its fatal-signal handler through
+ * qemu_ios_crash_note(), so a log ending in SIGSEGV names the guest GL call and
+ * whether the host driver was inside it, even when the driver's own frames
+ * can't be unwound. Plain stores, a few per call; a reader takes a torn view.
+ */
+typedef struct QemuIosCrashNote {
+    uint32_t version;               /* 1 */
+    uint32_t size;                  /* sizeof(QemuIosCrashNote) */
+    volatile uint32_t gl_slot;      /* gles-names.h id of the newest call */
+    volatile uint32_t gl_ctx;       /* its guest context handle */
+    volatile uint32_t gl_api;       /* the context's guest API (1, 2), 0 before it is set up */
+    volatile uint32_t gl_stage;     /* 0 returned, 1 context setup, 2 in the call */
+    volatile uint64_t gl_calls;     /* calls begun */
+} QemuIosCrashNote;
+
+static QemuIosCrashNote qemu_ios_crash_note_data = {
+    .version = 1, .size = sizeof(QemuIosCrashNote),
+};
+
+const void *qemu_ios_crash_note(void);
+const void *qemu_ios_crash_note(void)
+{
+    return &qemu_ios_crash_note_data;
+}
+
+/* A gles-names.h id's name ("?" when unknown): a switch over constants, safe in a signal handler. */
+const char *qemu_ios_crash_gl_name(uint32_t slot);
+const char *qemu_ios_crash_gl_name(uint32_t slot)
+{
+    return gles_id_name(slot);
+}
+
 static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
                        uint32_t argc, const uint32_t *a)
 {
@@ -10674,10 +10708,16 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
     if (!gles_allowed) {
         return -1;
     }
+    qemu_ios_crash_note_data.gl_slot = slot;
+    qemu_ios_crash_note_data.gl_ctx = ctx;
+    qemu_ios_crash_note_data.gl_api = 0;
+    qemu_ios_crash_note_data.gl_stage = 1;
+    qemu_ios_crash_note_data.gl_calls++;
 
     if (slot >= GLES_OP_NEW_SHAREGROUP && slot <= GLES_OP_DELETE_CONTEXT) {
 #if !defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE) || defined(GLES_HOST_EGL)
         r = gles_context_operation(slot, ctx, argc, a);
+        qemu_ios_crash_note_data.gl_stage = 0;
         if (r < 0) gles_refuse("context:op:%u", slot);
         return r;
 #else
@@ -10688,6 +10728,7 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
     GLESHost *state = gles_contexts ? g_hash_table_lookup(gles_contexts, GUINT_TO_POINTER(ctx)) : NULL;
     if (ctx >= 0x80000000 && !state) {
         gles_refuse("context:unknown");
+        qemu_ios_crash_note_data.gl_stage = 0;
         return -1;
     }
     gh_current = state ? state : &gh_legacy;
@@ -10707,6 +10748,7 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
     }
     if (!gles_host_init()) {
         gles_refuse("host:no-context");
+        qemu_ios_crash_note_data.gl_stage = 0;
         return -1;
     }
 
@@ -10715,6 +10757,7 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
     }
     if (!gles_platform_make_current()) {
         gles_refuse("host:make-current");
+        qemu_ios_crash_note_data.gl_stage = 0;
         return -1;
     }
     if (stage_slot >= 0) {
@@ -10727,6 +10770,8 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
     gles_present_async_before_call(ctx);
     gh.calls++;
     gles_cur_ctx = ctx;
+    qemu_ios_crash_note_data.gl_api = gh.api_version == 2 ? 2u : 1u;
+    qemu_ios_crash_note_data.gl_stage = 2;
     t0 = gles_t();
     int64_t st0 = gles_obj_stats > 0 ? g_get_monotonic_time() : 0;
     if (gles_strict) {
@@ -10748,6 +10793,7 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
     } else {
         r = gles_host_call_1(cpu, slot, ctx, argc, a);
     }
+    qemu_ios_crash_note_data.gl_stage = 0;
     if (stage_slot >= 0) {
         uint64_t end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         uint64_t current_ns = stage_current - stage_init;
