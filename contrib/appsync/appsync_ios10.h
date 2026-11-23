@@ -211,16 +211,6 @@ static void as_rehash_tree(char *path, unsigned len, unsigned cap, int depth) {
     closedir(dir);
 }
 
-// installd and amfid start long before anything reads the system log: say again later what the constructor did.
-extern unsigned long long dispatch_time(unsigned long long, long long);
-extern void *dispatch_get_global_queue(long, unsigned long);
-extern void dispatch_after_f(unsigned long long, void *, void *, void (*)(void *));
-static char as_status[160];
-static void as_say_status(void *ctx) {
-    AS_LOG("%s", as_status);
-    if (ctx) dispatch_after_f(dispatch_time(0, 240ll * 1000000000), dispatch_get_global_queue(0, 0), 0, as_say_status);
-}
-
 // The outermost "*.app" directory of `file` (an executable or a bundle path), re-hashed once per call. Only an app
 // installd is installing: one in its staging folder (it validates installed and built-in apps too).
 extern char *strstr(const char *, const char *);

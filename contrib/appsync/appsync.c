@@ -330,9 +330,7 @@ __attribute__((constructor)) static void as_ios10_bind(void) {
         sec += as_rebind("_SecCertificateCopySubjectSummary", (const void *)as_SecCertificateCopySubjectSummary);
         sec += as_rebind("_SecCertificateCopyOrganization", (const void *)as_SecCertificateCopyOrganization);
     }
-    snprintf(as_status, sizeof as_status, "loaded in %s; MIS imports rebound %d, Security %d", getprogname(), mis, sec);
-    AS_LOG("%s", as_status);
-    dispatch_after_f(dispatch_time(0, 120ll * 1000000000), dispatch_get_global_queue(0, 0), (void *)1, as_say_status);
+    AS_LOG("loaded in %s; MIS imports rebound %d, Security %d", getprogname(), mis, sec);
 }
 #endif
 
