@@ -5648,6 +5648,11 @@ static bool gles_surface_nv12(unsigned width, unsigned height, uint32_t format,
     return true;
 }
 
+#endif
+
+/* The writeback below runs on every host but EAGL (macOS CGL included), so this
+ * plain CPU conversion is built wherever it is. */
+#if !defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE)
 /* Render targets use the same BT.601 ranges as imported camera surfaces.
  * Average the four RGB pixels before subsampling each chroma pair. */
 static bool gles_bgra_to_nv12(unsigned w, unsigned h, bool full,
