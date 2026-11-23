@@ -231,7 +231,7 @@ static int as_MISValidateSignatureAndCopyInfo(void *path, void *options,
         dlsym(RTLD_NEXT, "MISValidateSignatureAndCopyInfo");
     // Rebound (iOS 10) rather than interposed: this library loads after libmis, so look everywhere.
     if (!real) real = dlsym(RTLD_DEFAULT, "MISValidateSignatureAndCopyInfo");
-    int ios10 = as_darwin_major() >= 16;
+    int ios10 = as_ios10();
     if (ios10 && in_installd()) as_rehash_bundle((CFStringRef)path);
     // Copy APIs may leave the out parameter untouched on failure.
     if (info) *info = 0;
@@ -298,14 +298,16 @@ static CFStringRef as_SecCertificateCopySubjectSummary(SecCertificateRef c) {
 // iOS 10: the weak LC_LOAD_DYLIB FirmwareKit gives installd and amfid; their own imports are pointed here.
 #ifndef APPSYNC_TEST
 __attribute__((constructor)) static void as_ios10_bind(void) {
-    if (as_darwin_major() < 16 || !(in_installd() || in_amfid())) return;
+    if (!as_ios10() || !(in_installd() || in_amfid())) return;
     int mis = as_rebind("_MISValidateSignatureAndCopyInfo", (const void *)as_MISValidateSignatureAndCopyInfo);
     int sec = 0;
     if (in_installd()) {
         sec += as_rebind("_SecCertificateCreateWithData", (const void *)as_SecCertificateCreateWithData);
         sec += as_rebind("_SecCertificateCopySubjectSummary", (const void *)as_SecCertificateCopySubjectSummary);
     }
-    AS_LOG("loaded in %s; MIS imports rebound %d, Security %d", getprogname(), mis, sec);
+    snprintf(as_status, sizeof as_status, "loaded in %s; MIS imports rebound %d, Security %d", getprogname(), mis, sec);
+    AS_LOG("%s", as_status);
+    dispatch_after_f(dispatch_time(0, 120ll * 1000000000), dispatch_get_global_queue(0, 0), (void *)1, as_say_status);
 }
 #endif
 

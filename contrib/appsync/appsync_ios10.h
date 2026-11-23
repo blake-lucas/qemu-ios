@@ -14,7 +14,6 @@
 // - amfid: where libmis refuses a file, the hook answers with that file's code directory hash (the one the kernel
 //   picked: SHA-256 over SHA-1), which is what amfid hands back to the kernel.
 
-extern int sysctlbyname(const char *, void *, unsigned long *, void *, unsigned long);
 extern const void *_dyld_get_image_header(unsigned int);
 extern long _dyld_get_image_vmaddr_slide(unsigned int);
 extern int mprotect(void *, unsigned long, int);
@@ -29,13 +28,10 @@ extern void *memcpy(void *, const void *, unsigned long);
 extern void syslog(int, const char *, ...);
 #define AS_LOG(...) syslog(5 /* LOG_NOTICE */, "LightTouch AppSync: " __VA_ARGS__)
 
-static int as_darwin_major(void) {
-    char release[32];
-    unsigned long n = sizeof release;
-    if (sysctlbyname("kern.osrelease", release, &n, 0, 0)) return 0;
-    int major = 0;
-    for (const char *p = release; p < release + n && *p >= '0' && *p <= '9'; p++) major = major * 10 + (*p - '0');
-    return major;
+// iOS 10 or later: CoreFoundation 1348 came with 10.0. (Not sysctl: a sandboxed installd may not read it.)
+static int as_ios10(void) {
+    const double *cf = dlsym(RTLD_DEFAULT, "kCFCoreFoundationVersionNumber");
+    return cf && *cf >= 1348.0;
 }
 
 static int in_amfid(void) {
@@ -205,6 +201,16 @@ static void as_rehash_tree(char *path, unsigned len, unsigned cap, int depth) {
         path[len] = 0;
     }
     closedir(dir);
+}
+
+// installd and amfid start long before anything reads the system log: say again later what the constructor did.
+extern unsigned long long dispatch_time(unsigned long long, long long);
+extern void *dispatch_get_global_queue(long, unsigned long);
+extern void dispatch_after_f(unsigned long long, void *, void *, void (*)(void *));
+static char as_status[160];
+static void as_say_status(void *ctx) {
+    AS_LOG("%s", as_status);
+    if (ctx) dispatch_after_f(dispatch_time(0, 240ll * 1000000000), dispatch_get_global_queue(0, 0), 0, as_say_status);
 }
 
 // The outermost "*.app" directory of `file` (an executable or a bundle path), re-hashed once per call.
