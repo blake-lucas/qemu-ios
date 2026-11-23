@@ -654,6 +654,12 @@ typedef struct {
      * revalidates completeness only when it is set, which is what makes the
      * check cheap enough to leave on permanently. */
     bool fb_dirty;
+    /* ES hosts check the target BEFORE a draw (gles_draw_target_ok): an
+     * incomplete one is remembered, and asked again at every draw until it is
+     * complete, so a stale answer can only ever let a draw through. */
+    bool fb_incomplete;
+    GLenum fb_status;
+    unsigned draws_recorded;    /* [gles-draw] lines this context has printed */
 
     uint64_t draws;
     /* Draws split by WHERE they landed. "The screen is blank but the app is
@@ -854,6 +860,59 @@ extern bool gles_host_a6;
 #endif
 #define gles_a6 gles_host_a6
 #define gh (*gh_current)
+
+/*
+ * What the GL bridge was doing, for a crash report. firmwarekit's oneshot (the
+ * preparation's boots) reads it from its fatal-signal handler through
+ * qemu_ios_crash_note(), so a log ending in SIGSEGV names the guest GL call and
+ * whether the host driver was inside it, even when the driver's own frames
+ * can't be unwound. Plain stores, a few per call; a reader takes a torn view.
+ *
+ * Version 2 adds the newest calls (a ring, so the report shows what led up to
+ * the fault) and the newest draw's target and program, set just before the
+ * host draw: what a driver that dies inside glDrawArrays was given.
+ */
+#define QEMU_IOS_CRASH_RING 32
+typedef struct QemuIosCrashCall {
+    uint32_t slot, ctx, a0, a1, a2, a3;
+} QemuIosCrashCall;
+
+typedef struct QemuIosCrashNote {
+    uint32_t version;               /* 2 */
+    uint32_t size;                  /* sizeof(QemuIosCrashNote) */
+    volatile uint32_t gl_slot;      /* gles-names.h id of the newest call */
+    volatile uint32_t gl_ctx;       /* its guest context handle */
+    volatile uint32_t gl_api;       /* the context's guest API (1, 2), 0 before it is set up */
+    volatile uint32_t gl_stage;     /* 0 returned, 1 context setup, 2 in the call */
+    volatile uint64_t gl_calls;     /* calls begun */
+    /* version 2 */
+    uint32_t ring_size;             /* QEMU_IOS_CRASH_RING; call n is ring[(n - 1) % ring_size] */
+    uint32_t draw_mode, draw_count;
+    uint32_t draw_guest_fb, draw_host_fb, draw_fb_status;   /* status 0: not checked since the target changed */
+    uint32_t draw_guest_program, draw_host_program;
+    uint32_t draw_attribs;          /* generic attribute arrays the bridge enabled */
+    uint32_t draw_fetch;            /* the program's shaders read gl_LastFragData */
+    uint64_t draw_call;             /* gl_calls at that draw */
+    QemuIosCrashCall ring[QEMU_IOS_CRASH_RING];
+} QemuIosCrashNote;
+
+static QemuIosCrashNote qemu_ios_crash_note_data = {
+    .version = 2, .size = sizeof(QemuIosCrashNote), .ring_size = QEMU_IOS_CRASH_RING,
+};
+
+const void *qemu_ios_crash_note(void);
+const void *qemu_ios_crash_note(void)
+{
+    return &qemu_ios_crash_note_data;
+}
+
+/* A gles-names.h id's name ("?" when unknown): a switch over constants, safe in a signal handler. */
+const char *qemu_ios_crash_gl_name(uint32_t slot);
+const char *qemu_ios_crash_gl_name(uint32_t slot)
+{
+    return gles_id_name(slot);
+}
+
 
 /* ---------------------------------------------------------- GPU memory ----
  *
@@ -3324,6 +3383,148 @@ static void gles_check_fb_complete(void)
                 "status 0x%x) -- this draw produces nothing\n",
                 gh.bound_framebuffer, gles_host_fbo(gh.bound_framebuffer), st);
     }
+}
+
+/* ---------------------------------------------------------------- draw target
+ *
+ * GL says a draw into an incomplete framebuffer draws nothing and raises
+ * GL_INVALID_FRAMEBUFFER_OPERATION, and Adreno does exactly that. PowerVR's
+ * glDrawArrays doesn't check first: a Pixel 10 preparing an iPhone 5 died in
+ * AttachAllUsedResourcesToCurrentSurface (GLES3EmitState, DrawArraysAutoIndices)
+ * reading through NULL, inside the guest's glDrawArrays, in a boot whose
+ * framebuffers go incomplete when the bridge refuses an IOSurface render
+ * target (surface:render:420f, then fb-incomplete 0x8cd7). So on ES hosts the
+ * bridge asks before the draw and does what GL specifies itself. A complete
+ * target costs nothing extra (the check only runs when the target changed); an
+ * incomplete one is asked again at every draw, so a stale answer can only let a
+ * draw through, never drop a valid one.
+ */
+static bool gles_draw_target_ok(const char *what, uint32_t mode, uint32_t count)
+{
+#ifdef GLES_HOST_EGL_ES
+    if (gh.fb_dirty || gh.fb_incomplete) {
+        GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+
+        gh.fb_dirty = false;
+        gh.fb_status = st;
+        gh.fb_incomplete = st != GL_FRAMEBUFFER_COMPLETE;
+        if (gh.fb_incomplete && gles_refuse("fb-incomplete:0x%x", st)) {
+            fprintf(stderr, "[gles] DRAWING INTO INCOMPLETE framebuffer %u (host %u, "
+                    "status 0x%x) -- this draw produces nothing\n",
+                    gh.bound_framebuffer, gles_host_fbo(gh.bound_framebuffer), st);
+        }
+    }
+    if (gh.fb_incomplete) {
+        if (gles_refuse("draw-skipped:fb-incomplete:0x%x", gh.fb_status)) {
+            fprintf(stderr, "[gles] %s(mode=0x%x, count=%u) into incomplete framebuffer %u "
+                    "(host %u, status 0x%x) not sent to the host: GL_INVALID_FRAMEBUFFER_OPERATION, "
+                    "as GL specifies (PowerVR crashed on such a draw)\n", what, mode, count,
+                    gh.bound_framebuffer, gles_host_fbo(gh.bound_framebuffer), gh.fb_status);
+        }
+        gles_reject(GL_INVALID_FRAMEBUFFER_OPERATION);
+        return false;
+    }
+#endif
+    return true;
+}
+
+/* Host shaders whose source reads gl_LastFragData, and host programs linked
+ * from one: for the draw record and the crash note. */
+static GHashTable *gles_fetch_shaders, *gles_fetch_programs;
+
+static void gles_note_fetch_shader(GLuint shader, const char *source)
+{
+    if (!gles_fetch_shaders) {
+        gles_fetch_shaders = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    if (source && strstr(source, "gl_LastFragData")) {
+        g_hash_table_add(gles_fetch_shaders, GUINT_TO_POINTER(shader));
+    } else {
+        g_hash_table_remove(gles_fetch_shaders, GUINT_TO_POINTER(shader));
+    }
+}
+
+static void gles_note_fetch_program(GLuint program)
+{
+    GLuint shaders[8];
+    GLsizei n = 0;
+    bool fetch = false;
+
+    if (!gles_fetch_programs) {
+        gles_fetch_programs = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    glGetAttachedShaders(program, G_N_ELEMENTS(shaders), &n, shaders);
+    for (GLsizei i = 0; i < n && i < (GLsizei)G_N_ELEMENTS(shaders); i++) {
+        if (gles_fetch_shaders && g_hash_table_contains(gles_fetch_shaders, GUINT_TO_POINTER(shaders[i]))) {
+            fetch = true;
+        }
+    }
+    if (fetch) {
+        g_hash_table_add(gles_fetch_programs, GUINT_TO_POINTER(program));
+    } else {
+        g_hash_table_remove(gles_fetch_programs, GUINT_TO_POINTER(program));
+    }
+}
+
+static bool gles_program_fetches(GLuint program)
+{
+    return program && gles_fetch_programs &&
+           g_hash_table_contains(gles_fetch_programs, GUINT_TO_POINTER(program));
+}
+
+/*
+ * What the host draw is about to be given: into the crash note always (plain
+ * stores), and on ES hosts a [gles-draw] line for the first two draws of each
+ * ES 2 context (400 at most), with what the host itself reports for the
+ * program and the target. A driver that dies inside a draw leaves no other
+ * trace of what it was asked to do.
+ */
+static void gles_draw_record(const char *what, uint32_t mode, uint32_t count, uint32_t attribs)
+{
+    QemuIosCrashNote *n = &qemu_ios_crash_note_data;
+    GLuint program = gh.program ? gles_glsl_host(gh.program) : 0;
+
+    n->draw_mode = mode;
+    n->draw_count = count;
+    n->draw_guest_fb = gh.bound_framebuffer;
+    n->draw_host_fb = gles_host_fbo(gh.bound_framebuffer);
+    n->draw_fb_status = gh.fb_dirty ? 0 : (gh.fb_status ? gh.fb_status : 0x8CD5);
+    n->draw_guest_program = gh.program;
+    n->draw_host_program = program;
+    n->draw_attribs = attribs;
+    n->draw_fetch = gles_program_fetches(program);
+    n->draw_call = n->gl_calls;
+#ifdef GLES_HOST_EGL_ES
+    static unsigned total;
+    if (gh.api_version == 2 && gh.draws_recorded < 2 && total < 400) {
+        GLint current = 0, linked = -1, fb = 0, type = 0, name = 0, texture = 0, active = 0;
+        GLenum st;
+
+        gh.draws_recorded++;
+        total++;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &current);
+        if (current) {
+            glGetProgramiv(current, GL_LINK_STATUS, &linked);
+        }
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+        st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (fb) {
+            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                  GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+            if (type != GL_NONE) {
+                glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                      GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+            }
+        }
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+        fprintf(stderr, "[gles-draw] ctx=%08x %s mode=0x%x count=%u program=%u (host %u, current %d, "
+                "linked %d, fetch %d) attribs=0x%x fb=%u (host %d, status 0x%x, color 0x%x:%d) "
+                "texture unit %d=%d\n", gles_cur_ctx, what, mode, count, gh.program, program, current,
+                linked, n->draw_fetch, attribs, gh.bound_framebuffer, fb, st, type, name,
+                active - GL_TEXTURE0, texture);
+    }
+#endif
 }
 
 /*
@@ -6487,6 +6688,7 @@ static bool gles_surface_copy(GLuint from, const GLESSurface *src, GLuint to, GL
 static int64_t gles_bind_surface(CPUState *cpu, const uint32_t *a, uint32_t id)
 {
     gles_present_async_settle();   /* the surface may be the frame still being copied */
+    gh.fb_dirty = true;            /* an attached texture may take the surface's storage */
     bool window = a[0] & GLES_SURFACE_WINDOW_ORDER;
     unsigned target = a[0] & ~GLES_SURFACE_WINDOW_ORDER, w = a[3], h = a[4], fmt = a[5];
     bool nv12 = fmt == 0x34323076 || fmt == 0x34323066;
@@ -7670,6 +7872,9 @@ static int64_t gles_es2_draw(CPUState *cpu, bool elements, const uint32_t *a)
     if (!count || !gles_refresh_surfaces(cpu)) {
         return count ? -1 : 0;
     }
+    if (!gles_draw_target_ok(elements ? "glDrawElements(ES2)" : "glDrawArrays(ES2)", mode, count)) {
+        return -1;
+    }
 #if !defined(GLES_HOST_EAGL) && !defined(GLES_HOST_ANGLE)
     GLESFetchProgram *clip = gles_fetch_program(gles_glsl_host(gh.program));
     if (clip && clip->clip[0] >= 0 && gh.clip_enabled) {
@@ -7750,8 +7955,10 @@ static int64_t gles_es2_draw(CPUState *cpu, bool elements, const uint32_t *a)
     }
 #endif
     else if (elements) {
+        gles_draw_record("glDrawElements(ES2)", mode, count, bound);
         glDrawElements(mode, count, isz == 1 ? GL_UNSIGNED_BYTE : GL_UNSIGNED_SHORT, idx);
     } else {
+        gles_draw_record("glDrawArrays(ES2)", mode, count, bound);
         glDrawArrays(mode, 0, count);            /* `first` applied by the fetch */
     }
     if (diagnostic) {
@@ -8085,6 +8292,7 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
 #endif
         g_string_free(src, true);
         p = glsl;
+        gles_note_fetch_shader(a[0], glsl);
         glShaderSource(a[0], 1, &p, NULL);
         break;
     }
@@ -8121,6 +8329,7 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
 #endif
         glGetProgramiv(a[0], GL_LINK_STATUS, &ok);
         if (ok) gles_fetch_link(a[0]); else gles_fetch_forget(a[0]);
+        gles_note_fetch_program(a[0]);
         if (!ok) {
             char log[1024] = "";
             glGetProgramInfoLog(a[0], sizeof(log), NULL, log);
@@ -8580,6 +8789,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             return 0;
         }
         if (!gles_refresh_surfaces(cpu)) return -1;
+        if (!gles_draw_target_ok("glDrawArrays", mode, count)) return -1;
         bound = gles_bind_all_arrays(cpu, first, count);
         if (!(bound & 1u)) {                    /* no positions -> no draw */
             /* The uncached path cleans up here; the cached path prepares
@@ -8588,6 +8798,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             return -1;
         }
         /* We already applied `first` when fetching, so draw from 0. */
+        gles_draw_record("glDrawArrays", mode, count, bound);
         if (mode == GL_POINTS && gh.pointsize.enabled) {
             gles_draw_sized_points(cpu, first, count);
         } else {
@@ -8659,11 +8870,13 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         }
 
         if (!gles_refresh_surfaces(cpu)) return -1;
+        if (!gles_draw_target_ok("glDrawElements", mode, count)) return -1;
         bound = gles_bind_all_arrays(cpu, minidx, nverts);
         if (!(bound & 1u)) {
             gles_unbind_arrays(bound);           /* see glDrawArrays above */
             return -1;
         }
+        gles_draw_record("glDrawElements", mode, count, bound);
         glDrawElements(mode, count, itype, idx);
         gles_check_draw("glDrawElements", mode, count);
         gles_trace_draw("glDrawElements", mode, count);
@@ -8779,11 +8992,13 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         return 0;
 
     case GLES_ID_glTexStorage2DEXT:
+        gh.fb_dirty = true;     /* an attached texture's storage decides completeness */
         return gles_tex_storage_2d(a);
 
     case GLES_SLOT_TEX_IMAGE_2D: {
         /* target, level, internalformat, width, height, border, format, type,
          * pixels -- nine arguments, so they arrive spilled. */
+        gh.fb_dirty = true;     /* as glTexStorage2D */
         uint32_t target = a[0], level = a[1], ifmt = a[2];
         uint32_t w = a[3], h = a[4], border = a[5];
         uint32_t fmt = a[6], type = a[7], pixels = a[8];
@@ -10089,6 +10304,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         return 0;
 
     case GLES_SLOT_COPY_TEX_IMAGE_2D:
+        gh.fb_dirty = true;     /* as glTexStorage2D */
         if (a[0] == GL_TEXTURE_2D) {
             GLESPVRTC *storage = gles_pvrtc_texture(false);
             if (storage && storage->immutable_levels) return gles_reject(GL_INVALID_OPERATION);
@@ -10476,6 +10692,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         return 0;
 
     case GLES_SLOT_RENDERBUFFER_STORAGE: { /* target, internalformat, w, h */
+        gh.fb_dirty = true;     /* an attached renderbuffer's storage decides completeness */
         GHashTable *table = gles_charge_table(false);
         gpointer key = gles_charge_key(GLES_CHARGE_RENDERBUFFER, gh.bound_renderbuffer, 0, 0);
         uint64_t old, bytes = (uint64_t)a[2] * a[3] * 4;
@@ -10869,40 +11086,6 @@ void gles_host_reset(void)
 #endif
 }
 
-/*
- * What the GL bridge was doing, for a crash report. firmwarekit's oneshot (the
- * preparation's boots) reads it from its fatal-signal handler through
- * qemu_ios_crash_note(), so a log ending in SIGSEGV names the guest GL call and
- * whether the host driver was inside it, even when the driver's own frames
- * can't be unwound. Plain stores, a few per call; a reader takes a torn view.
- */
-typedef struct QemuIosCrashNote {
-    uint32_t version;               /* 1 */
-    uint32_t size;                  /* sizeof(QemuIosCrashNote) */
-    volatile uint32_t gl_slot;      /* gles-names.h id of the newest call */
-    volatile uint32_t gl_ctx;       /* its guest context handle */
-    volatile uint32_t gl_api;       /* the context's guest API (1, 2), 0 before it is set up */
-    volatile uint32_t gl_stage;     /* 0 returned, 1 context setup, 2 in the call */
-    volatile uint64_t gl_calls;     /* calls begun */
-} QemuIosCrashNote;
-
-static QemuIosCrashNote qemu_ios_crash_note_data = {
-    .version = 1, .size = sizeof(QemuIosCrashNote),
-};
-
-const void *qemu_ios_crash_note(void);
-const void *qemu_ios_crash_note(void)
-{
-    return &qemu_ios_crash_note_data;
-}
-
-/* A gles-names.h id's name ("?" when unknown): a switch over constants, safe in a signal handler. */
-const char *qemu_ios_crash_gl_name(uint32_t slot);
-const char *qemu_ios_crash_gl_name(uint32_t slot)
-{
-    return gles_id_name(slot);
-}
-
 static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
                        uint32_t argc, const uint32_t *a)
 {
@@ -10919,6 +11102,16 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
     qemu_ios_crash_note_data.gl_ctx = ctx;
     qemu_ios_crash_note_data.gl_api = 0;
     qemu_ios_crash_note_data.gl_stage = 1;
+    {
+        QemuIosCrashCall *c = &qemu_ios_crash_note_data.ring[
+            qemu_ios_crash_note_data.gl_calls % QEMU_IOS_CRASH_RING];
+        c->slot = slot;
+        c->ctx = ctx;
+        c->a0 = argc > 0 ? a[0] : 0;
+        c->a1 = argc > 1 ? a[1] : 0;
+        c->a2 = argc > 2 ? a[2] : 0;
+        c->a3 = argc > 3 ? a[3] : 0;
+    }
     qemu_ios_crash_note_data.gl_calls++;
 
     if (slot >= GLES_OP_NEW_SHAREGROUP && slot <= GLES_OP_DELETE_CONTEXT) {
