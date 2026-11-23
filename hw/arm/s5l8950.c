@@ -1829,10 +1829,13 @@ static void a6_init(MachineState *machine)
             DeviceState *bb = qdev_new(TYPE_IOS_BASEBAND);
             USBDevice *modem = USB_DEVICE(qdev_new("usb-mdm9x15"));
 
-            object_property_set_int(OBJECT(bb), "answer-delay-ms", 1000,
-                                    &error_fatal);
-            object_property_set_int(OBJECT(bb), "signal-dbm", -51,
-                                    &error_fatal);
+            /*
+             * Signal strength and the remote's answer stay the modem's
+             * defaults (or -global ios-baseband.*), as on the iPhone 3GS and
+             * iPhone 4: setting them here, after the globals were applied,
+             * pinned five bars at every boot and picked up every outgoing
+             * call after 1 s whatever the front end's Answer said.
+             */
             object_property_set_str(OBJECT(bb), "smsc", "+10000000000",
                                     &error_fatal);
             object_property_set_bool(OBJECT(bb), "gps", true, &error_fatal);

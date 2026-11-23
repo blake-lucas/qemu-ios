@@ -601,6 +601,66 @@ static void mdm_uim_file(GByteArray *a, const IosBbCore *bb, uint16_t message,
     tlv(a, 0x10, sw, sizeof(sw));
 }
 
+/* A UTF-8 name as QMI's UCS-2 little-endian PLMN name string: length byte, then code units. */
+static void mdm_nas_ucs2_name(GByteArray *a, const char *name)
+{
+    gunichar2 *units = g_utf8_to_utf16(name, -1, NULL, NULL, NULL);
+    glong count = 0;
+    uint8_t length;
+
+    while (units && units[count] && count < 127) {
+        count++;
+    }
+    length = count * 2;
+    g_byte_array_append(a, &length, 1);
+    for (glong i = 0; i < count; i++) {
+        uint8_t le[2];
+        stw_le_p(le, units[i]);
+        g_byte_array_append(a, le, 2);
+    }
+    g_free(units);
+}
+
+/*
+ * NAS Get PLMN Name (0x44), TLV 0x10 "3GPP EONS PLMN Name": the service
+ * provider name, then the short and long network names, each an encoding
+ * (1, UCS-2 LE), for the network names the add-country-initials and spare-bits
+ * bytes, and a length-prefixed string. iOS 10's CommCenter asks for the
+ * registered PLMN's name here and shows it as the carrier; the modem's only
+ * network is its own, so any other PLMN has no name.
+ */
+static void mdm_nas_plmn_name(GByteArray *a, const IosBbCore *bb,
+                              const uint8_t *p, size_t n, uint8_t result[4])
+{
+    size_t len = 0;
+    const uint8_t *plmn = find_tlv(p, n, 1, &len);
+    char mcc[4];
+    g_autoptr(GByteArray) v = g_byte_array_new();
+    const char *name = bb->operator_long;
+    const char *short_name = bb->operator_short[0] ? bb->operator_short : name;
+    const uint8_t ucs2 = 1, none = 0;
+
+    if (!plmn || len < 4) {
+        result[0] = 1;
+        result[2] = 0x30; /* MISSING_ARGUMENT */
+        return;
+    }
+    memcpy(mcc, bb->plmn, 3);
+    mcc[3] = 0;
+    if (lduw_le_p(plmn) != atoi(mcc) || lduw_le_p(plmn + 2) != atoi(bb->plmn + 3)) {
+        name = short_name = "";
+    }
+    g_byte_array_append(v, &ucs2, 1);
+    mdm_nas_ucs2_name(v, name);
+    for (int i = 0; i < 2; i++) {
+        g_byte_array_append(v, &ucs2, 1);
+        g_byte_array_append(v, &none, 1);
+        g_byte_array_append(v, &none, 1);
+        mdm_nas_ucs2_name(v, i ? name : short_name);
+    }
+    tlv(a, 0x10, v->data, v->len);
+}
+
 static void mdm_nas_plmn(GByteArray *a, uint8_t tag, const IosBbCore *bb)
 {
     uint8_t value[5 + sizeof(bb->operator_long)];
@@ -2721,6 +2781,9 @@ static GByteArray *mdm_qmi_reply(MDM9x15State *s, unsigned iface,
             break;
         case 0x25:
             mdm_nas_plmn(a, 1, bb);
+            break;
+        case 0x44:
+            mdm_nas_plmn_name(a, bb, p + header, n - header, result);
             break;
         case 0x34: {
             uint8_t emergency = 0, automatic = 0;
