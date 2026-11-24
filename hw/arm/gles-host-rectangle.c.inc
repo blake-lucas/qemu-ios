@@ -140,6 +140,8 @@ static GLboolean gles_native_is_texture(GLuint name)
 static void gles_native_get_integer(GLenum pname, GLint *value)
 {
     if (pname==GL_MAX_TEXTURE_UNITS && gles_egl_current->api==1) { *value=gles_native_fixed_units(); return; }
+    /* The SGX's ES 1.1 limit; the guest's front end lowers it to the MBX's. */
+    if (pname==GL_MAX_TEXTURE_LOD_BIAS_EXT && gles_native_lod_bias_kept()) { *value=4; return; }
     int unit=gles_native_unit();
     if (unit>=0 && pname==GL_TEXTURE_BINDING_RECTANGLE_ARB) { *value=gles_egl_current->texture_units[unit].rectangle; return; }
     if (unit>=0 && pname==GL_TEXTURE_BINDING_2D) { *value=gles_egl_current->texture_units[unit].texture_2d; return; }
@@ -153,7 +155,8 @@ static void gles_native_get_float(GLenum pname, GLfloat *value)
 {
     if (pname==GL_TEXTURE_BINDING_2D || pname==GL_TEXTURE_BINDING_CUBE_MAP ||
         pname==GL_TEXTURE_BINDING_RECTANGLE_ARB || pname==GL_MAX_RECTANGLE_TEXTURE_SIZE_ARB ||
-        (pname==GL_MAX_TEXTURE_UNITS && gles_egl_current->api==1)) {
+        (pname==GL_MAX_TEXTURE_UNITS && gles_egl_current->api==1) ||
+        (pname==GL_MAX_TEXTURE_LOD_BIAS_EXT && gles_native_lod_bias_kept())) {
         GLint integer; gles_native_get_integer(pname,&integer); *value=integer; return;
     }
     glGetFloatv(pname,value);
@@ -181,19 +184,76 @@ static void gles_native_texture_enable(GLenum cap, bool enable)
 static void gles_native_enable(GLenum cap) { gles_native_texture_enable(cap,true); }
 static void gles_native_disable(GLenum cap) { gles_native_texture_enable(cap,false); }
 
-#define NATIVE_TEXTURE_PARAMETER(name, value_type) \
+/*
+ * EXT_texture_filter_anisotropic. Adreno's ES1 context lists it and answers
+ * MAX_TEXTURE_MAX_ANISOTROPY (16), but refuses TEXTURE_MAX_ANISOTROPY on a
+ * texture, set or get, with INVALID_ENUM. That error reached the guest's next
+ * glGetError: Zombie Crisis 3D sets 1.0 on its textures and took the error read
+ * after its first PVRTC upload for an upload failure, then used the texture
+ * object its failed init had freed (issue 18). Where the host refuses it, the
+ * value is kept on the texture here and not applied: textures filter without
+ * anisotropy, as the MBX does at 1.0.
+ */
+static bool gles_native_anisotropy_kept(void)
+{
+    static int kept=-1;   /* one driver per worker process: its ES1 answer is the same for every context */
+    if (gles_egl_current->api!=1) return false;
+    if (kept<0) {
+        GLfloat value=1;
+        gles_native_save_errors();
+        glGetTexParameterfv(GL_TEXTURE_2D,GL_TEXTURE_MAX_ANISOTROPY_EXT,&value);
+        kept=glGetError()!=GL_NO_ERROR;
+        if (!kept) {
+            glTexParameterf(GL_TEXTURE_2D,GL_TEXTURE_MAX_ANISOTROPY_EXT,value);
+            kept=glGetError()!=GL_NO_ERROR;
+        }
+        for (unsigned i=0;i<8 && glGetError()!=GL_NO_ERROR;i++) {}
+        fprintf(stderr,"[gles-egl] GLES1 GL_EXT_texture_filter_anisotropic: %s\n",
+                kept ? "texture setting not on this host, kept by the bridge and not applied" : "host");
+    }
+    return kept;
+}
+static bool gles_native_anisotropy_set(GLenum target, GLenum pname, GLfloat value)
+{
+    if (pname!=GL_TEXTURE_MAX_ANISOTROPY_EXT || !gles_native_anisotropy_kept()) return false;
+    GLESEGLTexture *texture=gles_native_bound_texture(target);
+    if (!texture) gles_native_error(GL_INVALID_ENUM);
+    else if (!(value>=1)) gles_native_error(GL_INVALID_VALUE);
+    else texture->max_anisotropy=value;
+    return true;
+}
+static bool gles_native_anisotropy_get(GLenum target, GLenum pname, GLfloat *value)
+{
+    if (pname!=GL_TEXTURE_MAX_ANISOTROPY_EXT || !gles_native_anisotropy_kept()) return false;
+    GLESEGLTexture *texture=gles_native_bound_texture(target);
+    if (!texture) gles_native_error(GL_INVALID_ENUM);
+    else *value=texture->max_anisotropy ? texture->max_anisotropy : 1;
+    return true;
+}
+static bool gles_native_anisotropy_geti(GLenum target, GLenum pname, GLint *value)
+{
+    GLfloat f;
+    if (!gles_native_anisotropy_get(target,pname,&f)) return false;
+    if (pname==GL_TEXTURE_MAX_ANISOTROPY_EXT && gles_native_bound_texture(target)) *value=(GLint)lrintf(f);
+    return true;
+}
+
+#define NATIVE_TEXTURE_PARAMETER(name, value_type, kept) \
 static void gles_native_##name(GLenum target, GLenum pname, value_type value) \
 { \
+    if (kept) return; \
     GLuint old=gles_native_texture_start(target); \
     name(gles_native_target(target),pname,value); \
     gles_native_texture_finish(target,old); \
 }
-NATIVE_TEXTURE_PARAMETER(glTexParameteri, GLint)
-NATIVE_TEXTURE_PARAMETER(glTexParameterf, GLfloat)
-NATIVE_TEXTURE_PARAMETER(glTexParameteriv, const GLint *)
-NATIVE_TEXTURE_PARAMETER(glTexParameterfv, const GLfloat *)
-NATIVE_TEXTURE_PARAMETER(glGetTexParameteriv, GLint *)
-NATIVE_TEXTURE_PARAMETER(glGetTexParameterfv, GLfloat *)
+NATIVE_TEXTURE_PARAMETER(glTexParameteri, GLint, gles_native_anisotropy_set(target,pname,(GLfloat)value))
+NATIVE_TEXTURE_PARAMETER(glTexParameterf, GLfloat, gles_native_anisotropy_set(target,pname,value))
+NATIVE_TEXTURE_PARAMETER(glTexParameteriv, const GLint *,
+                         pname==GL_TEXTURE_MAX_ANISOTROPY_EXT && gles_native_anisotropy_set(target,pname,(GLfloat)value[0]))
+NATIVE_TEXTURE_PARAMETER(glTexParameterfv, const GLfloat *,
+                         pname==GL_TEXTURE_MAX_ANISOTROPY_EXT && gles_native_anisotropy_set(target,pname,value[0]))
+NATIVE_TEXTURE_PARAMETER(glGetTexParameteriv, GLint *, gles_native_anisotropy_geti(target,pname,value))
+NATIVE_TEXTURE_PARAMETER(glGetTexParameterfv, GLfloat *, gles_native_anisotropy_get(target,pname,value))
 #undef NATIVE_TEXTURE_PARAMETER
 
 /* Copy calls use the same logical target selection as uploads. */
