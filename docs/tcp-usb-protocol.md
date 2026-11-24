@@ -128,9 +128,10 @@ length says how much was taken. The host sends the rest in its next transaction,
 which lands in the guest's next transfer. This is what a real link does when a
 host writes more than the device armed: a Mac's usbmuxd writes 48 KiB mux packets
 into iOS's 16 to 32 KiB transfers. The guest's mux reassembles them by its own
-headers. iOS arms 16 to 32 KiB, always a multiple of 512, on 3.1.3, 4.2.1, 5.1.1,
-6.1.x and 10.3.4 (`LT_USB_STATS=1`). LightTouch's usbmuxd-qemu sends 32760-byte
-transactions: twice the data per guest turnaround of the 16384 it used before.
+headers. iOS arms 16 to 32 KiB while the host sends 16 KiB packets, 4 to 32 KiB
+once it sends larger ones, and every armed size checked was a multiple of 512
+(`LT_USB_STATS=1`; 3.1.3 to 10.3.4). LightTouch's usbmuxd-qemu sends 32760-byte
+transactions, which halved the time an IPA upload spends sending against 16384.
 
 **The IN direction is the other way round: the device may answer one request
 with less than the transfer contains, and the transfer continues.** The guest
