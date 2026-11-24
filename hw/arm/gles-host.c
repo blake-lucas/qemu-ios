@@ -310,7 +310,7 @@ static inline bool gles_array_range(uint64_t ptr, uint64_t stride, uint64_t esz,
 /* Bit positions in the bound-array mask: the three non-texture arrays take
  * 0..2, then one bit per texture unit. */
 #define GLES_TEXCOORD_BIT  3u
-/* Set when the draw is skinned (gles_skin): the host's modelview was pushed. */
+/* Set when the draw is skinned (gles_skin): the host draws under identity, the guest's modelview saved in skin_modelview. */
 #define GLES_SKIN_BIT      (GLES_TEXCOORD_BIT + GLES_MAX_TEXUNITS)
 
 /*
@@ -2412,7 +2412,7 @@ static float gles_elem(const uint8_t *p, GLenum type, unsigned c, bool norm)
  * of its units' palette matrices applied to it, and with lighting on its
  * normal the weighted sum of their upper 3x3s' inverse transposes applied to
  * it (the extension's second formulation). The host draws those under an
- * identity modelview (pushed here, popped by gles_unbind_arrays), the
+ * identity modelview (the guest's saved here, loaded back by gles_unbind_arrays), the
  * projection as it is. The bound-array bits, or 0 to draw unskinned: the
  * palette is off or an array is missing.
  */
@@ -3881,6 +3881,15 @@ static void gles_unbind_arrays(uint32_t bound)
     unsigned i;
     uint64_t t0;
 
+    /* Whatever the array cache does: a skinned draw ran under an identity modelview (gles_skin), and the guest's
+     * next matrix op, draw or glLoadPaletteFromModelViewMatrixOES must find its own modelview there. */
+    if (bound & (1u << GLES_SKIN_BIT)) {
+        GLint mode = GL_MODELVIEW;
+        glGetIntegerv(GL_MATRIX_MODE, &mode);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadMatrixf(gh.skin_modelview);
+        glMatrixMode(mode);
+    }
     if (gles_array_cache) {
         return; /* Next draw prepares every array before the driver uses it. */
     }
@@ -3897,13 +3906,6 @@ static void gles_unbind_arrays(uint32_t bound)
         }
     }
     gles_client_active(gh.client_active_unit);
-    if (bound & (1u << GLES_SKIN_BIT)) {
-        GLint mode = GL_MODELVIEW;
-        glGetIntegerv(GL_MATRIX_MODE, &mode);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadMatrixf(gh.skin_modelview);
-        glMatrixMode(mode);
-    }
     gh.t_arrays += gles_t() - t0;
 }
 
@@ -5481,8 +5483,9 @@ static bool gles_vao_bind(GLESHost *h, uint32_t name)
  * resumes without them (the desktop hosts that save snapshots have deep stacks: Mesa's are 32, 32 and 10).
  *
  * The bridge's own matrix changes (gles_palette_call, gles_skin, gles_draw_tex) save and load back the live matrix
- * rather than push it, so a guest that fills a stack (Field & Stream Fishing's reel scene pushes its modelview without
- * popping until the host's 32 are full) can't make them overwrite its matrices.
+ * rather than push it: a push takes one of the guest's entries, and one refused on a full stack overwrites the guest's
+ * matrix. (Field & Stream Fishing's reel scene once filled the host's 32: gles_skin's push was never popped while the
+ * array cache was on; the game itself goes 3 deep there.)
  *
  * IT_GLES_HOST_STACK_DEPTH=N treats every host stack as N deep, to exercise this on a host with deep stacks.
  */
@@ -8920,8 +8923,8 @@ static bool gles_palette_op(uint32_t slot)
 /* A gles_palette_op slot in MATRIX_PALETTE_OES mode: the call itself, run on the host's modelview loaded with the
  * current palette matrix, which takes the result; the modelview and the host's matrix mode are put back. The
  * palette has no stack (the extension: "Not required"), so a push overflows and a pop underflows it. The modelview
- * is saved and loaded back, not pushed: Field & Stream Fishing's reel scene leaves the modelview stack full (it
- * pushes more than it pops), and a refused push here wrote the palette matrix over the guest's modelview. */
+ * is saved and loaded back, not pushed (see gles_matrix_push): a refused push here wrote the palette matrix over the
+ * guest's modelview. */
 static int64_t gles_palette_call(CPUState *cpu, uint32_t slot, uint32_t ctx, uint32_t argc, const uint32_t *a)
 {
     GLint mode = GL_MODELVIEW;
