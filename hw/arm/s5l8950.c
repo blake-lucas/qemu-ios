@@ -233,6 +233,7 @@ struct S5L8950State {
     uint32_t ae2_host_pending;
     bool ae2_wfi_seen;
     QEMUTimer *ae2_wfi_timer;
+    bool ae2_wfi_parked;   /* the tick is off: AE2 sits in WFI with its idle event sent (a6_ae2_wfi_tick) */
     uint32_t ae2_regs[0x2000 / 4];
     DeviceState *gpio;
     DeviceState *pmu;
@@ -997,11 +998,14 @@ static const MemoryRegionOps a6_iop_ops = {
     .valid = {.min_access_size = 4, .max_access_size = 4},
 };
 
+static void a6_ae2_wfi_unpark(S5L8950State *s);
+
 static void a6_ae2_irq_update(S5L8950State *s)
 {
     if (!s->ae2_cpu) {
         return;
     }
+    a6_ae2_wfi_unpark(s);
     qemu_set_irq(qdev_get_gpio_in(DEVICE(s->ae2_cpu), ARM_CPU_IRQ),
                  (s->ae2_pending & s->ae2_irq_enable) != 0);
     qemu_set_irq(qdev_get_gpio_in(DEVICE(s->ae2_cpu), ARM_CPU_FIQ),
@@ -1094,8 +1098,31 @@ static void a6_ae2_wfi_tick(void *opaque)
     } else {
         s->ae2_wfi_seen = false;
     }
+    /*
+     * Powered off, or idle with its event sent, AE2 has nothing to report until something starts or wakes it, and
+     * only its interrupt lines (a6_ae2_irq_update) or a hold or start do: the tick stops until then instead of
+     * running 1000 times a second on the main loop (~40% of its wakeups; iOS leaves AE2 off until audio needs it).
+     * LT_AE2_WFI_PARK=off keeps it ticking (A/B).
+     */
+    static int park = -1;
+    if (park < 0) {
+        const char *v = getenv("LT_AE2_WFI_PARK");
+        park = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    if (park && ((idle && s->ae2_wfi_seen) || s->ae2_cpu->power_state == PSCI_OFF)) {
+        s->ae2_wfi_parked = true;
+        return;
+    }
     timer_mod(s->ae2_wfi_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+}
+
+static void a6_ae2_wfi_unpark(S5L8950State *s)
+{
+    if (s->ae2_wfi_parked && s->ae2_wfi_timer) {
+        s->ae2_wfi_parked = false;
+        timer_mod(s->ae2_wfi_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    }
 }
 
 static uint64_t a6_ae2_control_read(void *opaque, hwaddr offset, unsigned size)
@@ -1175,6 +1202,7 @@ static void a6_ae2_control_write(void *opaque, hwaddr offset, uint64_t value,
         s->ae2_cpu->env.halt_reason = NOT_HALTED;
         cpu->halted = 0;
         qemu_cpu_kick(cpu);
+        a6_ae2_wfi_unpark(s);
     }
 }
 
