@@ -7367,9 +7367,10 @@ static bool gles_glsl_scan(const char *t, const char *end, bool *comment)
  * CC_PMatrix; ..."), so Mutant Fridge Mayhem's draw-node shader, whose text opens with `#extension
  * GL_OES_standard_derivatives : enable`, has it on line 12; the compile failed and cocos2d aborts on any failed
  * compile (GitHub issue 16).
- * A late directive goes after #version (else first), in order, its line left empty so later lines keep their
- * numbers. One inside an #if stays: moving it out would apply it unconditionally (none seen). So does one whose line
- * opens a block comment. NULL when nothing moves, which is every shader whose directives already come first.
+ * A late directive goes after #version (else first), in order, and its own line is left empty, so a compile error
+ * names a line one further down per moved directive. One inside an #if stays: moving it out would apply it
+ * unconditionally (none seen). So does one whose line opens a block comment. NULL when nothing moves, which is every
+ * shader whose directives already come first.
  */
 static char *gles_glsl_hoist_extensions(const char *src)
 {
