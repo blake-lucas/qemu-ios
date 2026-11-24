@@ -310,7 +310,7 @@ static inline bool gles_array_range(uint64_t ptr, uint64_t stride, uint64_t esz,
 /* Bit positions in the bound-array mask: the three non-texture arrays take
  * 0..2, then one bit per texture unit. */
 #define GLES_TEXCOORD_BIT  3u
-/* Set when the draw is skinned (gles_skin): the host's modelview was pushed. */
+/* Set when the draw is skinned (gles_skin): the host draws under identity, the guest's modelview saved in skin_modelview. */
 #define GLES_SKIN_BIT      (GLES_TEXCOORD_BIT + GLES_MAX_TEXUNITS)
 
 /*
@@ -2412,7 +2412,7 @@ static float gles_elem(const uint8_t *p, GLenum type, unsigned c, bool norm)
  * of its units' palette matrices applied to it, and with lighting on its
  * normal the weighted sum of their upper 3x3s' inverse transposes applied to
  * it (the extension's second formulation). The host draws those under an
- * identity modelview (pushed here, popped by gles_unbind_arrays), the
+ * identity modelview (the guest's saved here, loaded back by gles_unbind_arrays), the
  * projection as it is. The bound-array bits, or 0 to draw unskinned: the
  * palette is off or an array is missing.
  */
