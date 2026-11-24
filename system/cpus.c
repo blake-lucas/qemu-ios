@@ -476,7 +476,7 @@ void qemu_process_cpu_events(CPUState *cpu)
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
         }
-        qemu_cond_wait(cpu->halt_cond, &bql);
+        qemu_cond_wait_bql(cpu->halt_cond);
     }
     if (slept) {
         qemu_plugin_vcpu_resume_cb(cpu);
@@ -586,7 +586,10 @@ void qemu_ios_profile_lock(uint64_t, uint64_t, bool, const char *, int) __attrib
 void qemu_ios_profile_callback(void *, const char *, int64_t) __attribute__((weak));
 uint64_t it_acct_vcpu_bql_n, it_acct_vcpu_bql_ns, it_acct_vcpu_bql_slow;
 extern void *it_acct_mmio_mr;
-struct it_acct_mr { void *mr; uint64_t n, ns; char *name; } it_acct_mrs[256];
+/* vCPU acquisitions by MMIO region or call site and vCPU: waits (n, ns) and the hold that followed (hold_*). */
+struct it_acct_mr { void *mr; uint64_t n, ns; char *name; uint64_t hold_n, hold_ns, hold_long_n, hold_max; } it_acct_mrs[256];
+static __thread int64_t it_acct_vhold_since;
+static __thread int it_acct_vhold_idx = -1;
 /* vCPU waits and other threads' holds by duration: <1us, <10us, <100us, <1ms, more. */
 uint64_t it_acct_wait_hist[5][2], it_acct_hold_hist[5][2];
 struct it_acct_holder { const char *file; int line; uint64_t n, ns, long_n, long_ns; } it_acct_holders[64];
@@ -662,25 +665,30 @@ void bql_lock_impl(const char *file, int line)
             it_acct_wait_hist[it_acct_bucket(dt)][0]++;
             it_acct_wait_hist[it_acct_bucket(dt)][1] += dt;
             /* Non-MMIO takers are keyed by call site (file is a literal). */
-            void *key = it_acct_mmio_mr ? it_acct_mmio_mr
-                                        : (void *)((uintptr_t)file ^ ((uintptr_t)line << 48));
+            /* ...and by vCPU: on the A6 four vCPU threads (two AP cores, the IOP, AE2) contend with each other. */
+            uintptr_t who = (uintptr_t)current_cpu->cpu_index << 56;
+            void *key = it_acct_mmio_mr ? (void *)((uintptr_t)it_acct_mmio_mr ^ who)
+                                        : (void *)((uintptr_t)file ^ ((uintptr_t)line << 40) ^ who);
             for (int i = 0; i < 256; i++) {
                 if (!it_acct_mrs[i].mr || it_acct_mrs[i].mr == key) {
                     if (!it_acct_mrs[i].mr) {
                         /* Copy now: some regions are transient and freed later. */
                         MemoryRegion *r = it_acct_mmio_mr;
-                        it_acct_mrs[i].name = r ? g_strdup_printf("%s@0x%" PRIx64 "+0x%" PRIx64,
+                        it_acct_mrs[i].name = r ? g_strdup_printf("%s@0x%" PRIx64 "+0x%" PRIx64 "#cpu%d",
                             memory_region_name(r) ?: "?", (uint64_t)r->addr,
-                            (uint64_t)int128_get64(r->size)) : g_strdup_printf("%s:%d", file, line);
+                            (uint64_t)int128_get64(r->size), current_cpu->cpu_index)
+                            : g_strdup_printf("%s:%d#cpu%d", file, line, current_cpu->cpu_index);
                     }
                     it_acct_mrs[i].mr = key;
                     it_acct_mrs[i].n++;
                     it_acct_mrs[i].ns += dt;
+                    it_acct_vhold_idx = i;
                     break;
                 }
             }
         }
         it_acct_mmio_mr = NULL;
+        it_acct_vhold_since = t0 + dt;
         return;
     }
     bql_lock_fn(&bql, file, line);
@@ -699,10 +707,35 @@ bool bql_trylock(void)
     return !qemu_mutex_trylock_impl(&bql, __FILE__, __LINE__);
 }
 
+/* A vCPU's hold ends (unlock, or a condition wait that drops the BQL): by the site that took it. */
+static void it_acct_vhold_end(void)
+{
+    int64_t dt = get_clock() - it_acct_vhold_since;
+    int i = it_acct_vhold_idx;
+
+    it_acct_vhold_since = 0;
+    it_acct_vhold_idx = -1;
+    if (i >= 0 && qatomic_read(&it_bql_acct_on)) {
+        it_acct_mrs[i].hold_n++;
+        it_acct_mrs[i].hold_ns += dt;
+        it_acct_mrs[i].hold_long_n += dt >= 100000;
+        it_acct_mrs[i].hold_max = MAX(it_acct_mrs[i].hold_max, (uint64_t)dt);
+    }
+    /* Capture rows only with the accounting on: the frame inspector reads H rows as the main loop's holds. */
+    if (dt >= 500000 && qemu_ios_profile_lock && current_cpu && qatomic_read(&it_bql_acct_on)) {
+        qemu_ios_profile_lock(get_clock() - dt, get_clock(), false,
+                              i >= 0 && it_acct_mrs[i].name ? it_acct_mrs[i].name : "vcpu-hold",
+                              1000 + current_cpu->cpu_index);
+    }
+}
+
 void bql_unlock(void)
 {
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
+    if (unlikely(it_acct_vhold_since)) {
+        it_acct_vhold_end();
+    }
     if (unlikely(it_acct_held_since)) {
         /* How long threads other than the vCPU hold the BQL, by taker. */
         int64_t dt = get_clock() - it_acct_held_since;
@@ -734,12 +767,28 @@ void bql_unlock(void)
 
 void qemu_cond_wait_bql(QemuCond *cond)
 {
+    bool timed = it_acct_vhold_since;
+
+    if (timed) {
+        it_acct_vhold_end();
+    }
     qemu_cond_wait(cond, &bql);
+    if (timed) {
+        it_acct_vhold_since = get_clock();   /* the rest of this hold has no site */
+    }
 }
 
 void qemu_cond_timedwait_bql(QemuCond *cond, int ms)
 {
+    bool timed = it_acct_vhold_since;
+
+    if (timed) {
+        it_acct_vhold_end();
+    }
     qemu_cond_timedwait(cond, &bql, ms);
+    if (timed) {
+        it_acct_vhold_since = get_clock();
+    }
 }
 
 /* signal CPU creation */

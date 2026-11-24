@@ -133,7 +133,7 @@ extern uint64_t it_acct_lookups, it_acct_jc_misses, it_acct_jc_empty, it_acct_jc
 extern uint64_t it_acct_flagbit[3][32];
 extern uint64_t it_acct_pcrel_invals, it_acct_jc_flushes;
 extern uint64_t it_acct_vcpu_bql_n, it_acct_vcpu_bql_ns, it_acct_vcpu_bql_slow;
-extern struct it_acct_mr { void *mr; uint64_t n, ns; char *name; } it_acct_mrs[256];
+extern struct it_acct_mr { void *mr; uint64_t n, ns; char *name; uint64_t hold_n, hold_ns, hold_long_n, hold_max; } it_acct_mrs[256];
 extern uint64_t it_acct_wait_hist[5][2], it_acct_hold_hist[5][2];
 extern uint64_t it_acct_ctxsw, it_acct_fills[32][2];
 extern uint64_t it_acct_el0_sync, it_acct_el0_used, it_acct_tlbiasid, it_acct_pflush, it_acct_rflush,
@@ -368,8 +368,10 @@ static void mttcg_acct_dump(int64_t now)
                 it_acct_holders[i].ns, it_acct_holders[i].long_n, it_acct_holders[i].long_ns);
     }
     for (int i = 0; i < 256 && it_acct_mrs[i].mr; i++) {
-        fprintf(stderr, "[acct]   bql-by-mr %s n %" PRIu64 " wait-ns %" PRIu64 "\n",
-                it_acct_mrs[i].name, it_acct_mrs[i].n, it_acct_mrs[i].ns);
+        fprintf(stderr, "[acct]   bql-by-mr %s n %" PRIu64 " wait-ns %" PRIu64 " hold-n %" PRIu64 " hold-ns %" PRIu64
+                " hold-long %" PRIu64 " hold-max %" PRIu64 "\n",
+                it_acct_mrs[i].name, it_acct_mrs[i].n, it_acct_mrs[i].ns, it_acct_mrs[i].hold_n,
+                it_acct_mrs[i].hold_ns, it_acct_mrs[i].hold_long_n, it_acct_mrs[i].hold_max);
     }
     for (int k = 0; k < 3; k++) {
         for (int b = 0; b < 32; b++) {
@@ -377,6 +379,18 @@ static void mttcg_acct_dump(int64_t now)
                 fprintf(stderr, "[acct]   same-pc miss: %s bit %d x%" PRIu64 "\n",
                         k == 0 ? "cs_base" : k == 1 ? "flags" : "cflags", b,
                         it_acct_flagbit[k][b]);
+            }
+        }
+    }
+    {
+        extern struct it_mmio_hist { void *mr; uint32_t off; uint64_t n; char *name; } it_mmio_hist[4096];
+        extern int it_mmio_hist_on;
+
+        for (int i = 0; it_mmio_hist_on > 0 && i < 4096; i++) {
+            struct it_mmio_hist *e = &it_mmio_hist[i];
+            if (qatomic_load_acquire(&e->mr) && e->n >= 64) {
+                fprintf(stderr, "[acct]   mmio %s+0x%x %c n %" PRIu64 "\n", e->name, e->off & ~1u,
+                        e->off & 1 ? 'w' : 'r', e->n);
             }
         }
     }

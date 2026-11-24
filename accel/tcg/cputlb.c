@@ -2433,6 +2433,49 @@ static inline void it_acct_mmio_leave(ItAcctMMIOScope *scope)
 
 G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(ItAcctMMIOScope, it_acct_mmio_leave)
 
+/*
+ * LT_MMIO_HIST=on: count guest MMIO accesses by region, 4-byte offset and direction (diagnostics, racy counts), to
+ * find the registers a guest hits often enough that taking the BQL for them matters. The accounting dump prints them.
+ */
+struct it_mmio_hist { void *mr; uint32_t off; uint64_t n; char *name; } it_mmio_hist[4096];
+int it_mmio_hist_on = -1;
+
+static void it_mmio_hist_note(MemoryRegion *mr, hwaddr off, bool write)
+{
+    uint32_t key = (uint32_t)(off & ~(hwaddr)3) | write;
+    uint32_t h = (uint32_t)(((uintptr_t)mr >> 4) * 2654435761u ^ key * 40503u) & 4095;
+
+    for (int i = 0; i < 4096; i++, h = (h + 1) & 4095) {
+        struct it_mmio_hist *e = &it_mmio_hist[h];
+        if (e->mr == mr && e->off == key) {
+            qatomic_set(&e->n, e->n + 1);
+            return;
+        }
+        if (!e->mr) {
+            /* Named now: some regions are transient and freed later. */
+            e->name = g_strdup_printf("%s@0x%" PRIx64, memory_region_name(mr) ?: "?", (uint64_t)mr->addr);
+            e->off = key;
+            e->n = 1;
+            qatomic_store_release(&e->mr, mr);
+            return;
+        }
+    }
+}
+
+static inline void it_mmio_hist_maybe(MemoryRegion *mr, hwaddr off, bool write)
+{
+    if (unlikely(it_mmio_hist_on)) {
+        if (it_mmio_hist_on < 0) {
+            const char *v = getenv("LT_MMIO_HIST");
+            it_mmio_hist_on = v && !strcmp(v, "on");
+            if (!it_mmio_hist_on) {
+                return;
+            }
+        }
+        it_mmio_hist_note(mr, off, write);
+    }
+}
+
 /* Lockless callbacks may acquire the BQL themselves. Keep their region for
  * that acquisition, then restore it even when no acquisition consumed it.
  * Otherwise a timer-counter read can mislabel a subsequent interrupt lock. */
@@ -2455,6 +2498,7 @@ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     mr = section->mr;
 
     MMIO_BQL_LOCK_GUARD(mr);
+    it_mmio_hist_maybe(mr, mr_offset, false);
     return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
                            type, ra, mr, mr_offset);
 }
@@ -2474,6 +2518,7 @@ static Int128 do_ld16_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     mr = section->mr;
 
     MMIO_BQL_LOCK_GUARD(mr);
+    it_mmio_hist_maybe(mr, mr_offset, false);
     a = int_ld_mmio_beN(cpu, full, ret_be, addr, size - 8, mmu_idx,
                         MMU_DATA_LOAD, ra, mr, mr_offset);
     b = int_ld_mmio_beN(cpu, full, ret_be, addr + size - 8, 8, mmu_idx,
@@ -2969,6 +3014,7 @@ static uint64_t do_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
     mr = section->mr;
 
     MMIO_BQL_LOCK_GUARD(mr);
+    it_mmio_hist_maybe(mr, mr_offset, true);
     return int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
                            ra, mr, mr_offset);
 }
@@ -2987,6 +3033,7 @@ static uint64_t do_st16_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
     mr = section->mr;
 
     MMIO_BQL_LOCK_GUARD(mr);
+    it_mmio_hist_maybe(mr, mr_offset, true);
     int_st_mmio_leN(cpu, full, int128_getlo(val_le), addr, 8,
                     mmu_idx, ra, mr, mr_offset);
     return int_st_mmio_leN(cpu, full, int128_gethi(val_le), addr + 8,
