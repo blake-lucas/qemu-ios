@@ -266,6 +266,9 @@ struct S5L8950State {
     uint32_t pmgr[0x7000 / 4];
     uint64_t pmgr_transition_done;
     bool pmgr_transition_pending;
+    /* PMGR+0x1700-0x172b, the performance-state registers, dispatched without the BQL (a6_pmgr_perf_ops). */
+    MemoryRegion pmgr_perf;
+    QemuSpin pmgr_perf_lock;
     A6I2C *i2c[3];
     /* the motion sensors (a6_motion_init): the accelerometer carries the
      * attitude and the host's samples the gyro and compass read */
@@ -796,6 +799,39 @@ static void a6_pmgr_write(S5L8950State *s, uint32_t reg, uint32_t value)
     }
     s->pmgr[reg / 4] = value;
 }
+
+/*
+ * iOS 10's performance controller requests a performance state at PMGR+0x1700 and polls it and the finish times
+ * after each request: 400-750 requests a second while the UI works, ~5-10 accesses each, the most frequent MMIO
+ * on the board. They touch only these three fields, so they skip the BQL and take this lock instead.
+ * LT_PMGR_PERF_UNLOCKED=off dispatches them under the BQL again (A/B).
+ */
+static uint64_t a6_pmgr_perf_read(void *opaque, hwaddr offset, unsigned size)
+{
+    S5L8950State *s = opaque;
+    uint32_t value;
+
+    qemu_spin_lock(&s->pmgr_perf_lock);
+    value = a6_pmgr_read(s, 0x1700 + offset);
+    qemu_spin_unlock(&s->pmgr_perf_lock);
+    return value;
+}
+
+static void a6_pmgr_perf_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
+{
+    S5L8950State *s = opaque;
+
+    qemu_spin_lock(&s->pmgr_perf_lock);
+    a6_pmgr_write(s, 0x1700 + offset, value);
+    qemu_spin_unlock(&s->pmgr_perf_lock);
+}
+
+static const MemoryRegionOps a6_pmgr_perf_ops = {
+    .read = a6_pmgr_perf_read,
+    .write = a6_pmgr_perf_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {.min_access_size = 4, .max_access_size = 4},
+};
 
 static uint64_t a6_unimplemented_read(void *opaque, hwaddr offset,
                                       unsigned size)
@@ -1687,6 +1723,15 @@ static void a6_init(MachineState *machine)
     memory_region_init_io(&s->peripheral, OBJECT(s), &a6_unimplemented_ops, s,
                           "a6.unimplemented", 0x10000000);
     memory_region_add_subregion_overlap(memory, 0x30000000, &s->peripheral, -1);
+    qemu_spin_init(&s->pmgr_perf_lock);
+    memory_region_init_io(&s->pmgr_perf, OBJECT(s), &a6_pmgr_perf_ops, s, "a6.pmgr-perf", 0x2c);
+    {
+        const char *v = getenv("LT_PMGR_PERF_UNLOCKED");
+        if (!(v && (!strcmp(v, "off") || !strcmp(v, "0")))) {
+            memory_region_enable_lockless_io(&s->pmgr_perf);
+        }
+    }
+    memory_region_add_subregion(memory, 0x3f101700, &s->pmgr_perf);
     memory_region_init_ram(&s->sram, NULL, "a6.sram", 0x100000, &error_fatal);
     memory_region_add_subregion_overlap(memory, 0x3f000000, &s->sram, 1);
     /* Original N42 ae2/reg entry 4: the audio IOP's dedicated 3 MiB SRAM.
