@@ -1108,6 +1108,12 @@ void free_queued_cpu_work(CPUState *cpu);
  */
 void process_queued_cpu_work(CPUState *cpu);
 
+/* Exclusive work by function (cpu-common.c), printed by the vCPU accounting. */
+struct it_acct_excl { void *fn; uint64_t n, wait_ns, work_ns, max_wait; };
+extern bool it_acct_excl_on;
+extern struct it_acct_excl it_acct_excl[16];
+void it_acct_excl_note(void *fn, int64_t wait, int64_t work);
+
 /**
  * cpu_exec_start:
  * @cpu: The CPU for the current thread.

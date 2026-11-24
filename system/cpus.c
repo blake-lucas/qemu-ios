@@ -588,6 +588,8 @@ uint64_t it_acct_vcpu_bql_n, it_acct_vcpu_bql_ns, it_acct_vcpu_bql_slow;
 extern void *it_acct_mmio_mr;
 /* vCPU acquisitions by MMIO region or call site and vCPU: waits (n, ns) and the hold that followed (hold_*). */
 struct it_acct_mr { void *mr; uint64_t n, ns; char *name; uint64_t hold_n, hold_ns, hold_long_n, hold_max; } it_acct_mrs[256];
+/* A literal naming the next vCPU acquisition when it is not MMIO (a cp15 register's name). */
+__thread const char *it_acct_site;
 static __thread int64_t it_acct_vhold_since;
 static __thread int it_acct_vhold_idx = -1;
 /* vCPU waits and other threads' holds by duration: <1us, <10us, <100us, <1ms, more. */
@@ -667,8 +669,10 @@ void bql_lock_impl(const char *file, int line)
             /* Non-MMIO takers are keyed by call site (file is a literal). */
             /* ...and by vCPU: on the A6 four vCPU threads (two AP cores, the IOP, AE2) contend with each other. */
             uintptr_t who = (uintptr_t)current_cpu->cpu_index << 56;
+            const char *site = it_acct_mmio_mr ? NULL : it_acct_site;
             void *key = it_acct_mmio_mr ? (void *)((uintptr_t)it_acct_mmio_mr ^ who)
-                                        : (void *)((uintptr_t)file ^ ((uintptr_t)line << 40) ^ who);
+                        : site ? (void *)((uintptr_t)site ^ who ^ 1)
+                        : (void *)((uintptr_t)file ^ ((uintptr_t)line << 40) ^ who);
             for (int i = 0; i < 256; i++) {
                 if (!it_acct_mrs[i].mr || it_acct_mrs[i].mr == key) {
                     if (!it_acct_mrs[i].mr) {
@@ -677,6 +681,7 @@ void bql_lock_impl(const char *file, int line)
                         it_acct_mrs[i].name = r ? g_strdup_printf("%s@0x%" PRIx64 "+0x%" PRIx64 "#cpu%d",
                             memory_region_name(r) ?: "?", (uint64_t)r->addr,
                             (uint64_t)int128_get64(r->size), current_cpu->cpu_index)
+                            : site ? g_strdup_printf("cp:%s#cpu%d", site, current_cpu->cpu_index)
                             : g_strdup_printf("%s:%d#cpu%d", file, line, current_cpu->cpu_index);
                     }
                     it_acct_mrs[i].mr = key;
@@ -688,10 +693,12 @@ void bql_lock_impl(const char *file, int line)
             }
         }
         it_acct_mmio_mr = NULL;
+        it_acct_site = NULL;
         it_acct_vhold_since = t0 + dt;
         return;
     }
     bql_lock_fn(&bql, file, line);
+    it_acct_site = NULL;
     if (unlikely(qatomic_read(&it_bql_acct_on) ||
                  qatomic_read(&it_profile_on))) {
         it_acct_held_since = get_clock();

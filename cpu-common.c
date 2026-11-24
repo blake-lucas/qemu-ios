@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "exec/cpu-common.h"
 #include "hw/core/cpu.h"
@@ -349,6 +350,28 @@ void free_queued_cpu_work(CPUState *cpu)
     }
 }
 
+/*
+ * Exclusive (stop-the-world) work by function, with the accounting on: how often each vCPU stopped every other one,
+ * how long it waited for them to leave guest code and how long the work took. Diagnostics; counts are racy.
+ */
+bool it_acct_excl_on;
+struct it_acct_excl it_acct_excl[16];
+
+void it_acct_excl_note(void *fn, int64_t wait, int64_t work)
+{
+    for (int i = 0; i < ARRAY_SIZE(it_acct_excl); i++) {
+        struct it_acct_excl *e = &it_acct_excl[i];
+        if (!e->fn || e->fn == fn) {
+            e->fn = fn;
+            e->n++;
+            e->wait_ns += wait;
+            e->work_ns += work;
+            e->max_wait = MAX(e->max_wait, (uint64_t)wait);
+            break;
+        }
+    }
+}
+
 void process_queued_cpu_work(CPUState *cpu)
 {
     struct qemu_work_item *wi;
@@ -369,10 +392,18 @@ void process_queued_cpu_work(CPUState *cpu)
              * BQL, so it goes to sleep; start_exclusive() is sleeping too, so
              * neither CPU can proceed.
              */
+            int64_t t0 = it_acct_excl_on ? get_clock() : 0, t1 = 0;
+
             bql_unlock();
             start_exclusive();
+            if (t0) {
+                t1 = get_clock();
+            }
             wi->func(cpu, wi->data);
             end_exclusive();
+            if (t0) {
+                it_acct_excl_note((void *)wi->func, t1 - t0, get_clock() - t1);
+            }
             bql_lock();
         } else {
             wi->func(cpu, wi->data);

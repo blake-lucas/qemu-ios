@@ -210,6 +210,7 @@ static void mttcg_acct_init(CPUState *cpu)
     acct_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     acct_next_dump = acct_t0 + acct_interval_ns;
     it_acct_cb_enable();
+    it_acct_excl_on = true;
     fprintf(stderr, "[acct-mode] full=%s bql=on begin-ns %" PRId64
             " interval-ns %" PRId64 "\n", it_acct_on ? "on" : "off",
             acct_t0, acct_interval_ns);
@@ -342,6 +343,18 @@ static void mttcg_acct_dump(int64_t now)
                 di.dli_fname ? strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname : "?",
                 (uintptr_t)c->fn - (uintptr_t)di.dli_fbase, di.dli_sname ? di.dli_sname : "-",
                 c->n, c->ns, c->long_n, c->long_ns, c->max);
+#endif
+    }
+    for (int i = 0; i < ARRAY_SIZE(it_acct_excl) && it_acct_excl[i].fn; i++) {
+        struct it_acct_excl *e = &it_acct_excl[i];
+#ifndef _WIN32
+        Dl_info di = { 0 };
+
+        dladdr(e->fn, &di);
+        fprintf(stderr, "[acct]   exclusive %s+0x%" PRIxPTR " n %" PRIu64 " wait-ns %" PRIu64 " work-ns %" PRIu64
+                " max-wait %" PRIu64 "\n", di.dli_sname ? di.dli_sname : "lib",
+                (uintptr_t)e->fn - (uintptr_t)(di.dli_sname ? di.dli_saddr : di.dli_fbase), e->n, e->wait_ns,
+                e->work_ns, e->max_wait);
 #endif
     }
     fprintf(stderr, "[acct]   ctxsw %" PRIu64 " el0-sync %" PRIu64 " el0-used %" PRIu64 " tlbiasid %" PRIu64
