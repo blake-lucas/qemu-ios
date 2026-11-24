@@ -661,9 +661,9 @@ typedef struct TLBShootdownItem {
 } TLBShootdownItem;
 
 /*
- * LT_TLB_SHOOTDOWN: unset or "on", the targets run the flush as queued work (tlb_broadcast_synced); "inline", they
- * flush at their next TB boundary and the issuer waits in place (tlb_shootdown_inline_run); "off", the exclusive
- * work. Only from @src's own thread, which flushes itself directly; from elsewhere, the exclusive work.
+ * LT_TLB_SHOOTDOWN: unset or "on", the targets flush at their next TB boundary and the issuer waits in place
+ * (tlb_shootdown_inline_run); "queued", they run the flush as queued work (tlb_broadcast_synced); "off", the
+ * exclusive work. Only from @src's own thread, which flushes itself directly; from elsewhere, the exclusive work.
  */
 bool tlb_shootdown_inline;
 
@@ -673,7 +673,7 @@ static int tlb_shootdown_mode(void)
 
     if (mode < 0) {
         const char *v = getenv("LT_TLB_SHOOTDOWN");
-        mode = v && (!strcmp(v, "off") || !strcmp(v, "0")) ? 0 : v && !strcmp(v, "inline") ? 2 : 1;
+        mode = v && (!strcmp(v, "off") || !strcmp(v, "0")) ? 0 : v && !strcmp(v, "queued") ? 1 : 2;
         tlb_shootdown_inline = mode == 2;
     }
     return mode;
@@ -1397,7 +1397,7 @@ void tlb_flush_page_bits_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 
 
 /*
- * LT_TLB_SHOOTDOWN=inline: each CPU the broadcast reaches gets the flush in a small
+ * The default broadcast (LT_TLB_SHOOTDOWN unset or "on"): each CPU the broadcast reaches gets the flush in a small
  * queue of its own and is sent out of its TB chain (icount_decr, as cpu_exit does without exit_request), so it runs
  * the flush at its next TB boundary in cpu_handle_interrupt, without leaving cpu_exec or taking the BQL. The issuer
  * flushes itself and waits in place until each target has run its queue that far or is outside guest code (it runs
