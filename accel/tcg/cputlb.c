@@ -607,6 +607,121 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
     }
 }
 
+/*
+ * A guest's broadcast TLB maintenance (TLBI...IS) must be complete on every CPU it reaches before the CPU that issued
+ * it runs on. QEMU did that with exclusive work: the issuer stopped every vCPU in the machine, flushed, and let them
+ * go. iOS 10 on the A6 issues ~0.6-1.4K page broadcasts a second, and the stops cost 3-9% of wall time with every vCPU
+ * stopped. Instead the issuer flushes its own TLB at once, queues the flush on each CPU the broadcast reaches, and
+ * before running guest code again waits until each of those has run it or is outside guest code (it then runs its
+ * queued work before it executes again: the queueing kicked it, so it leaves cpu_exec at its next TB boundary).
+ * Nothing else stops. LT_TLB_SHOOTDOWN=off brings back the exclusive work (A/B).
+ */
+#define TLB_SHOOTDOWN_MAX 16
+
+typedef struct TLBShootdown {
+    int refs;
+    int n;
+    CPUState *targets[TLB_SHOOTDOWN_MAX];
+    bool acked[TLB_SHOOTDOWN_MAX];
+} TLBShootdown;
+
+typedef struct TLBShootdownItem {
+    run_on_cpu_func fn;
+    run_on_cpu_data d;
+    TLBShootdown *sd;
+    int slot;
+} TLBShootdownItem;
+
+/* Only from @src's own thread, which flushes itself directly; from elsewhere, the exclusive work. */
+static bool tlb_shootdown_on(CPUState *src)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_TLB_SHOOTDOWN");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    return on && current_cpu == src;
+}
+
+static void tlb_shootdown_unref(TLBShootdown *sd)
+{
+    if (qatomic_fetch_dec(&sd->refs) == 1) {
+        g_free(sd);
+    }
+}
+
+static void tlb_shootdown_flush(CPUState *cpu, run_on_cpu_data data)
+{
+    TLBShootdownItem *it = data.host_ptr;
+
+    it->fn(cpu, it->d);
+    qatomic_store_release(&it->sd->acked[it->slot], true);
+    tlb_shootdown_unref(it->sd);
+    g_free(it);
+}
+
+/* Queued on the issuer itself: runs once it has left cpu_exec, with the BQL held, which the targets may need. */
+static void tlb_shootdown_wait(CPUState *src, run_on_cpu_data data)
+{
+    TLBShootdown *sd = data.host_ptr;
+    int64_t t0 = it_acct_excl_on ? get_clock() : 0;
+
+    bql_unlock();
+    smp_mb();
+    for (int i = 0; i < sd->n; i++) {
+        CPUState *t = sd->targets[i];
+        unsigned spins = 0;
+
+        while (!qatomic_load_acquire(&sd->acked[i]) && qatomic_read(&t->running)) {
+            if (++spins < 2000) {
+                cpu_relax();
+            } else {
+                g_usleep(0);
+            }
+            smp_mb();
+        }
+    }
+    if (t0) {
+        /* In the exclusive table, as the work it replaces: the issuer's wait, no stop of the others. */
+        it_acct_excl_note((void *)tlb_shootdown_wait, get_clock() - t0, 0);
+    }
+    bql_lock();
+    tlb_shootdown_unref(sd);
+}
+
+/*
+ * fn(cpu, d) on @src now and on every CPU the broadcast reaches, synced as above. @size > 0: d.host_ptr is a block
+ * of that size that fn frees, copied for each target; otherwise d is passed as it is.
+ */
+static void tlb_broadcast_synced(CPUState *src, run_on_cpu_func fn, run_on_cpu_data d, size_t size)
+{
+    TLBShootdown *sd = g_new0(TLBShootdown, 1);
+    CPUState *cpu;
+
+    sd->refs = 1;
+    CPU_FOREACH(cpu) {
+        if (tlb_flush_reaches(src, cpu)) {
+            TLBShootdownItem *it = g_new(TLBShootdownItem, 1);
+
+            g_assert(sd->n < TLB_SHOOTDOWN_MAX);
+            it->fn = fn;
+            it->d = size ? RUN_ON_CPU_HOST_PTR(g_memdup2(d.host_ptr, size)) : d;
+            it->sd = sd;
+            it->slot = sd->n;
+            sd->targets[sd->n++] = cpu;
+            qatomic_inc(&sd->refs);
+            async_run_on_cpu(cpu, tlb_shootdown_flush, RUN_ON_CPU_HOST_PTR(it));
+        }
+    }
+    fn(src, d);
+    if (sd->n) {
+        async_run_on_cpu(src, tlb_shootdown_wait, RUN_ON_CPU_HOST_PTR(sd));
+    } else {
+        tlb_shootdown_unref(sd);
+    }
+}
+
 /* In a flush's work data: the guest switched address space, see tlb_flush_switch_context. */
 #define TLB_FLUSH_KEEP_JMP_CACHE (1u << 31)
 QEMU_BUILD_BUG_ON(NB_MMU_MODES > 31);
@@ -715,6 +830,10 @@ void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
 
     tlb_debug("mmu_idx: 0x%"PRIx16"\n", idxmap);
 
+    if (tlb_shootdown_on(src_cpu)) {
+        tlb_broadcast_synced(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap), 0);
+        return;
+    }
     flush_all_helper(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
     async_safe_run_on_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
 }
@@ -973,6 +1092,19 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
      * Allocate memory to hold addr+idxmap only when needed.
      * See tlb_flush_page_by_mmuidx for details.
      */
+    if (tlb_shootdown_on(src_cpu)) {
+        if (idxmap < TARGET_PAGE_SIZE) {
+            tlb_broadcast_synced(src_cpu, tlb_flush_page_by_mmuidx_async_1,
+                                 RUN_ON_CPU_TARGET_PTR(addr | idxmap), 0);
+        } else {
+            TLBFlushPageByMMUIdxData *d = g_new(TLBFlushPageByMMUIdxData, 1);
+
+            d->addr = addr;
+            d->idxmap = idxmap;
+            tlb_broadcast_synced(src_cpu, tlb_flush_page_by_mmuidx_async_2, RUN_ON_CPU_HOST_PTR(d), sizeof(*d));
+        }
+        return;
+    }
     if (idxmap < TARGET_PAGE_SIZE) {
         flush_all_helper(src_cpu, tlb_flush_page_by_mmuidx_async_1,
                          RUN_ON_CPU_TARGET_PTR(addr | idxmap));
@@ -1186,6 +1318,11 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     d.idxmap = idxmap;
     d.bits = bits;
 
+    if (tlb_shootdown_on(src_cpu)) {
+        tlb_broadcast_synced(src_cpu, tlb_flush_range_by_mmuidx_async_1,
+                             RUN_ON_CPU_HOST_PTR(g_memdup(&d, sizeof(d))), sizeof(d));
+        return;
+    }
     /* Allocate a separate data block for each destination cpu.  */
     CPU_FOREACH(dst_cpu) {
         if (tlb_flush_reaches(src_cpu, dst_cpu)) {
