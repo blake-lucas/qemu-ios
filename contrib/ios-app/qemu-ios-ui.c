@@ -989,6 +989,11 @@ void qemu_ios_storage_stats(QemuIosStorageStats *out)
     };
 }
 
+void qemu_ios_storage_sync_hold(bool hold)
+{
+    nand_image_sync_hold(hold);
+}
+
 void qemu_ios_ui_vm_stopped(void)
 {
 #if !defined(__APPLE__)

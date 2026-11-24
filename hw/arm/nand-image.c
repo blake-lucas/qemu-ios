@@ -590,6 +590,23 @@ static void nand_disk_flush(void *opaque)
 }
 
 /*
+ * Holds on the periodic sync (qemu_ios_storage_sync_hold): while the app installs an app, the host's filesystem made
+ * the guest's writes wait for each fdatasync (an install grows the overlay, and a growing write waits for the
+ * journal commit), so the upload went in bursts. An install cut short is lost anyway, so nothing is risked; the
+ * writes stay pending and the first tick after the release syncs them.
+ */
+static int nand_sync_holds;
+
+void nand_image_sync_hold(bool hold)
+{
+    if (hold) {
+        qatomic_inc(&nand_sync_holds);
+    } else if (qatomic_fetch_dec(&nand_sync_holds) <= 0) {
+        qatomic_inc(&nand_sync_holds);  /* a release without a hold */
+    }
+}
+
+/*
  * The periodic sync: while the guest writes, every sync_ms an fdatasync of the overlay file, on this thread with no
  * lock held, so a host crash or power loss loses at most that window (the stop syncs the rest). Nothing else waits
  * for it; writes keep landing in the page cache meanwhile. fdatasync, not syncfs: on Android's f2fs a syncfs is a
@@ -603,7 +620,7 @@ static void *nand_disk_sync_thread(void *opaque)
     qemu_mutex_lock(&d->sync_lock);
     while (!d->sync_quit) {
         qemu_cond_timedwait(&d->sync_cond, &d->sync_lock, d->sync_ms);
-        if (d->sync_quit || !qatomic_xchg(&d->pending, false)) {
+        if (d->sync_quit || qatomic_read(&nand_sync_holds) > 0 || !qatomic_xchg(&d->pending, false)) {
             continue;
         }
         qemu_mutex_unlock(&d->sync_lock);

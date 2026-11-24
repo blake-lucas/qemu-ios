@@ -94,6 +94,9 @@ int nand_disk_erase(NANDDisk *d, unsigned chip, uint32_t block);
 int nand_disk_sync(NANDDisk *d);
 void nand_disk_close(NANDDisk *d, DeviceState *owner);
 
+/* Holds (true) or releases (false) the periodic overlay sync while the app installs an app; holds nest. */
+void nand_image_sync_hold(bool hold);
+
 /* NAND page I/O straight on the host files (POSIX; LT_NAND_DIRECT=off: through the block layer). */
 bool nand_direct_enabled(void);
 
