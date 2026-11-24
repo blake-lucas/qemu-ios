@@ -760,6 +760,53 @@ static void fetch_run(S5L8930DisplayState *s, uint8_t *dst)
     plan_run(s->fetch, dst);
 }
 
+/*
+ * Whether the planned reads would bring exactly `ref`'s bytes, compared in guest RAM without copying them; false
+ * when a segment isn't plain RAM. A still screen re-latches every vsync (QUIET_RELATCH_VBLS) and almost always
+ * finds the same pixels: copying both 640x1136 layers out first was ~6 MB of memmove a vsync on the main loop,
+ * most of the latch's 0.5-0.8 ms. LT_LATCH_COMPARE_IN_PLACE=off copies first again (A/B).
+ */
+static bool latch_compare_in_place(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_LATCH_COMPARE_IN_PLACE");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    return on;
+}
+
+static bool plan_same(GArray *plan, const uint8_t *ref)
+{
+    for (guint i = 0; i < plan->len; i++) {
+        FbSeg *g = &g_array_index(plan, FbSeg, i);
+        hwaddr done = 0;
+
+        if (g->pa == (hwaddr)-1) {
+            if (!buffer_is_zero(ref + g->off, g->len)) {
+                return false;
+            }
+            continue;
+        }
+        while (done < g->len) {
+            hwaddr l = g->len - done;
+            void *p = address_space_map(&address_space_memory, g->pa + done, &l, false, MEMTXATTRS_UNSPECIFIED);
+            bool same;
+
+            if (!p) {
+                return false;
+            }
+            same = l && !memcmp(p, ref + g->off + done, l);
+            address_space_unmap(&address_space_memory, p, l, false, 0);
+            if (!same) {
+                return false;
+            }
+            done += l;
+        }
+    }
+    return true;
+}
 
 static hwaddr h5p_ui_xlate(const uint32_t tables[64], uint32_t va)
 {
@@ -1337,6 +1384,17 @@ static void front_latch(S5L8930DisplayState *s, bool vbl)
         } else {
             g_free(vp.planes);
         }
+    }
+    /* The same layers as the front's, unchanged in guest RAM: nothing to copy or compose. */
+    if (latch_compare_in_place() && valid && !video && !s->front_video && s->front_valid &&
+        !memcmp(key, s->front_key, sizeof(key)) && len == s->src_len && !memcmp(u, s->src_layers, sizeof(u)) &&
+        plan_same(s->fetch, s->src)) {
+        g_array_set_size(s->fetch, 0);
+        if (unlocked) {
+            bql_lock();
+        }
+        display_trace_latch(s, valid, video, false, key);
+        return;
     }
     fetch_run(s, s->src_next);
     /* The front was composed from these very layers and bytes (and the same movie frame). */
