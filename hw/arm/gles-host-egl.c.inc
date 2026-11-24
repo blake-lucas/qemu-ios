@@ -32,6 +32,8 @@ typedef struct GLESEGLTextureUnit {
     bool enabled_2d, enabled_rectangle;
     /* The unit's native 2D binding holds its rectangle texture, not object_2d. */
     bool host_rectangle;
+    /* EXT_texture_lod_bias's value where the host has no such state (gles_native_lod_bias_kept). */
+    GLfloat lod_bias;
 } GLESEGLTextureUnit;
 
 typedef struct GLESEGLContext {

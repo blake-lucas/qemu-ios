@@ -140,6 +140,8 @@ static GLboolean gles_native_is_texture(GLuint name)
 static void gles_native_get_integer(GLenum pname, GLint *value)
 {
     if (pname==GL_MAX_TEXTURE_UNITS && gles_egl_current->api==1) { *value=gles_native_fixed_units(); return; }
+    /* The SGX's ES 1.1 limit; the guest's front end lowers it to the MBX's. */
+    if (pname==GL_MAX_TEXTURE_LOD_BIAS_EXT && gles_native_lod_bias_kept()) { *value=4; return; }
     int unit=gles_native_unit();
     if (unit>=0 && pname==GL_TEXTURE_BINDING_RECTANGLE_ARB) { *value=gles_egl_current->texture_units[unit].rectangle; return; }
     if (unit>=0 && pname==GL_TEXTURE_BINDING_2D) { *value=gles_egl_current->texture_units[unit].texture_2d; return; }
@@ -153,7 +155,8 @@ static void gles_native_get_float(GLenum pname, GLfloat *value)
 {
     if (pname==GL_TEXTURE_BINDING_2D || pname==GL_TEXTURE_BINDING_CUBE_MAP ||
         pname==GL_TEXTURE_BINDING_RECTANGLE_ARB || pname==GL_MAX_RECTANGLE_TEXTURE_SIZE_ARB ||
-        (pname==GL_MAX_TEXTURE_UNITS && gles_egl_current->api==1)) {
+        (pname==GL_MAX_TEXTURE_UNITS && gles_egl_current->api==1) ||
+        (pname==GL_MAX_TEXTURE_LOD_BIAS_EXT && gles_native_lod_bias_kept())) {
         GLint integer; gles_native_get_integer(pname,&integer); *value=integer; return;
     }
     glGetFloatv(pname,value);

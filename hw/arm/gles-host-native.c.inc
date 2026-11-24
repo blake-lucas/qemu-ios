@@ -252,6 +252,77 @@ static void gles_native_delete_texture_attachments(GLsizei n, const GLuint *name
     }
     gles_native_collect_textures(true);
 }
+/*
+ * EXT_texture_lod_bias. The MBX and the SGX's ES 1.1 have it, and the guest's
+ * extension list names it, but Adreno's ES1 context refuses
+ * TEXTURE_FILTER_CONTROL_EXT with INVALID_ENUM. That error reached the guest's
+ * next glGetError: Zombie Highway sets a bias before each PVRTC upload and took
+ * the error read after level 0 for an upload failure, so every texture came
+ * back nil and the game crashed (issue 17). Where the host refuses it, the bias
+ * is kept per texture unit here and read back by glGetTexEnv, but not applied:
+ * textures pick their mip level without it. Adreno 650 answers the get (0) and
+ * MAX_TEXTURE_LOD_BIAS but refuses every set, so the probe sets the value it
+ * reads back.
+ */
+static bool gles_native_lod_bias_kept(void)
+{
+    static int kept=-1;   /* one driver per worker process: its ES1 answer is the same for every context */
+    if (gles_egl_current->api!=1) return false;
+    if (kept<0) {
+        GLfloat bias=0;
+        gles_native_save_errors();
+        glGetTexEnvfv(GL_TEXTURE_FILTER_CONTROL_EXT,GL_TEXTURE_LOD_BIAS_EXT,&bias);
+        glTexEnvf(GL_TEXTURE_FILTER_CONTROL_EXT,GL_TEXTURE_LOD_BIAS_EXT,bias);
+        kept=glGetError()!=GL_NO_ERROR;
+        for (unsigned i=0;i<8 && glGetError()!=GL_NO_ERROR;i++) {}
+        fprintf(stderr,"[gles-egl] GLES1 GL_EXT_texture_lod_bias: %s\n",
+                kept ? "not on this host, kept by the bridge and not applied" : "host");
+    }
+    return kept;
+}
+static GLfloat *gles_native_lod_bias(void)
+{
+    GLint active=GL_TEXTURE0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE,&active);
+    unsigned unit=active>=GL_TEXTURE0 && active<GL_TEXTURE0+32 ? active-GL_TEXTURE0 : 0;
+    return &gles_egl_current->texture_units[unit].lod_bias;
+}
+static bool gles_native_lod_bias_set(GLenum target, GLenum pname, GLfloat value)
+{
+    if (target!=GL_TEXTURE_FILTER_CONTROL_EXT || !gles_native_lod_bias_kept()) return false;
+    if (pname!=GL_TEXTURE_LOD_BIAS_EXT) gles_native_error(GL_INVALID_ENUM);
+    else *gles_native_lod_bias()=value;
+    return true;
+}
+static bool gles_native_lod_bias_get(GLenum target, GLenum pname, GLfloat *value)
+{
+    if (target!=GL_TEXTURE_FILTER_CONTROL_EXT || !gles_native_lod_bias_kept()) return false;
+    if (pname!=GL_TEXTURE_LOD_BIAS_EXT) gles_native_error(GL_INVALID_ENUM);
+    else *value=*gles_native_lod_bias();
+    return true;
+}
+static void gles_native_tex_envf(GLenum target, GLenum pname, GLfloat value)
+{
+    if (!gles_native_lod_bias_set(target,pname,value)) glTexEnvf(target,pname,value);
+}
+static void gles_native_tex_envfv(GLenum target, GLenum pname, const GLfloat *value)
+{
+    if (!gles_native_lod_bias_set(target,pname,value[0])) glTexEnvfv(target,pname,value);
+}
+static void gles_native_tex_enviv(GLenum target, GLenum pname, const GLint *value)
+{
+    if (!gles_native_lod_bias_set(target,pname,(GLfloat)value[0])) glTexEnviv(target,pname,value);
+}
+static void gles_native_get_tex_envfv(GLenum target, GLenum pname, GLfloat *value)
+{
+    if (!gles_native_lod_bias_get(target,pname,value)) glGetTexEnvfv(target,pname,value);
+}
+static void gles_native_get_tex_enviv(GLenum target, GLenum pname, GLint *value)
+{
+    GLfloat bias;
+    if (!gles_native_lod_bias_get(target,pname,&bias)) glGetTexEnviv(target,pname,value);
+    else if (pname==GL_TEXTURE_LOD_BIAS_EXT) *value=(GLint)lrintf(bias);
+}
 #include "gles-host-rectangle.c.inc"
 static void gles_native_tex_image(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h,
                                   GLint border, GLenum format, GLenum type, const void *pixels)
@@ -807,6 +878,16 @@ static void gles_native_GetFramebufferAttachmentParameteriv(GLenum target, GLenu
 #define glGetTexParameteriv gles_native_glGetTexParameteriv
 #undef glGetTexParameterfv
 #define glGetTexParameterfv gles_native_glGetTexParameterfv
+#undef glTexEnvf
+#define glTexEnvf gles_native_tex_envf
+#undef glTexEnvfv
+#define glTexEnvfv gles_native_tex_envfv
+#undef glTexEnviv
+#define glTexEnviv gles_native_tex_enviv
+#undef glGetTexEnvfv
+#define glGetTexEnvfv gles_native_get_tex_envfv
+#undef glGetTexEnviv
+#define glGetTexEnviv gles_native_get_tex_enviv
 #undef glDrawArrays
 #define glDrawArrays gles_native_draw_arrays
 #undef glDrawElements
