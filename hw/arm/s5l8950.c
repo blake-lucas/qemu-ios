@@ -1822,6 +1822,11 @@ static void a6_init(MachineState *machine)
         } else {
             define_arm_cp_regs(s->cpu[i], a6_guest_cpregs);
         }
+        if (i == 1) {
+            /* The second AP core spins on a contended BQL like the first (Android's default; LT_BQL_SPIN_CPU1=off). */
+            const char *v = getenv("LT_BQL_SPIN_CPU1");
+            CPU(s->cpu[i])->bql_spin = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+        }
         object_unref(cpu);
     }
     memory_region_init_io(&s->aic, OBJECT(s), &a6_aic_ops, s, "a6.aic-v1",

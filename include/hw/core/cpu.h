@@ -595,6 +595,8 @@ struct CPUState {
      * firmware on their own memory maps beside the two AP cores. 0 for every CPU unless the board sets it.
      */
     int tlb_domain;
+    /* Spin briefly on a contended BQL as vCPU 0 does (cpus-bql-spin.c.inc): a board's other application core. */
+    bool bql_spin;
     /* Broadcast TLB flushes queued for this CPU, run at its next TB boundary (cputlb.c, tlb_shootdown_service). */
     struct TLBShootdownQueue *tlb_sd;
     uint32_t tcg_cflags;
