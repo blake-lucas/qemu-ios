@@ -6034,9 +6034,10 @@ static bool gles_resolve_drawable(void)
  * APPLE_framebuffer_multisample, which the SGX's drivers had from 4.0 on. The front end doesn't list it, and the
  * host answers MAX_SAMPLES_APPLE 0, but Unreal Engine 3 uses it unasked where the device had it: Epic Citadel on
  * the iPhone 5 draws its scene into a multisample renderbuffer and resolves that into the screen's. With the two
- * calls dropped the scene went nowhere and the screen stayed black. The host gives the renderbuffer up to 4
- * samples (the SGX 543's) and resolves with a blit, as the extension is defined: desktop GL, and Android's native
- * driver where the context is ES 3 (ANGLE and ES 2-only drivers still drop the calls).
+ * calls dropped the scene went nowhere and the screen stayed black. The resolve is a blit, as the extension is
+ * defined. Desktop GL gives the renderbuffer up to 4 samples (the SGX 543's); Android's native driver, where the
+ * context is ES 3, a single-sampled one (see gles_renderbuffer_storage_multisample). ANGLE and ES 2-only drivers
+ * still drop the calls.
  */
 #define GLES_READ_FRAMEBUFFER_APPLE 0x8CA8
 #define GLES_DRAW_FRAMEBUFFER_APPLE 0x8CA9
@@ -6083,6 +6084,8 @@ static bool gles_multisample_on(void)
                 eglGetProcAddress("glRenderbufferStorageMultisample");
         }
         on = on && gles_es3_blit && gles_es3_storage;
+#elif defined(GLES_HOST_WGL)
+        on = on && glRenderbufferStorageMultisampleEXT && glBlitFramebufferEXT;     /* GLEW's, null if missing */
 #endif
     }
     return on;
@@ -6108,7 +6111,19 @@ static int64_t gles_renderbuffer_storage_multisample(uint32_t format, uint32_t s
     if (!gles_multisample_on()) return gles_multisample_dropped(GLES_ID_glRenderbufferStorageMultisampleAPPLE);
     gh.fb_dirty = true;     /* an attached renderbuffer's storage decides completeness */
     glGetIntegerv(GL_MAX_SAMPLES_EXT, &host_max);
+    uint32_t asked = samples;
     samples = MIN(samples, MIN(4u, (uint32_t)MAX(host_max, 0)));
+#ifdef GLES_HOST_EGL_ES
+    /* ES 3 resolves a multisampled source only into a color buffer of the identical format, which the screen's
+     * (gles_layer_storage) needn't be; a single-sampled source blits into any. */
+    samples = 0;
+#endif
+    static unsigned said;
+    if (said < 4) {
+        said++;
+        fprintf(stderr, "[gles] multisample renderbuffer %ux%u format 0x%x: %u samples asked, %u given\n",
+                w, h, format, asked, samples);
+    }
     uint64_t bytes = (uint64_t)w * h * 4 * MAX(samples, 1u);
     if ((uint64_t)w * h * 4 > GLES_MAX_TEX_BYTES) {
         gles_refuse("cap:glRenderbufferStorageMultisample");
