@@ -360,13 +360,11 @@ static void gles_draw_diagnostic(void);
  * level, renderbuffer and drawable (gles_charge), against GLES_MAX_GPU_BYTES. */
 static size_t gles_buffer_bytes;
 static uint64_t gles_held_bytes;
-/* The cap they are held to: GLES_MAX_GPU_BYTES, or the A6's (gles_host_set_a6). */
-static uint64_t gles_gpu_cap = GLES_MAX_GPU_BYTES;
 
-/* Whether an object going from `old` to `new` bytes stays within gles_gpu_cap. */
+/* Whether an object going from `old` to `new` bytes stays within GLES_MAX_GPU_BYTES. */
 static inline bool gles_budget_ok(uint64_t old, uint64_t new)
 {
-    return new <= old || gles_buffer_bytes + gles_held_bytes + (new - old) <= gles_gpu_cap;
+    return new <= old || gles_buffer_bytes + gles_held_bytes + (new - old) <= GLES_MAX_GPU_BYTES;
 }
 
 /*
@@ -867,26 +865,9 @@ static uint64_t gles_prof_call_ns, gles_prof_present_ns;
 #ifndef GLES_HOST_ANGLE
 bool gles_host_a6;
 
-/*
- * The A6's GPU memory cap. Its games' PVRTC is decoded here at 8-16x its size, and an iPhone 5 build is the biggest
- * of them: Epic Citadel holds 1.22 GiB (85 MiB of PVRTC). A guest process that dies (the app switcher, a crash)
- * never deletes its contexts, so its objects stay charged until the device stops: in a Windows report a second Epic
- * Citadel process started with the first one's 1.2 GiB still held and was refused at the other boards' 2 GiB
- * (GL_OUT_OF_MEMORY). A quarter of the host's memory, between those 2 GiB and 4 GiB: room for a dead copy and a
- * live one on a 12 GB phone or a 16 GB computer, and no more than before on an 8 GB phone, which also holds the
- * guest's 1 GiB, the engine and the app.
- */
-#define GLES_A6_MAX_GPU_BYTES ((uint64_t)4096 << 20)
-static uint64_t gles_a6_gpu_cap(void)
-{
-    uint64_t share = (uint64_t)qemu_get_host_physmem() / 4 & ~(((uint64_t)256 << 20) - 1);
-    return MAX(GLES_MAX_GPU_BYTES, MIN(GLES_A6_MAX_GPU_BYTES, share));
-}
-
 void gles_host_set_a6(bool on)
 {
     gles_host_a6 = on;
-    gles_gpu_cap = on ? gles_a6_gpu_cap() : GLES_MAX_GPU_BYTES;
 }
 #else
 extern bool gles_host_a6;
@@ -988,7 +969,7 @@ static bool gles_charge(GHashTable *table, gpointer key, uint64_t bytes, uint64_
         if (gles_refuse("cap:gpu-memory")) {
             fprintf(stderr, "[gles] GL objects hold %" PRIu64 " MiB; %" PRIu64 " bytes more would pass the "
                     "%" PRIu64 " MiB cap: GL_OUT_OF_MEMORY\n", (gles_held_bytes + gles_buffer_bytes) >> 20,
-                    bytes - held, gles_gpu_cap >> 20);
+                    bytes - held, GLES_MAX_GPU_BYTES >> 20);
         }
         return false;
     }
@@ -998,7 +979,7 @@ static bool gles_charge(GHashTable *table, gpointer key, uint64_t bytes, uint64_
     if ((gles_held_bytes + gles_buffer_bytes) >> 26 > gles_charge_reported) {
         gles_charge_reported = (gles_held_bytes + gles_buffer_bytes) >> 26;
         fprintf(stderr, "[gles] GL objects hold %" PRIu64 " MiB (cap %" PRIu64 " MiB)\n",
-                (gles_held_bytes + gles_buffer_bytes) >> 20, gles_gpu_cap >> 20);
+                (gles_held_bytes + gles_buffer_bytes) >> 20, GLES_MAX_GPU_BYTES >> 20);
     }
     return true;
 }
