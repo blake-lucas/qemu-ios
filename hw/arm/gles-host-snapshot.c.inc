@@ -854,6 +854,7 @@ static void snap_get_glsl(SnapR *r)
     if (!*t) *t = g_hash_table_new(g_direct_hash, g_direct_equal);
     g_hash_table_remove_all(*t);
     if (*gles_uloc_table()) g_hash_table_remove_all(*gles_uloc_table());
+    if (*gles_glsl_source_table()) g_hash_table_remove_all(*gles_glsl_source_table());
     for (uint32_t i = 0; i < n && !r->bad; i++) {
         uint32_t guest = sr32(r), prog = sr32(r), len;
         if (!prog) {

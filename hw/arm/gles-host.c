@@ -497,6 +497,7 @@ typedef struct {
     uint32_t next_buffer_name;
     GHashTable *glsl;           /* guest shader/program id -> host id */
     uint32_t glsl_next;
+    GHashTable *glsl_source;    /* guest shader id -> the source the guest gave (glGetShaderSource) */
     GHashTable *uloc;           /* guest program id -> uniform location map */
     GHashTable *fetch_programs; /* host program id -> translated fetch metadata */
 } GLESGroup;
@@ -791,6 +792,7 @@ typedef struct {
     GLint fetch_tex_size[2];
     GHashTable *glsl;           /* shader/program names, without a group */
     uint32_t glsl_next;
+    GHashTable *glsl_source;
     GHashTable *uloc;
     /* OES_vertex_array_object (gles_vao_bind): the context's VAOs by name, the next name, the bound one (0: the
      * default), and the default VAO's arrays while another is bound. */
@@ -1077,6 +1079,9 @@ static bool gles_array_cache;
 /* LT_GLES_INDEX_RANGE=off fetches glDrawElements' arrays from vertex 0 again,
  * for same-binary A/B runs. */
 static bool gles_index_range;
+/* LT_GLES_GLSL_HOIST=off leaves late #extension directives where the app put them (gles_glsl_hoist_extensions), for
+ * same-binary A/B runs. */
+static bool gles_glsl_hoist;
 /* Focused wall timings, independent of per-draw and live capture timers. */
 static bool gles_context_prof;
 static bool gles_present_prof;
@@ -1120,6 +1125,8 @@ static void gles_read_switches(void)
     gles_array_cache = !v || (strcmp(v, "off") && strcmp(v, "0"));
     v = getenv("LT_GLES_INDEX_RANGE");
     gles_index_range = !v || (strcmp(v, "off") && strcmp(v, "0"));
+    v = getenv("LT_GLES_GLSL_HOIST");
+    gles_glsl_hoist = !v || (strcmp(v, "off") && strcmp(v, "0"));
     v = getenv("LT_GLES_CONTEXT_PROF");
     gles_context_prof = v && strcmp(v, "off") && strcmp(v, "0");
     v = getenv("LT_GLES_PRESENT_PROF");
@@ -7329,6 +7336,130 @@ static void gles_link_program(GLuint program)
 }
 #endif
 
+/* Whether [t, end) holds a token outside comments; *comment carries an open block comment from line to line. */
+static bool gles_glsl_scan(const char *t, const char *end, bool *comment)
+{
+    bool token = false;
+
+    while (t < end) {
+        if (*comment) {
+            if (t + 1 < end && t[0] == '*' && t[1] == '/') {
+                *comment = false;
+                t++;
+            }
+        } else if (t + 1 < end && t[0] == '/' && t[1] == '/') {
+            break;
+        } else if (t + 1 < end && t[0] == '/' && t[1] == '*') {
+            *comment = true;
+            t++;
+        } else if (!g_ascii_isspace(*t)) {
+            token = true;
+        }
+        t++;
+    }
+    return token;
+}
+
+/*
+ * Late #extension directives, moved to the top. GLSL ES 1.00 wants every #extension before the shader's first
+ * token outside the preprocessor, and ANGLE, Adreno and Mesa refuse the compile otherwise; Apple's compiler took
+ * one anywhere. cocos2d 2.x compiles each shader behind its own header ("precision mediump float; uniform mat4
+ * CC_PMatrix; ..."), so Mutant Fridge Mayhem's draw-node shader, whose text opens with `#extension
+ * GL_OES_standard_derivatives : enable`, has it on line 12; the compile failed and cocos2d aborts on any failed
+ * compile (GitHub issue 16).
+ * A late directive goes after #version (else first), in order, and its own line is left empty, so a compile error
+ * names a line one further down per moved directive. One inside an #if stays: moving it out would apply it
+ * unconditionally (none seen). So does one whose line opens a block comment. NULL when nothing moves, which is every
+ * shader whose directives already come first.
+ */
+static char *gles_glsl_hoist_extensions(const char *src)
+{
+    g_autoptr(GArray) late = g_array_new(false, false, sizeof(size_t) * 3);   /* line start, '#', line end */
+    bool comment = false, tokens = false, directives = false;
+    size_t top = 0;
+    int depth = 0;
+
+    for (const char *p = src; *p;) {
+        const char *eol = strchr(p, '\n');
+        const char *end = eol ? eol : p + strlen(p);
+        const char *t = p;
+
+        for (;;) {                              /* blanks and whole comments before a '#' */
+            if (comment) {
+                while (t + 1 < end && !(t[0] == '*' && t[1] == '/')) {
+                    t++;
+                }
+                if (t + 1 >= end) {
+                    t = end;
+                    break;
+                }
+                comment = false;
+                t += 2;
+            }
+            while (t < end && g_ascii_isspace(*t)) {
+                t++;
+            }
+            if (t + 1 < end && t[0] == '/' && t[1] == '*') {
+                comment = true;
+                t += 2;
+                continue;
+            }
+            break;
+        }
+        if (t < end && *t == '#') {
+            const char *d = t + 1, *w;
+
+            while (d < end && (*d == ' ' || *d == '\t')) {
+                d++;
+            }
+            w = d;
+            while (w < end && (g_ascii_isalnum(*w) || *w == '_')) {
+                w++;
+            }
+            size_t n = w - d;
+            bool ext = n == 9 && !strncmp(d, "extension", 9);
+            gles_glsl_scan(w, end, &comment);
+            if ((n == 2 && !strncmp(d, "if", 2)) || (n == 5 && !strncmp(d, "ifdef", 5)) ||
+                (n == 6 && !strncmp(d, "ifndef", 6))) {
+                depth++;
+            } else if (n == 5 && !strncmp(d, "endif", 5) && depth > 0) {
+                depth--;
+            } else if (n == 7 && !strncmp(d, "version", 7) && !directives && !tokens) {
+                top = (eol ? eol + 1 : end) - src;
+            } else if (ext && tokens && !depth && !comment) {
+                size_t at[3] = { p - src, t - src, end - src };
+                g_array_append_val(late, at);
+            }
+            directives = true;
+        } else if (gles_glsl_scan(t, end, &comment)) {
+            tokens = true;
+        }
+        p = eol ? eol + 1 : end;
+    }
+    if (!late->len) {
+        return NULL;
+    }
+
+    GString *out = g_string_new_len(src, top);
+    size_t from = top;
+
+    if (top && src[top - 1] != '\n') {
+        g_string_append_c(out, '\n');
+    }
+    for (guint i = 0; i < late->len; i++) {
+        const size_t *at = &g_array_index(late, size_t, i * 3);
+        g_string_append_len(out, src + at[1], at[2] - at[1]);
+        g_string_append_c(out, '\n');
+    }
+    for (guint i = 0; i < late->len; i++) {     /* the rest, with each moved line emptied */
+        const size_t *at = &g_array_index(late, size_t, i * 3);
+        g_string_append_len(out, src + from, at[0] - from);
+        from = at[2];
+    }
+    g_string_append(out, src + from);
+    return g_string_free(out, false);
+}
+
 /* ES GLSL 1.00 -> desktop GLSL 1.20: drop #version and precision statements,
  * and define the precision qualifiers away.
  *
@@ -8309,6 +8440,51 @@ static GHashTable **gles_uloc_table(void)
     return gh.group ? &gh.group->uloc : &gh.uloc;
 }
 
+/* The guest's own text of each shader, for glGetShaderSource and SHADER_SOURCE_LENGTH: the host holds the text after
+ * gles_glsl_hoist_extensions and, on the desktop, the GLSL 1.20 translation. Not in snapshots, so a restored shader
+ * answers with the host's text. */
+static GHashTable **gles_glsl_source_table(void)
+{
+    return gh.group ? &gh.group->glsl_source : &gh.glsl_source;
+}
+
+static const char *gles_glsl_source(uint32_t guest)
+{
+    GHashTable *t = *gles_glsl_source_table();
+    return t ? g_hash_table_lookup(t, GUINT_TO_POINTER(guest)) : NULL;
+}
+
+/* glGetShaderSource (shader, bufSize, int *length, char *source): at most bufSize - 1 characters and a NUL. */
+static void gles_es2_shader_source(CPUState *cpu, uint32_t guest, GLuint host, const uint32_t *a)
+{
+    g_autofree char *host_text = NULL;
+    const char *text = gles_glsl_source(guest);
+    int32_t size = (int32_t)a[1];
+    GLsizei n = 0;
+
+    if (!host || size < 0) {
+        gles_reject(GL_INVALID_VALUE);
+        return;
+    }
+    if (!text) {
+        GLint len = 0;
+        glGetShaderiv(host, GL_SHADER_SOURCE_LENGTH, &len);
+        host_text = g_malloc0(MAX(len, 0) + 1);
+        if (len > 0) {
+            glGetShaderSource(host, len + 1, NULL, host_text);
+        }
+        text = host_text;
+    }
+    if (size > 0 && a[3]) {
+        n = MIN(strlen(text), (size_t)size - 1);
+        gles_es2_write(cpu, a[3], text, n);
+        gles_es2_write(cpu, a[3] + n, "", 1);
+    }
+    if (a[2]) {
+        gles_es2_write(cpu, a[2], &n, 4);
+    }
+}
+
 static GHashTable *gles_uloc_map(uint32_t program, bool create)
 {
     GHashTable **t = gles_uloc_table();
@@ -8483,6 +8659,7 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
         else glDeleteShader(a[0]);
         g_hash_table_remove(*t, GUINT_TO_POINTER(ga[0]));
         if (*gles_uloc_table()) g_hash_table_remove(*gles_uloc_table(), GUINT_TO_POINTER(ga[0]));
+        if (*gles_glsl_source_table()) g_hash_table_remove(*gles_glsl_source_table(), GUINT_TO_POINTER(ga[0]));
         break;
     }
     case 593: glDetachShader(a[0], a[1]); break;
@@ -8499,7 +8676,18 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
             g_autofree char *part = gles_es2_string(cpu, strs[i], lens ? lens[i] : -1);
             g_string_append_len(src, part, MIN(strlen(part), GLES_MAX_STRING - src->len));
         }
-        g_autofree char *fetched = gles_es2_fetch_glsl(src->str);
+        if (a[0]) {
+            GHashTable **sources = gles_glsl_source_table();
+            if (!*sources) {
+                *sources = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+            }
+            g_hash_table_insert(*sources, GUINT_TO_POINTER(ga[0]), g_strdup(src->str));
+        }
+        g_autofree char *hoisted = gles_glsl_hoist ? gles_glsl_hoist_extensions(src->str) : NULL;
+        if (hoisted) {
+            fprintf(stderr, "[gles] ES2 shader %u: late #extension moved to the top\n", ga[0]);
+        }
+        g_autofree char *fetched = gles_es2_fetch_glsl(hoisted ? hoisted : src->str);
 
         glsl = gles_es2_glsl(fetched);
 #if !defined(GLES_HOST_EAGL) && !defined(GLES_HOST_EGL_ES)
@@ -8614,14 +8802,17 @@ static bool gles_es2_call(CPUState *cpu, uint32_t slot, uint32_t argc,
     case 656: *r = glIsProgram(a[0]); break;
     case 657: case 658: {                       /* object, pname, int* */
         GLint out = 0;
+        const char *text = slot == 657 && a[1] == GL_SHADER_SOURCE_LENGTH ? gles_glsl_source(ga[0]) : NULL;
         if (slot == 657) glGetShaderiv(a[0], a[1], &out);
         else glGetProgramiv(a[0], a[1], &out);
+        if (text && a[0]) out = *text ? strlen(text) + 1 : 0;
         GLESFetchProgram *fetch = slot == 658 ? gles_fetch_program(a[0]) : NULL;
         if (fetch && a[1] == GL_ACTIVE_UNIFORMS) out = fetch->uniforms->len;
         if (fetch && a[1] == GL_ACTIVE_UNIFORM_MAX_LENGTH) out = fetch->max_name;
         gles_es2_write(cpu, a[2], &out, 4);
         break;
     }
+    case 629: gles_es2_shader_source(cpu, ga[0], a[0], a); break;
     case 659: case 660: *r = gles_es2_info_log(cpu, slot == 660, a); break;
     case 759: {                                 /* program, max, *count, shaders* */
         GLuint sh[16];
@@ -11137,6 +11328,7 @@ static void gles_group_unref(GLESGroup *group)
     g_hash_table_destroy(group->pvrtc);
     gles_charge_free(group->charged);
     if (group->glsl) g_hash_table_destroy(group->glsl);
+    if (group->glsl_source) g_hash_table_destroy(group->glsl_source);
     if (group->uloc) g_hash_table_destroy(group->uloc);
     if (group->fetch_programs) g_hash_table_destroy(group->fetch_programs);
     g_free(group);
@@ -11169,6 +11361,7 @@ static void gles_context_free(GLESHost *state)
     g_free(state->decbuf); g_free(state->readback); g_free(state->skin);
     if (state->fbo_drawable) g_hash_table_destroy(state->fbo_drawable);
     if (state->glsl) g_hash_table_destroy(state->glsl);
+    if (state->glsl_source) g_hash_table_destroy(state->glsl_source);
     if (state->uloc) g_hash_table_destroy(state->uloc);
     if (state->fetch_programs) g_hash_table_destroy(state->fetch_programs);
     if (state->cgl) {
