@@ -411,6 +411,23 @@ static void clcd_frame_end(S5L8930DisplayState *s)
     clcd_update_irq(s);
 }
 
+/*
+ * On the iPhone 5, after a second without swaps the re-latch runs every LT_QUIET_RELATCH_EVERY-th vsync (default 4,
+ * 1 = every vsync as before): a still screen's re-latch reads and compares both 640x1136 layers, the main loop's
+ * largest cost on a phone. Only content written into the scanned-out buffer without a swap (Accessibility Zoom)
+ * reaches the screen up to three vsyncs later; swaps are latched at their vsync as always.
+ */
+static bool quiet_relatch_due(S5L8930DisplayState *s)
+{
+    static int every = -1;
+
+    if (every < 0) {
+        const char *v = getenv("LT_QUIET_RELATCH_EVERY");
+        every = v && atoi(v) > 0 ? atoi(v) : 4;
+    }
+    return !s->h5p || every <= 1 || s->quiet_vbls < 60 || s->quiet_vbls % every == 0;
+}
+
 /* One frame: the queued swaps complete and the VBLs fire. */
 static void vbl_tick(void *opaque)
 {
@@ -480,7 +497,7 @@ static void vbl_tick(void *opaque)
         s->quiet_vbls = 0;
         s->swaps++;
         latch = true;
-    } else if (++s->quiet_vbls >= QUIET_RELATCH_VBLS) {
+    } else if (++s->quiet_vbls >= QUIET_RELATCH_VBLS && quiet_relatch_due(s)) {
         /*
          * No swap for a quarter second, yet the buffer can still change:
          * with Accessibility > Zoom on, CA stops swapping and the scaler
