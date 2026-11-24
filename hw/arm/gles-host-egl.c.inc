@@ -15,6 +15,8 @@
 typedef struct GLESEGLTexture {
     unsigned name, native_name, width, height, target, refs;
     bool deleted, hidden;
+    /* EXT_texture_filter_anisotropic's value where the host has no such state (gles_native_anisotropy_kept); 0: 1. */
+    GLfloat max_anisotropy;
     struct GLESEGLTexture *next;
 } GLESEGLTexture;
 typedef struct GLESEGLTextures {
