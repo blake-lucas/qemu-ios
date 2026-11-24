@@ -1252,6 +1252,8 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
      * tcg_kick_vcpu_thread())
      */
     qatomic_set_mb(&cpu->neg.icount_decr.u16.high, 0);
+    /* Broadcast TLB flushes from the other cores, before this CPU runs another TB (cputlb.c). */
+    tlb_shootdown_service(cpu);
     if (!qatomic_read(&cpu->exec_seen)) {
         qatomic_set(&cpu->exec_seen, true);
     }

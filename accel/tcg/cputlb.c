@@ -538,12 +538,36 @@ static inline void tlb_n_used_entries_dec(CPUState *cpu, uintptr_t mmu_idx)
     cpu->neg.tlb.d[mmu_idx].n_used_entries--;
 }
 
+/* A CPU's queue of broadcast TLB flushes (see tlb_shootdown_inline_run). */
+#define TLB_SD_OPS 32
+
+typedef struct TLBShootdownOp {
+    vaddr addr, len;
+    MMUIdxMap idxmap;
+    uint8_t kind, bits;
+} TLBShootdownOp;
+
+struct TLBShootdownQueue {
+    QemuSpin lock;
+    unsigned n;
+    bool all;
+    uint64_t enq, done;
+    TLBShootdownOp op[TLB_SD_OPS];
+};
+
+static int tlb_shootdown_mode(void);
+
 void tlb_init(CPUState *cpu)
 {
     int64_t now = tlb_clock_ns();
     int i;
 
     qemu_spin_init(&cpu->neg.tlb.c.lock);
+    if (!cpu->tlb_sd) {
+        cpu->tlb_sd = g_new0(struct TLBShootdownQueue, 1);
+        qemu_spin_init(&cpu->tlb_sd->lock);
+    }
+    tlb_shootdown_mode();
 
     /* All tlbs are initialized flushed. */
     cpu->neg.tlb.c.dirty = 0;
@@ -618,6 +642,10 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
  */
 #define TLB_SHOOTDOWN_MAX 16
 
+enum { TLB_SD_PAGE, TLB_SD_RANGE, TLB_SD_ALL };
+static bool tlb_shootdown_inline_run(CPUState *src, int kind, vaddr addr, vaddr len, MMUIdxMap idxmap,
+                                     unsigned bits);
+
 typedef struct TLBShootdown {
     int refs;
     int n;
@@ -632,16 +660,28 @@ typedef struct TLBShootdownItem {
     int slot;
 } TLBShootdownItem;
 
-/* Only from @src's own thread, which flushes itself directly; from elsewhere, the exclusive work. */
+/*
+ * LT_TLB_SHOOTDOWN: unset or "on", the targets run the flush as queued work (tlb_broadcast_synced); "inline", they
+ * flush at their next TB boundary and the issuer waits in place (tlb_shootdown_inline_run); "off", the exclusive
+ * work. Only from @src's own thread, which flushes itself directly; from elsewhere, the exclusive work.
+ */
+bool tlb_shootdown_inline;
+
+static int tlb_shootdown_mode(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *v = getenv("LT_TLB_SHOOTDOWN");
+        mode = v && (!strcmp(v, "off") || !strcmp(v, "0")) ? 0 : v && !strcmp(v, "inline") ? 2 : 1;
+        tlb_shootdown_inline = mode == 2;
+    }
+    return mode;
+}
+
 static bool tlb_shootdown_on(CPUState *src)
 {
-    static int on = -1;
-
-    if (on < 0) {
-        const char *v = getenv("LT_TLB_SHOOTDOWN");
-        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
-    }
-    return on && current_cpu == src;
+    return tlb_shootdown_mode() && current_cpu == src;
 }
 
 static void tlb_shootdown_unref(TLBShootdown *sd)
@@ -830,6 +870,9 @@ void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
 
     tlb_debug("mmu_idx: 0x%"PRIx16"\n", idxmap);
 
+    if (tlb_shootdown_inline_run(src_cpu, TLB_SD_ALL, 0, 0, idxmap, 0)) {
+        return;
+    }
     if (tlb_shootdown_on(src_cpu)) {
         tlb_broadcast_synced(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap), 0);
         return;
@@ -1092,6 +1135,9 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
      * Allocate memory to hold addr+idxmap only when needed.
      * See tlb_flush_page_by_mmuidx for details.
      */
+    if (tlb_shootdown_inline_run(src_cpu, TLB_SD_PAGE, addr, 0, idxmap, 0)) {
+        return;
+    }
     if (tlb_shootdown_on(src_cpu)) {
         if (idxmap < TARGET_PAGE_SIZE) {
             tlb_broadcast_synced(src_cpu, tlb_flush_page_by_mmuidx_async_1,
@@ -1318,6 +1364,9 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     d.idxmap = idxmap;
     d.bits = bits;
 
+    if (tlb_shootdown_inline_run(src_cpu, TLB_SD_RANGE, d.addr, len, idxmap, bits)) {
+        return;
+    }
     if (tlb_shootdown_on(src_cpu)) {
         tlb_broadcast_synced(src_cpu, tlb_flush_range_by_mmuidx_async_1,
                              RUN_ON_CPU_HOST_PTR(g_memdup(&d, sizeof(d))), sizeof(d));
@@ -1344,6 +1393,114 @@ void tlb_flush_page_bits_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 {
     tlb_flush_range_by_mmuidx_all_cpus_synced(src_cpu, addr, TARGET_PAGE_SIZE,
                                               idxmap, bits);
+}
+
+
+/*
+ * LT_TLB_SHOOTDOWN=inline: each CPU the broadcast reaches gets the flush in a small
+ * queue of its own and is sent out of its TB chain (icount_decr, as cpu_exit does without exit_request), so it runs
+ * the flush at its next TB boundary in cpu_handle_interrupt, without leaving cpu_exec or taking the BQL. The issuer
+ * flushes itself and waits in place until each target has run its queue that far or is outside guest code (it runs
+ * the queue before its first TB). While it waits it runs its own queue, so two CPUs broadcasting at once don't wait
+ * for each other. An issuer holding the BQL, which a target may be waiting for, takes the queued path instead.
+ */
+
+static void tlb_shootdown_run_op(CPUState *cpu, const TLBShootdownOp *o)
+{
+    switch (o->kind) {
+    case TLB_SD_PAGE:
+        tlb_flush_page_by_mmuidx_async_0(cpu, o->addr, o->idxmap);
+        break;
+    case TLB_SD_RANGE:
+        tlb_flush_range_by_mmuidx_async_0(cpu, (TLBFlushRangeData){ o->addr, o->len, o->idxmap, o->bits });
+        break;
+    default:
+        tlb_flush_by_mmuidx_async_work(cpu, RUN_ON_CPU_HOST_INT(o->idxmap));
+        break;
+    }
+}
+
+void tlb_shootdown_service_slow(CPUState *cpu)
+{
+    struct TLBShootdownQueue *q = cpu->tlb_sd;
+    TLBShootdownOp ops[TLB_SD_OPS];
+    unsigned n;
+    bool all;
+    uint64_t upto;
+
+    if (qatomic_load_acquire(&q->done) == qatomic_read(&q->enq)) {
+        return;
+    }
+    qemu_spin_lock(&q->lock);
+    n = q->n;
+    all = q->all;
+    upto = q->enq;
+    memcpy(ops, q->op, n * sizeof(ops[0]));
+    q->n = 0;
+    q->all = false;
+    qemu_spin_unlock(&q->lock);
+    if (all) {
+        tlb_flush_by_mmuidx_async_work(cpu, RUN_ON_CPU_HOST_INT(ALL_MMUIDX_BITS));
+    } else {
+        for (unsigned i = 0; i < n; i++) {
+            tlb_shootdown_run_op(cpu, &ops[i]);
+        }
+    }
+    qatomic_store_release(&q->done, upto);
+}
+
+static bool tlb_shootdown_inline_run(CPUState *src, int kind, vaddr addr, vaddr len, MMUIdxMap idxmap,
+                                     unsigned bits)
+{
+    TLBShootdownOp o = { .addr = addr, .len = len, .idxmap = idxmap, .kind = kind, .bits = bits };
+    CPUState *targets[TLB_SHOOTDOWN_MAX], *cpu;
+    uint64_t tickets[TLB_SHOOTDOWN_MAX];
+    int n = 0;
+    int64_t t0;
+
+    if (tlb_shootdown_mode() != 2 || current_cpu != src || bql_locked() || !src->tlb_sd) {
+        return false;
+    }
+    t0 = it_acct_excl_on ? get_clock() : 0;
+    CPU_FOREACH(cpu) {
+        struct TLBShootdownQueue *q = cpu->tlb_sd;
+
+        if (!tlb_flush_reaches(src, cpu) || !q || n == TLB_SHOOTDOWN_MAX) {
+            if (cpu != src && q && n == TLB_SHOOTDOWN_MAX) {
+                return false;   /* never: boards have fewer CPUs */
+            }
+            continue;
+        }
+        qemu_spin_lock(&q->lock);
+        if (q->n < TLB_SD_OPS) {
+            q->op[q->n++] = o;
+        } else {
+            q->all = true;   /* a full flush covers what didn't fit */
+        }
+        tickets[n] = ++q->enq;
+        qemu_spin_unlock(&q->lock);
+        targets[n++] = cpu;
+        qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
+    }
+    tlb_shootdown_run_op(src, &o);
+    smp_mb();
+    for (int i = 0; i < n; i++) {
+        unsigned spins = 0;
+
+        while (qatomic_load_acquire(&targets[i]->tlb_sd->done) < tickets[i] && qatomic_read(&targets[i]->running)) {
+            tlb_shootdown_service_slow(src);
+            if (++spins < 4000) {
+                cpu_relax();
+            } else {
+                g_usleep(0);
+            }
+            smp_mb();
+        }
+    }
+    if (t0) {
+        it_acct_excl_note((void *)tlb_shootdown_inline_run, get_clock() - t0, 0);
+    }
+    return true;
 }
 
 /* update the TLBs so that writes to code in the virtual page 'addr'
