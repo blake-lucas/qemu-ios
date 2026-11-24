@@ -390,6 +390,20 @@ static void mdm_log(MDM9x15State *s, const char *kind, unsigned a, unsigned b,
         qemu_log_mask(LOG_UNIMP, "MDM9x15 %s %x %x %x\n", kind, a, b, c);
     }
 }
+
+/* Whether a non-traffic mdm_log line would print: a firmware image's CRC, for the log only, is a bitwise pass over
+ * megabytes on the main loop with the BQL held (a 332 ms stall when iOS uploaded the baseband's DSP image).
+ * LT_MDM_LOG_CRC=on computes it always, as before (A/B). */
+static bool mdm_logging(MDM9x15State *s)
+{
+    static int always = -1;
+
+    if (always < 0) {
+        const char *v = getenv("LT_MDM_LOG_CRC");
+        always = v && !strcmp(v, "on");
+    }
+    return always || (qemu_loglevel_mask(LOG_UNIMP) && s->logs < 512);
+}
 static void tlv(GByteArray *a, uint8_t tag, const void *data, uint16_t n)
 {
     uint8_t h[3] = {tag, n, n >> 8};
@@ -3398,7 +3412,7 @@ static void mdm_sahara_image_data(MDM9x15State *s, GByteArray *a)
         stl_le_p(end + 8, 22);
         d->image_complete = true;
         mdm_log(s, "sahara-image-complete", 22, d->image->len,
-                mdm_dload_crc(d->image->data, d->image->len));
+                mdm_logging(s) ? mdm_dload_crc(d->image->data, d->image->len) : 0);
         mdm_sahara_packet(s, end, sizeof(end));
     } else {
         mdm_sahara_read_image(s);
@@ -3539,7 +3553,7 @@ static bool mdm_dload_boot(MDM9x15State *s, uint32_t entry)
      * CPU. Transition only after the complete boot image has arrived. */
     d->loader_started = true;
     mdm_log(s, "dload-boot", entry, source + image_size,
-            mdm_dload_crc(d->ram, source + image_size));
+            mdm_logging(s) ? mdm_dload_crc(d->ram, source + image_size) : 0);
     return true;
 }
 
