@@ -405,30 +405,28 @@ static int synopsys_usb_tcp_callback(tcp_usb_state_t *_state, void *_arg,
 			}
 
 			/*
-			 * One host transaction is one complete transfer, so it always
-			 * retires the endpoint. That is right for this transport - it is
-			 * transfer-oriented, not packet-oriented. A zero-length transaction
-			 * is the host's ZLP and completes an armed transfer with 0 bytes;
-			 * the host sends one only when its software asks (usbmuxd does
-			 * after a max-packet-multiple write, which iOS 4's mux needs to
-			 * find the end of a message; libirecovery's uploads do not).
+			 * A transaction is a run of max-size packets ending, unless it fills
+			 * the transfer, in a short one. A zero-length transaction is the
+			 * host's ZLP and completes an armed transfer with 0 bytes; the host
+			 * sends one only when its software asks (usbmuxd does after a
+			 * max-packet-multiple write, which iOS 4's mux needs to find the end
+			 * of a message; libirecovery's uploads do not).
 			 *
-			 * The corollary is a real constraint on the host: it must never
-			 * split one logical packet across transactions, because the second
-			 * half would land in a transfer the guest already considers
-			 * finished. The wire header's length is an int16_t, so a host
-			 * transaction cannot exceed 32767 bytes and the host must keep its
-			 * MTU at or under that. usbmuxd's default USB_MTU of 49152 does not
-			 * fit and silently corrupted AFC writes until it was capped.
-			 *
-			 * Warn when a transaction is truncated, since that is exactly the
-			 * situation that produces the corruption and it is otherwise silent.
+			 * A transaction longer than the armed transfer fills it, which ends
+			 * it (XferSize drained), and is answered with the bytes accepted;
+			 * the host sends the rest next, into the guest's next transfer. A
+			 * real link does the same when a host writes more than the device
+			 * armed (a Mac's usbmuxd writes 48 KiB mux packets into iOS's 16-32
+			 * KiB transfers), and the guest's mux reassembles by its headers.
+			 * What corrupted AFC writes once (usbmuxd's 49152-byte MTU split at
+			 * 16384) was retiring a transfer the transaction had NOT filled; the
+			 * max-packet-multiple rule below keeps such a transfer open. The
+			 * wire header's length is an int16_t: at most 32767 bytes a
+			 * transaction (docs/tcp-usb-protocol.md).
 			 */
-			if (amtDone < hdr_len) {
-				qemu_log_mask(LOG_GUEST_ERROR,
-				              "usb_synopsys: OUT ep%d truncated %zu -> %zu bytes; "
-				              "the host must not split a logical packet\n",
-				              ep, hdr_len, amtDone);
+			if (amtDone < hdr_len && synopsys_usb_trace_enabled()) {
+				TRACE_PRINTF(trace_ipod_touch_usb_otg_log, "[USBTCP] OUT ep%d %zu of %zu bytes fill the armed "
+				             "transfer; the rest goes to the next\n", ep, amtDone, hdr_len);
 			}
 
 			/*
@@ -519,7 +517,7 @@ static int synopsys_usb_tcp_callback(tcp_usb_state_t *_state, void *_arg,
 static void synopsys_usb_out_stats(int ep, size_t armed, size_t sent)
 {
 	static int on = -1;
-	static size_t armed_min = SIZE_MAX, armed_max, sent_max, truncated;
+	static size_t armed_min = SIZE_MAX, armed_max, sent_max, truncated, odd;
 	static uint64_t n;
 	static int64_t last;
 
@@ -535,11 +533,12 @@ static void synopsys_usb_out_stats(int ep, size_t armed, size_t sent)
 	armed_max = MAX(armed_max, armed);
 	sent_max = MAX(sent_max, sent);
 	truncated += sent > armed;
+	odd += armed % 512 != 0;
 	int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 	if (changed || now - last >= 10000) {
 		last = now;
 		fprintf(stderr, "[usb-stats] bulk OUT ep%d: %" PRIu64 " transfers, armed %zu..%zu bytes, largest sent %zu, "
-		        "split %zu\n", ep, n, armed_min, armed_max, sent_max, truncated);
+		        "split %zu, armed not a 512 multiple %zu\n", ep, n, armed_min, armed_max, sent_max, truncated, odd);
 	}
 }
 
