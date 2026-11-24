@@ -20,6 +20,7 @@
 #include "qemu/timer.h"
 #include "qemu/thread.h"
 #include "hw/arm/nand-image.h"
+#include "hw/core/cpu.h"
 #ifdef _WIN32
 #include <winioctl.h>
 #endif
@@ -777,6 +778,33 @@ static int nand_disk_pio(int fd, void *buf, uint32_t len, uint64_t offset, bool 
 }
 #endif
 
+#ifndef _WIN32
+/*
+ * A page's pread or pwrite at a mapped cluster, from a vCPU holding the BQL (the IOP running the NAND firmware), runs
+ * without it: a cold read waits on the host's storage for up to tens of milliseconds, and on the iPhone 5 both AP
+ * cores waited behind it. Only the file I/O runs unlocked; the mapping was looked up (and copied into the arguments)
+ * under the BQL, and the block layer's paths (misses, allocating programs, erases) keep it.
+ * LT_NAND_IO_UNLOCKED=off keeps the BQL for the I/O (A/B).
+ */
+static int nand_disk_pio_maybe_unlocked(int fd, void *buf, uint32_t len, uint64_t offset, bool write)
+{
+    static int on = -1;
+    int result;
+
+    if (on < 0) {
+        const char *v = getenv("LT_NAND_IO_UNLOCKED");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    if (!on || !current_cpu || !bql_locked()) {
+        return nand_disk_pio(fd, buf, len, offset, write);
+    }
+    bql_unlock();
+    result = nand_disk_pio(fd, buf, len, offset, write);
+    bql_lock();
+    return result;
+}
+#endif
+
 /* The overlay may allocate or free clusters: forget their mappings. */
 static void nand_disk_remap(NANDDisk *d)
 {
@@ -848,8 +876,8 @@ int nand_disk_read(NANDDisk *d, uint64_t offset, uint32_t len, void *buf)
         if (m->kind == NAND_DISK_ZERO) {
             memset(p, 0, n);
         } else {
-            int result = nand_disk_pio(m->kind == NAND_DISK_TOP ? d->top_fd : d->base_fd, p, n,
-                                       m->host + offset % NAND_DISK_CLUSTER, false);
+            int result = nand_disk_pio_maybe_unlocked(m->kind == NAND_DISK_TOP ? d->top_fd : d->base_fd, p, n,
+                                                      m->host + offset % NAND_DISK_CLUSTER, false);
 
             if (result < 0) {
                 return result;
@@ -882,7 +910,8 @@ int nand_disk_write(NANDDisk *d, uint64_t offset, uint32_t len, const void *buf)
 
         if (m && m->kind == NAND_DISK_TOP) {
             qatomic_set(&d->pending, true);
-            return nand_disk_pio(d->top_fd, (void *)buf, len, m->host + offset % NAND_DISK_CLUSTER, true);
+            return nand_disk_pio_maybe_unlocked(d->top_fd, (void *)buf, len, m->host + offset % NAND_DISK_CLUSTER,
+                                                true);
         }
     }
     nand_disk_remap(d);
