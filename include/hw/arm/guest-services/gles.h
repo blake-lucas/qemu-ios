@@ -430,6 +430,8 @@ static inline const char *gles_id_name(uint32_t id)
 
 #ifndef OUT_OF_TREE_BUILD
 int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a);
+/* The A6's GL call without the BQL, behind the renderer gate (LT_A6_GL_UNLOCKED). */
+int64_t qc_handle_gles_unlocked(CPUState *cpu, qc_gles_args_t *a);
 /* Guest-pointer access for the GL host: faults untouched pages in (guest-gles.c). */
 int gles_guest_rw(CPUState *cpu, vaddr va, void *buf, size_t len, bool write);
 extern __thread int (*gles_guest_rw_hook)(vaddr va, void *buf, size_t len, bool write);

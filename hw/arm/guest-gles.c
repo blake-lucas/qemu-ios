@@ -195,6 +195,36 @@ int gles_guest_rw(CPUState *cpu, vaddr va, void *buf, size_t len, bool write)
     return cpu_memory_rw_debug(cpu, va, buf, len, write);
 }
 
+/*
+ * The pending fault's address and access, taken out of gf for gles_guest_fault_raise, which may longjmp: the
+ * unlocked A6 path takes it inside the renderer gate (gf is shared) and raises it after leaving the gate.
+ */
+static bool gles_guest_fault_take(CPUState *cpu, vaddr *va, MMUAccessType *type)
+{
+    gf.armed = false;
+    if (!gf.pending) {
+        gf.repeats = 0;
+        return false;
+    }
+    gf.pending = false;
+    if (gf.va != gf.last_va) {
+        gf.last_va = gf.va;
+        gf.repeats = 0;
+    } else if (++gf.repeats > 4) {
+        if (gles_host_refuse("guest-read:fault-dropped")) {
+            fprintf(stderr, "[gles] guest page 0x%08" PRIx64 " still not "
+                    "accessible after 4 faults (slot %u, %s, page table: %s); call dropped\n",
+                    (uint64_t)gf.va, gf.slot, gf.type == MMU_DATA_STORE ? "store" : "load",
+                    cpu_get_phys_page_debug(cpu, gf.va) == -1 ? "unmapped" : "mapped");
+        }
+        gf.repeats = 0;
+        return false;
+    }
+    *va = gf.va;
+    *type = gf.type;
+    return true;
+}
+
 static void gles_guest_fault_in(CPUState *cpu)
 {
     gf.armed = false;
@@ -393,6 +423,61 @@ int64_t qc_handle_gles(CPUState *cpu, qc_gles_args_t *a)
      * gate first, while still holding the BQL, so that fault retries cannot
      * strand the gate or let another caller overwrite the pending fault. */
     gles_guest_fault_in(cpu);
+    return result;
+}
+
+/*
+ * The A6's QEMU_CALL without the BQL (LT_A6_GL_UNLOCKED, s5l8950.c): the register took the BQL for every GL call
+ * (ARM_CP_IO) only for the gate to hand it back past it, two acquisitions per call on the board's two busiest vCPUs,
+ * thousands a second in a game. The gate now has a lock of its own, taken first; context setup and teardown take the
+ * BQL inside it (gate, then BQL, the order everywhere, so a gate holder never waits on a BQL holder that waits on
+ * the gate). A vCPU waiting for the gate counts as idle for the stall check, as one in a call does.
+ */
+static QemuMutex gles_gate_lock;
+static QemuCond gles_gate_cond;
+static bool gles_gate_busy;
+
+static void __attribute__((constructor)) gles_gate_init(void)
+{
+    qemu_mutex_init(&gles_gate_lock);
+    qemu_cond_init(&gles_gate_cond);
+}
+
+int64_t qc_handle_gles_unlocked(CPUState *cpu, qc_gles_args_t *a)
+{
+    bool ctx = a->slot >= GLES_OP_NEW_SHAREGROUP && a->slot <= GLES_OP_DELETE_CONTEXT;
+    vaddr va = 0;
+    MMUAccessType type = MMU_DATA_LOAD;
+    bool fault;
+    int64_t result;
+
+    assert(!bql_locked());
+    qatomic_set(&cpu->idle, true);
+    qemu_mutex_lock(&gles_gate_lock);
+    while (gles_gate_busy) {
+        qemu_cond_wait(&gles_gate_cond, &gles_gate_lock);
+    }
+    gles_gate_busy = true;
+    qemu_mutex_unlock(&gles_gate_lock);
+    if (ctx) {
+        bql_lock();
+    }
+    gf.armed = gf.pending = false;
+    result = gles_handle_call(cpu, a);
+    fault = gles_guest_fault_take(cpu, &va, &type);
+    if (ctx) {
+        bql_unlock();
+    }
+    qemu_mutex_lock(&gles_gate_lock);
+    gles_gate_busy = false;
+    qemu_cond_signal(&gles_gate_cond);
+    qemu_mutex_unlock(&gles_gate_lock);
+    qatomic_set(&cpu->exec_seen, true);
+    qatomic_set(&cpu->idle, false);
+    if (fault) {
+        /* Raises the data abort and does not return (unless it is mapped now). */
+        probe_access(cpu_env(cpu), va, 1, type, cpu_mmu_index(cpu, false), 0);
+    }
     return result;
 }
 
