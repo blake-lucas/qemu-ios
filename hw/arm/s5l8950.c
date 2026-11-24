@@ -253,6 +253,9 @@ struct S5L8950State {
     bool backlight_probe;
     bool hsic_ready_probe;
     bool baseband;
+    /* The motor runs while its driver is enabled and the SoC PWM channel runs. */
+    bool vibrator_enable, vibrator_pwm;
+    qemu_irq vibrator;
     DeviceState *baseband_usb;
     USBBus *hsic_bus;
     Chardev *gauge;
@@ -278,6 +281,23 @@ struct S5L8950State {
     IPodAgent *agent;
     uint64_t powerdown_sequence;
 };
+
+/*
+ * The vibration motor: 14G61's AppleARMPWMDevice raises the driver's enable
+ * (function-enable, GPIO 0x0b07) for a whole pattern and runs the SoC PWM's
+ * channel 1 for each buzz in it, so the motor turns while both are high.
+ */
+static void a6_vibrator_gate(void *opaque, int input, int level)
+{
+    S5L8950State *s = opaque;
+
+    if (input) {
+        s->vibrator_pwm = level;
+    } else {
+        s->vibrator_enable = level;
+    }
+    qemu_set_irq(s->vibrator, s->vibrator_enable && s->vibrator_pwm);
+}
 
 /* Native N42 DT handshake: HOST_READY GPIO2.1 /6.6, DEVICE_READY GPIO26.3
  * /7.1, EHCI ports2/4. An attached HSIC peer acknowledges host readiness;
@@ -1353,6 +1373,19 @@ static void a6_dt_identity(uint8_t *image, size_t length, uint32_t load,
     a4_dt_edit(image, length, load, arguments,
                &(A4DTEdit){"product", "product-id", a6_n42_product_id,
                            sizeof(a6_n42_product_id)});
+    /*
+     * The vibrator's duty cycle (32-bit fraction of the period), from the
+     * unit's calibration on hardware; the IPSW DT's is 0. 14G61's
+     * AppleARMPWMDevice takes the duty from it whenever a request names none
+     * (CoreMedia's vibration patterns never do), so every "on" step of a
+     * pattern came out at duty 0 and called stopPWM: the ring and the
+     * Settings previews ran their patterns without ever starting the motor.
+     * Half, the driver's own default when a DT has no duty-cycle.
+     */
+    uint32_t duty;
+    stl_le_p(&duty, 0x80000000u);
+    a4_dt_edit(image, length, load, arguments,
+               &(A4DTEdit){"vibrator", "duty-cycle", &duty, sizeof(duty)});
 }
 
 /*
@@ -1684,13 +1717,23 @@ static void a6_init(MachineState *machine)
     sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
                        qemu_allocate_irq(a6_irq, s, 119));
     /*
-     * The vibration motor, as on the iPhone 4's 6.x: the N42 DT's pmu/vib-pwm
-     * (PMU PWM) has function-enable on GPIO 0x0b07 (port 11, pin 7), the motor
-     * driver's enable, which the PMU PWM driver raises for each buzz. The
-     * enable alone runs the motor; the PMU's PWM registers are not a gate.
+     * The vibration motor: GPIO 0x0b07 (port 11, pin 7) is the motor
+     * driver's enable, the function-enable of both DT vibrator nodes
+     * (pmu/vib-pwm's, whose node is AAPL,ignore, and pwm/vibrator's, the one
+     * 14G61 drives); a6_vibrator_gate ANDs it with the SoC PWM's channel.
      */
+    s->vibrator = ios_vibrator_line(OBJECT(machine));
     qdev_connect_gpio_out(gpio, S5L8930_GPIO_PIN(0x0b07),
-                          ios_vibrator_line(OBJECT(machine)));
+                          qemu_allocate_irq(a6_vibrator_gate, s, 0));
+    /*
+     * The SoC PWM (DT arm-io/pwm, "pwm,s5l8950x", hw/arm/s5l8920_pwm.c) at
+     * 0x33500000: 14G61's vibrator is its channel 1 (pwm/vibrator, reg 1; the
+     * grape-clk is channel 2), gated by the enable above.
+     */
+    {
+        DeviceState *pwm = sysbus_create_simple("s5l8920.pwm", 0x33500000, NULL);
+        qdev_connect_gpio_out(pwm, 1, qemu_allocate_irq(a6_vibrator_gate, s, 1));
+    }
     /* N42 DT spi1: 0x32100000, IRQ 29; multi-touch,n41 ATN is
      * GPIO interrupt 201 (port 25, pin 1). The shared Samsung SPI model
      * accepts the native C1F57 firmware's 64452-byte download burst. */

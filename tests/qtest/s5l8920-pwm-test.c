@@ -5,7 +5,9 @@
  * it for a buzz (0x4207) and stops it (0), and the other channels leave it be.
  * The 3GS wires channel 0, the iPhone 4 channel 1 (each DT's pwm/vibrator reg). The iPhone 4's motor also
  * runs from its driver's enable GPIO 0x0e07, the way 6.x and 7.x drive it (pmu/vib-pwm's function-enable).
- * The iPhone 5 (S5L8950X) has only that path: its DT's pmu/vib-pwm enables GPIO 0x0b07.
+ * The iPhone 5 (S5L8950X) has the SoC PWM at 0x33500000 (channel 1, its DT's pwm/vibrator) and the driver's enable
+ * GPIO 0x0b07; 14G61 holds the enable for a whole pattern and runs the channel for each buzz, so the motor runs only
+ * while both are on.
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -14,6 +16,7 @@
 
 #define PWM_BASE    0x83500000
 #define PWM_CTRL(n) (PWM_BASE + 0x18 + 4 * (n))
+#define A6_PWM_CTRL(n) (0x33500000 + 0x18 + 4 * (n))
 #define A4_GPIO_BASE 0xbfa00000
 #define A6_GPIO_BASE 0x3fa00000
 #define GPIO_CFG(base, dt) ((base) + 4 * (((dt) >> 8) * 8 + ((dt) & 0xff)))
@@ -75,7 +78,8 @@ static void check(const char *machine, int channel, uint16_t enable)
 static void n88(void) { check("n88", 0, 0); }
 static void n90(void) { check("iPhone-4", 1, 0x0e07); }
 
-/* The iPhone 5: the enable GPIO runs the motor, its neighbours don't, and a reset stops it. */
+/* The iPhone 5: the motor runs while the enable and PWM channel 1 both are on; its neighbours don't run it, and a
+ * reset stops it. */
 static void n42(void)
 {
     QTestState *q = qtest_initf("-machine iPhone-5,kboot=%s -display none -audio driver=none -nic none", a6_kboot);
@@ -85,10 +89,22 @@ static void n42(void)
     qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0c00), GPIO_OUT_HIGH);
     g_assert_false(vibrating(q));
     qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0b07), GPIO_OUT_HIGH);
-    g_assert_true(vibrating(q));
+    g_assert_false(vibrating(q));
+    qtest_writel(q, A6_PWM_CTRL(0), 0x4003);
+    qtest_writel(q, A6_PWM_CTRL(2), 0x4003);
+    g_assert_false(vibrating(q));
+    /* A pattern: the enable held, the channel run and stopped for each buzz. */
+    for (int buzz = 0; buzz < 2; buzz++) {
+        qtest_writel(q, A6_PWM_CTRL(1), 0x4003);
+        g_assert_true(vibrating(q));
+        qtest_writel(q, A6_PWM_CTRL(1), 0x4000);
+        g_assert_false(vibrating(q));
+    }
+    qtest_writel(q, A6_PWM_CTRL(1), 0x4003);
     qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0b07), GPIO_OUT_LOW);
     g_assert_false(vibrating(q));
     qtest_writel(q, GPIO_CFG(A6_GPIO_BASE, 0x0b07), GPIO_OUT_HIGH);
+    g_assert_true(vibrating(q));
     qtest_system_reset(q);
     g_assert_false(vibrating(q));
     qtest_quit(q);
