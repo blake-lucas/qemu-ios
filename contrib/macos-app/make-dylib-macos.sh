@@ -114,6 +114,7 @@ _qemu_ios_ui_net_lan
 _qemu_ios_ui_ready
 _qemu_ios_ui_storage_failed
 _qemu_ios_storage_stats
+_qemu_ios_storage_sync_hold
 _qemu_ios_ui_guest_shutdown_confirmed
 _qemu_ios_ui_display_sleeping
 _qemu_ios_ui_backlight_level
