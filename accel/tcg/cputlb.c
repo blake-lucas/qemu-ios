@@ -579,13 +579,29 @@ void tlb_destroy(CPUState *cpu)
  * where all queued work will be finished before execution starts
  * again.
  */
+/*
+ * Whether a broadcast TLB flush from @src reaches @cpu: only within @src's TLB domain (CPUState tlb_domain).
+ * LT_TLB_DOMAIN=off reaches every CPU again (A/B). Waking the A6's IOP and AE2 cores for each of the AP's ~1.3K
+ * broadcasts a second made each take the BQL as often, for translations they never hold.
+ */
+static bool tlb_flush_reaches(CPUState *src, CPUState *cpu)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_TLB_DOMAIN");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    return cpu != src && (!on || cpu->tlb_domain == src->tlb_domain);
+}
+
 static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
                              run_on_cpu_data d)
 {
     CPUState *cpu;
 
     CPU_FOREACH(cpu) {
-        if (cpu != src) {
+        if (tlb_flush_reaches(src, cpu)) {
             async_run_on_cpu(cpu, fn, d);
         }
     }
@@ -968,7 +984,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 
         /* Allocate a separate data block for each destination cpu.  */
         CPU_FOREACH(dst_cpu) {
-            if (dst_cpu != src_cpu) {
+            if (tlb_flush_reaches(src_cpu, dst_cpu)) {
                 d = g_new(TLBFlushPageByMMUIdxData, 1);
                 d->addr = addr;
                 d->idxmap = idxmap;
@@ -1172,7 +1188,7 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 
     /* Allocate a separate data block for each destination cpu.  */
     CPU_FOREACH(dst_cpu) {
-        if (dst_cpu != src_cpu) {
+        if (tlb_flush_reaches(src_cpu, dst_cpu)) {
             p = g_memdup(&d, sizeof(d));
             async_run_on_cpu(dst_cpu, tlb_flush_range_by_mmuidx_async_1,
                              RUN_ON_CPU_HOST_PTR(p));

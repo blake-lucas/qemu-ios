@@ -589,6 +589,12 @@ struct CPUState {
      * if it were the only CPU (no CF_PARALLEL). See mttcg_start_vcpu_thread.
      */
     bool tcg_unshared;
+    /*
+     * Set by a board: CPUs in different TLB domains never share translations, so a guest's broadcast TLB
+     * maintenance (TLBI...IS) reaches only its own domain (cputlb.c). The A6's IOP and AE2 cores run their own
+     * firmware on their own memory maps beside the two AP cores. 0 for every CPU unless the board sets it.
+     */
+    int tlb_domain;
     uint32_t tcg_cflags;
     uint32_t halted;
     int32_t exception_index;

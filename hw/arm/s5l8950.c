@@ -1211,6 +1211,7 @@ static void a6_ae2_init(S5L8950State *s, MemoryRegion *memory)
     /* ISA execution probe; the physical AE2 core identity remains unqualified. */
     Object *core = object_new(ARM_CPU_TYPE_NAME("cortex-a9"));
     s->ae2_cpu = ARM_CPU(core);
+    CPU(core)->tlb_domain = 2;   /* the AP cores' TLB broadcasts don't reach it */
     object_property_set_link(core, "memory", OBJECT(&s->ae2_mem), &error_abort);
     object_property_set_bool(core, "start-powered-off", true, &error_abort);
     qdev_realize(DEVICE(core), NULL, &error_fatal);
@@ -2032,6 +2033,7 @@ static void a6_init(MachineState *machine)
     memory_region_add_subregion(&s->iop_mem, 0x30000000, &s->iop_periph);
     Object *iop = object_new(ARM_CPU_TYPE_NAME("cortex-a9"));
     s->iop_cpu = ARM_CPU(iop);
+    CPU(iop)->tlb_domain = 1;   /* the AP cores' TLB broadcasts don't reach it */
     s->iop_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, a6_iop_timer_expired, s);
     object_property_set_link(iop, "memory", OBJECT(&s->iop_mem), &error_abort);
     object_property_set_bool(iop, "start-powered-off", true, &error_abort);
