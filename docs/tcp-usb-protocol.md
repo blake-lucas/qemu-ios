@@ -108,11 +108,11 @@ data without any error being reported.
 **A transaction cannot exceed `INT16_MAX` (32767) bytes**, because `length` is
 an `int16_t`.
 
-**The host must never split one logical OUT packet across transactions.** In the
-host->device direction this transport is *transfer-oriented*, not
-packet-oriented. One OUT transaction means one complete transfer, and the device
-retires the endpoint after each one. A continuation lands in a transfer the guest
-already considers finished.
+**An OUT transaction ends the guest's transfer as a real link would.** It is a run
+of max-size packets ending in a short one, unless it fills the transfer. A
+transaction that ends on a max-packet boundary short of the armed size leaves the
+transfer open, and the next transaction continues it. A transaction that ends in a
+short packet completes it.
 
 **A zero-length OUT transaction is a ZLP.** It completes the guest's armed
 transfer with 0 bytes (and is NAKed like any OUT until one is armed). The device
@@ -122,10 +122,16 @@ explicit ZLP after a write whose length is a multiple of the bulk endpoint's
 `wMaxPacketSize`). iOS 4's mux needs that ZLP to find the end of a message;
 libirecovery's recovery uploads do not send one, and iBoot does not expect it.
 
-**The device accepts at most the guest's currently armed transfer size.** If an
-OUT transaction exceeds it the excess is truncated; the device logs this via
-`LOG_GUEST_ERROR` (visible with `-d guest_errors`), but the host will see a
-short accept and, if it resends the remainder, corrupt the stream.
+**The device accepts at most the guest's currently armed transfer size.** A longer
+OUT transaction fills the armed transfer, which completes it, and the reply's
+length says how much was taken. The host sends the rest in its next transaction,
+which lands in the guest's next transfer. This is what a real link does when a
+host writes more than the device armed: a Mac's usbmuxd writes 48 KiB mux packets
+into iOS's 16 to 32 KiB transfers. The guest's mux reassembles them by its own
+headers. iOS arms 16 to 32 KiB while the host sends 16 KiB packets, 4 to 32 KiB
+once it sends larger ones, and every armed size checked was a multiple of 512
+(`LT_USB_STATS=1`; 3.1.3 to 10.3.4). LightTouch's usbmuxd-qemu sends 32760-byte
+transactions, which halved the time an IPA upload spends sending against 16384.
 
 **The IN direction is the other way round: the device may answer one request
 with less than the transfer contains, and the transfer continues.** The guest
@@ -138,11 +144,14 @@ makes usbmuxd's reassembly (accumulate while chunks are exactly `USB_MRU`, stop
 on a short one) work unmodified. The device must therefore *not* raise
 `XferCompl` or clear `EPENA` until `DIEPTSIZ.XferSize` drains.
 
-Concretely: usbmuxd's default `USB_MTU` of 49152 is larger than both limits.
-Left unchanged it split every large AFC write, and the guest's mux driver
-reassembled unrelated fragments — uploads arrived at the correct size with the
-wrong contents, and `installation_proxy` then failed to extract them. The fix is
-host-side: keep the MTU at or below `max_transaction`.
+History: usbmuxd's default `USB_MTU` of 49152 is larger than `max_transaction`, so
+it split every large AFC write at 16384 bytes. The device model of the time
+retired the transfer after each transaction, even one it had not filled. The
+guest's mux then reassembled unrelated fragments: uploads arrived at the correct
+size with the wrong contents, and `installation_proxy` failed to extract them. The
+model now keeps an unfilled transfer open (the rule above). The host still keeps
+its MTU at or below `max_transaction`, so no packet is ever cut at an arbitrary
+point.
 
 ## Required event order
 

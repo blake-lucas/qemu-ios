@@ -69,6 +69,8 @@ bool nand_image_io_failed(void);
  * A program's data reaches the host's page cache before it returns; the qcow2
  * metadata of a burst of programs that allocated clusters follows when the burst
  * ends (a main-loop bottom half), and an erase's before it returns.
+ * While the guest writes, a thread fdatasyncs the overlay every couple of seconds
+ * (LT_NAND_SYNC=off: never), so a host crash loses at most that window;
  * nand_disk_sync makes it all durable.
  */
 typedef struct NANDDisk NANDDisk;
