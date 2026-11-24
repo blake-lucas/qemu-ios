@@ -345,6 +345,30 @@ static void glq_mirror_refresh(uint32_t ctx)
     }
 }
 
+/* After a call that may have freed other contexts (a process's exit, gles_owner_free), with the worker idle: their
+ * mirrors go, and the call counters of share groups no mirror names any more (a later group may reuse the address). */
+static void glq_prune(void)
+{
+    g_autoptr(GHashTable) used = g_hash_table_new(NULL, NULL);
+    GHashTableIter it;
+    gpointer key, value;
+
+    g_hash_table_iter_init(&it, glq.mirrors);
+    while (g_hash_table_iter_next(&it, &key, &value)) {
+        uint32_t ctx = GPOINTER_TO_UINT(key);
+
+        if (ctx >= 0x80000000 && !(gles_contexts && g_hash_table_contains(gles_contexts, key))) {
+            g_hash_table_iter_remove(&it);
+        } else {
+            g_hash_table_add(used, ((GlqMirror *)value)->group_calls);
+        }
+    }
+    g_hash_table_iter_init(&it, glq.groups);
+    while (g_hash_table_iter_next(&it, NULL, &value)) {
+        if (!g_hash_table_contains(used, value)) g_hash_table_iter_remove(&it);
+    }
+}
+
 typedef struct {
     uint32_t n;
     GlqRegion r[GLQ_MAX_PRE];
@@ -683,6 +707,9 @@ static int64_t gles_queue_call(CPUState *cpu, uint32_t slot, uint32_t ctx, uint3
         glq.wait_own[slot] += t1 - r->started;
     }
     glq_mirror_refresh(ctx);
+    if (slot == GLES_OP_NEW_SHAREGROUP || slot == GLES_OP_DELETE_SHAREGROUP) {
+        glq_prune();
+    }
     m = g_hash_table_lookup(glq.mirrors, GUINT_TO_POINTER(ctx));
     if (m && (slot == GLES_SLOT_FINISH || slot == GLES_SLOT_FLUSH) && r->result >= 0) {
         m->finished_at = *m->group_calls;
