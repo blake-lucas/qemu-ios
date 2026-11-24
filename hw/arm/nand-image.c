@@ -18,6 +18,7 @@
 #include "system/runstate.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
 #include "hw/arm/nand-image.h"
 #ifdef _WIN32
 #include <winioctl.h>
@@ -378,6 +379,7 @@ int nand_image_erase(NANDImage *n, unsigned chip, uint32_t block)
 /* ---- containers: a qcow2 system image under the device's qcow2 overlay ---- */
 
 #define NAND_DISK_FILE      "nand.qcow2"
+#define NAND_DISK_SYNC_MS   2000        /* the periodic sync's interval: docs/STORAGE.md in the app repo */
 #define NAND_DISK_CLUSTER   65536
 
 struct NANDDisk {
@@ -393,6 +395,14 @@ struct NANDDisk {
     unsigned chips;
     struct NANDDiskMapping *map;        /* recent clusters' block status, for direct page I/O */
     uint32_t map_generation;            /* bumped whenever a cluster's mapping may change */
+    /* The periodic sync (nand_disk_sync_thread): `pending` is set by every write that reached the OS since the
+     * thread's last fdatasync; the thread syncs the overlay file every `sync_ms` while it is. */
+    QemuThread sync_thread;
+    QemuMutex sync_lock;
+    QemuCond sync_cond;
+    bool sync_running, sync_quit, pending;
+    int64_t sync_ms;
+    int sync_error;                     /* the periodic sync's first failure, for the stop to report */
 };
 
 /*
@@ -532,6 +542,15 @@ void nand_disk_close(NANDDisk *d, DeviceState *owner)
     if (!d) {
         return;
     }
+    if (d->sync_running) {
+        qemu_mutex_lock(&d->sync_lock);
+        d->sync_quit = true;
+        qemu_cond_signal(&d->sync_cond);
+        qemu_mutex_unlock(&d->sync_lock);
+        qemu_thread_join(&d->sync_thread);
+        qemu_cond_destroy(&d->sync_cond);
+        qemu_mutex_destroy(&d->sync_lock);
+    }
     if (d->flush) {
         qemu_bh_delete(d->flush);
     }
@@ -567,6 +586,55 @@ static void nand_disk_flush(void *opaque)
         d->flush_error = result;
         error_report("NAND disk: metadata write: %s", strerror(-result));
     }
+    qatomic_set(&d->pending, true);     /* the metadata just written: the next periodic sync covers it */
+}
+
+/*
+ * The periodic sync: while the guest writes, every sync_ms an fdatasync of the overlay file, on this thread with no
+ * lock held, so a host crash or power loss loses at most that window (the stop syncs the rest). Nothing else waits
+ * for it; writes keep landing in the page cache meanwhile. fdatasync, not syncfs: on Android's f2fs a syncfs is a
+ * whole-filesystem checkpoint. LT_NAND_SYNC=off turns it off; LT_NAND_SYNC_MS sets the interval.
+ */
+static void *nand_disk_sync_thread(void *opaque)
+{
+    NANDDisk *d = opaque;
+    bool log = getenv("LT_NAND_SYNC_LOG") != NULL;
+
+    qemu_mutex_lock(&d->sync_lock);
+    while (!d->sync_quit) {
+        qemu_cond_timedwait(&d->sync_cond, &d->sync_lock, d->sync_ms);
+        if (d->sync_quit || !qatomic_xchg(&d->pending, false)) {
+            continue;
+        }
+        qemu_mutex_unlock(&d->sync_lock);
+        int64_t t0 = get_clock();
+        int result = qemu_fdatasync(d->sync_fd) < 0 ? -errno : 0;
+        if (log) {
+            fprintf(stderr, "[nand-sync] fdatasync %.2f ms\n", (get_clock() - t0) / 1e6);
+        }
+        if (result < 0 && !qatomic_read(&d->sync_error)) {
+            qatomic_set(&d->sync_error, result);
+            qatomic_set(&nand_image_failed, true);
+            error_report("NAND disk: periodic sync: %s", strerror(-result));
+        }
+        qemu_mutex_lock(&d->sync_lock);
+    }
+    qemu_mutex_unlock(&d->sync_lock);
+    return NULL;
+}
+
+static void nand_disk_start_sync(NANDDisk *d)
+{
+    const char *on = getenv("LT_NAND_SYNC"), *ms = getenv("LT_NAND_SYNC_MS");
+
+    if (d->sync_fd < 0 || (on && (!strcmp(on, "off") || !strcmp(on, "0")))) {
+        return;
+    }
+    d->sync_ms = ms && atoll(ms) > 0 ? atoll(ms) : NAND_DISK_SYNC_MS;
+    qemu_mutex_init(&d->sync_lock);
+    qemu_cond_init(&d->sync_cond);
+    qemu_thread_create(&d->sync_thread, "nand-sync", nand_disk_sync_thread, d, QEMU_THREAD_JOINABLE);
+    d->sync_running = true;
 }
 
 NANDDisk *nand_disk_open(DeviceState *owner, const char *dir, const char *overlay_dir, unsigned chips,
@@ -677,6 +745,7 @@ NANDDisk *nand_disk_open(DeviceState *owner, const char *dir, const char *overla
         }
     }
     d->flush = qemu_bh_new(nand_disk_flush, d);
+    nand_disk_start_sync(d);
     return d;
 }
 
@@ -812,12 +881,14 @@ int nand_disk_write(NANDDisk *d, uint64_t offset, uint32_t len, const void *buf)
         const NANDDiskMapping *m = nand_disk_map(d, offset);
 
         if (m && m->kind == NAND_DISK_TOP) {
+            qatomic_set(&d->pending, true);
             return nand_disk_pio(d->top_fd, (void *)buf, len, m->host + offset % NAND_DISK_CLUSTER, true);
         }
     }
     nand_disk_remap(d);
 #endif
     result = blk_pwrite(d->blk, offset, len, buf, 0);
+    qatomic_set(&d->pending, true);
     qemu_bh_schedule(d->flush);
     return result;
 }
@@ -833,7 +904,9 @@ int nand_disk_erase(NANDDisk *d, unsigned chip, uint32_t block)
     /* The freed clusters' new mapping reaches the OS before any program can reuse them. */
     result = blk_pwrite_zeroes(d->blk, chip * d->chip_stride + block * d->block_stride, d->block_stride,
                                BDRV_REQ_MAY_UNMAP);
-    return result < 0 ? result : blk_flush(d->blk);
+    result = result < 0 ? result : blk_flush(d->blk);
+    qatomic_set(&d->pending, true);
+    return result;
 }
 
 int nand_disk_sync(NANDDisk *d)
@@ -841,7 +914,8 @@ int nand_disk_sync(NANDDisk *d)
     int result;
 
     qemu_bh_cancel(d->flush);
-    result = d->flush_error ? d->flush_error : blk_flush(d->blk);
+    result = d->flush_error ? d->flush_error : qatomic_read(&d->sync_error) ? qatomic_read(&d->sync_error)
+                                                                          : blk_flush(d->blk);
 
     if (result >= 0 && d->sync_fd >= 0 && qemu_fdatasync(d->sync_fd) < 0) {
         result = -errno;

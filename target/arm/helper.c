@@ -9721,6 +9721,7 @@ static struct {
         uint64_t n, ns, max_ns;
     } exception[32];
     uint64_t svc[1024], svc_other;
+    uint64_t fullfsync;     /* fcntl / fcntl_nocancel (92 / 406) with F_FULLFSYNC (51): a sync that reaches the flash */
     uint64_t abort_status[32];
     uint64_t mach_send, mach_receive;
     /* Kernel episodes: from an exception taken from user mode to the exception return to user mode, in
@@ -9842,6 +9843,7 @@ static inline QEMU_ALWAYS_INLINE uint64_t arm_exception_prof_begin(CPUState *cs)
 
         if (nr >= -512 && nr < 512) {
             arm_exception_prof.svc[nr + 512]++;
+            arm_exception_prof.fullfsync += (nr == 92 || nr == 406) && env->regs[1] == 51;
         } else {
             arm_exception_prof.svc_other++;
         }
@@ -9897,6 +9899,7 @@ static void arm_exception_prof_end(int exc, uint64_t start)
     }
     fprintf(stderr, "[exception-prof] svc r12 other n %" PRIu64 "\n",
             arm_exception_prof.svc_other);
+    fprintf(stderr, "[exception-prof] fcntl F_FULLFSYNC n %" PRIu64 "\n", arm_exception_prof.fullfsync);
     fprintf(stderr, "[exception-prof] mach-msg send-attempts %" PRIu64
             " receive-attempts %" PRIu64 "\n",
             arm_exception_prof.mach_send, arm_exception_prof.mach_receive);

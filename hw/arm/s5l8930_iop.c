@@ -71,7 +71,7 @@ static void ioprof_tick(void)
 {
     static const char *names[IOPROF_N] = {
         "pread", "pwrite", "zero", "pread_us", "pwrite_us", "zero_us", "pg_read", "pg_prog", "erase",
-        "fmi_irq", "cdma_irq", "db_ap2iop", "db_iop2ap", "cachectl", "cdma_go", "iop_us", "ap_us",
+        "fmi_irq", "cdma_irq", "db_ap2iop", "db_iop2ap", "cachectl", "cdma_go", "iop_us", "ap_us", "pwrite_max_us",
     };
     static int64_t last;
     static uint64_t prev[IOPROF_N];
@@ -89,7 +89,10 @@ static void ioprof_tick(void)
     for (int i = 0; i < IOPROF_N; i++) {
         uint64_t v = qatomic_read(&s5l8930_ioprof[i]), d = v - prev[i];
         prev[i] = v;
-        if (i == IOPROF_PREAD_NS || i == IOPROF_PWRITE_NS || i == IOPROF_ZERO_NS ||
+        if (i == IOPROF_PWRITE_MAX_NS) {   /* the window's longest program write, not a running total */
+            d = qatomic_xchg(&s5l8930_ioprof[i], 0) / 1000;
+            prev[i] = 0;
+        } else if (i == IOPROF_PREAD_NS || i == IOPROF_PWRITE_NS || i == IOPROF_ZERO_NS ||
             i == IOPROF_IOP_NS || i == IOPROF_AP_NS) {
             d /= 1000;
         }
@@ -642,6 +645,12 @@ static uint32_t nand_program_page(S5L8930IOPState *s, int bus, uint32_t ce,
                            nand_page_io(nand_fd(s, bus, ce, page, true), blk, (int64_t)page * s->page_stride,
                                         s->page_stride, p, true), bus, ce, "program");
     nand_stat(NAND_STAT_WRITE, s->page_stride, stat);
+    if (unlikely(s5l8930_ioprof_on)) {
+        int64_t took = get_clock() - t0;
+        if (took > (int64_t)qatomic_read(&s5l8930_ioprof[IOPROF_PWRITE_MAX_NS])) {
+            qatomic_set(&s5l8930_ioprof[IOPROF_PWRITE_MAX_NS], took);
+        }
+    }
     ioprof_done(IOPROF_PWRITE, IOPROF_PWRITE_NS, t0);
     if (result == FMI_STATUS_OK && s->overlay_dir && !s->disk && nand_set_dirty(s, bus, ce, page)) {
         nand_publish_owners(s, bus, ce, page, page);
