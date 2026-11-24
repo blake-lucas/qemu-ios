@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "hw/arm/nand-image.h"
 #include "hw/arm/ios-boot-args.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -1756,6 +1757,10 @@ static void a6_init(MachineState *machine)
     DeviceState *modem_uart = NULL;
     s->restore_fd = -1;
     gles_host_set_a6(true);
+    /* Opt-ins measured on this board only (docs/PERFORMANCE.md in the app repo): the inline TLB shootdown, page
+     * file I/O without the BQL for the IOP. */
+    tlb_shootdown_board = true;
+    nand_disk_unlocked_io = true;
     if (s->restore_image) {
         struct stat st;
         s->restore_fd = qemu_open_old(s->restore_image, O_RDONLY | O_BINARY);

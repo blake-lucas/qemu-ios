@@ -346,8 +346,8 @@ static void mttcg_acct_dump(int64_t now)
 #endif
     }
     for (int i = 0; i < ARRAY_SIZE(it_acct_excl) && it_acct_excl[i].fn; i++) {
-        struct it_acct_excl *e = &it_acct_excl[i];
 #ifndef _WIN32
+        struct it_acct_excl *e = &it_acct_excl[i];
         Dl_info di = { 0 };
 
         dladdr(e->fn, &di);

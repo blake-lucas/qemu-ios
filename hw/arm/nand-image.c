@@ -778,6 +778,9 @@ static int nand_disk_pio(int fd, void *buf, uint32_t len, uint64_t offset, bool 
 }
 #endif
 
+/* Set by a board whose NAND firmware runs on a vCPU beside other busy ones (the A6). */
+bool nand_disk_unlocked_io;
+
 #ifndef _WIN32
 /*
  * A page's pread or pwrite at a mapped cluster, from a vCPU holding the BQL (the IOP running the NAND firmware), runs
@@ -795,7 +798,7 @@ static int nand_disk_pio_maybe_unlocked(int fd, void *buf, uint32_t len, uint64_
         const char *v = getenv("LT_NAND_IO_UNLOCKED");
         on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
     }
-    if (!on || !current_cpu || !bql_locked()) {
+    if (!on || !nand_disk_unlocked_io || !current_cpu || !bql_locked()) {
         return nand_disk_pio(fd, buf, len, offset, write);
     }
     bql_unlock();

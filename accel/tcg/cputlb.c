@@ -666,6 +666,8 @@ typedef struct TLBShootdownItem {
  * exclusive work. Only from @src's own thread, which flushes itself directly; from elsewhere, the exclusive work.
  */
 bool tlb_shootdown_inline;
+/* Set by a board before its CPUs exist (the A6): without it, unset LT_TLB_SHOOTDOWN means the exclusive work. */
+bool tlb_shootdown_board;
 
 static int tlb_shootdown_mode(void)
 {
@@ -673,7 +675,8 @@ static int tlb_shootdown_mode(void)
 
     if (mode < 0) {
         const char *v = getenv("LT_TLB_SHOOTDOWN");
-        mode = v && (!strcmp(v, "off") || !strcmp(v, "0")) ? 0 : v && !strcmp(v, "queued") ? 1 : 2;
+        mode = v && (!strcmp(v, "off") || !strcmp(v, "0")) ? 0 : v && !strcmp(v, "queued") ? 1
+             : v && !strcmp(v, "inline") ? 2 : tlb_shootdown_board ? 2 : 0;
         tlb_shootdown_inline = mode == 2;
     }
     return mode;

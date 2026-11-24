@@ -1125,6 +1125,7 @@ void it_acct_excl_note(void *fn, int64_t wait, int64_t work);
 /* Run the broadcast TLB flushes queued for @cpu, on its own thread, without the BQL (cputlb.c). */
 void tlb_shootdown_service_slow(CPUState *cpu);
 extern bool tlb_shootdown_inline;
+extern bool tlb_shootdown_board;
 static inline void tlb_shootdown_service(CPUState *cpu)
 {
     if (unlikely(tlb_shootdown_inline) && cpu->tlb_sd) {

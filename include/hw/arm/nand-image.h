@@ -87,6 +87,8 @@ NANDDisk *nand_disk_open(DeviceState *owner, const char *dir, const char *overla
 uint64_t nand_disk_record(NANDDisk *d, unsigned chip, uint32_t page);
 /* `len` bytes at `offset`: 0 or -errno. */
 int nand_disk_read(NANDDisk *d, uint64_t offset, uint32_t len, void *buf);
+/* A board opts in to page file I/O without the BQL (nand-image.c, LT_NAND_IO_UNLOCKED). */
+extern bool nand_disk_unlocked_io;
 int nand_disk_write(NANDDisk *d, uint64_t offset, uint32_t len, const void *buf);
 /* The whole erase block reads as zeros; its clusters are freed. 0 or -errno. */
 int nand_disk_erase(NANDDisk *d, unsigned chip, uint32_t block);

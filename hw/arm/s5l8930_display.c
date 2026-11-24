@@ -1358,7 +1358,7 @@ static void front_latch(S5L8930DisplayState *s, bool vbl)
         }
     }
     /* The same layers as the front's, unchanged in guest RAM: nothing to copy or compose. */
-    if (latch_compare_in_place() && valid && !video && !s->front_video && s->front_valid &&
+    if (s->h5p && latch_compare_in_place() && valid && !video && !s->front_video && s->front_valid &&
         !memcmp(key, s->front_key, sizeof(key)) && len == s->src_len && !memcmp(u, s->src_layers, sizeof(u)) &&
         plan_same(s->fetch, s->src)) {
         g_array_set_size(s->fetch, 0);
