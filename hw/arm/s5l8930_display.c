@@ -165,8 +165,6 @@ struct S5L8930DisplayState {
     uint8_t *src, *src_next;
     size_t src_size, src_len;
     GArray *fetch;           /* FbSeg: the reads layers_fetch planned, run by fetch_run */
-    hwaddr h5p_cached;       /* the H5P PTE table in h5p_ptes, read once per latch; -1: none */
-    uint32_t h5p_ptes[1024];
     GArray *vfetch;          /* FbSeg: the video layer's planes, planned by video_plan */
     /*
      * The last movie frame: its planes as read, the plan they were read with, and the panel-sized
@@ -670,55 +668,13 @@ typedef struct FbSeg {
 
 static hwaddr h5p_ui_xlate(const uint32_t tables[64], uint32_t va);
 
-/*
- * The A6 layers' translation through their H5P tables, a 4 KiB table page read whole the first time a latch needs
- * it: a 640x1136 layer spans ~710 pages, and a PTE load per page cost the latch ~1.4K guest-memory loads with the
- * BQL held, 60 times a second on a still screen (it re-latches every vsync then). LT_H5P_TABLE_CACHE=off loads each
- * PTE again (A/B). The guest edits the tables between latches only; layers_fetch drops the cached page each latch.
- */
-static bool h5p_table_cache(void)
-{
-    static int on = -1;
-
-    if (on < 0) {
-        const char *v = getenv("LT_H5P_TABLE_CACHE");
-        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
-    }
-    return on;
-}
-
-static hwaddr h5p_ui_xlate_cached(S5L8930DisplayState *s, const uint32_t tables[64], uint32_t va)
-{
-    unsigned segment = va >> 22;
-    hwaddr table;
-    uint32_t pte;
-
-    if (!h5p_table_cache()) {
-        return h5p_ui_xlate(tables, va);
-    }
-    if (segment >= 64 || !tables[segment]) {
-        return (hwaddr)-1;
-    }
-    table = tables[segment] & ~0xfffu;
-    if (s->h5p_cached != table) {
-        if (address_space_read(&address_space_memory, table, MEMTXATTRS_UNSPECIFIED, s->h5p_ptes,
-                               sizeof(s->h5p_ptes)) != MEMTX_OK) {
-            s->h5p_cached = (hwaddr)-1;
-            return h5p_ui_xlate(tables, va);
-        }
-        s->h5p_cached = table;
-    }
-    pte = le32_to_cpu(s->h5p_ptes[(va >> 12) & 0x3ff]);
-    return pte & 1 ? (pte & ~0xfffu) | (va & 0xfff) : (hwaddr)-1;
-}
-
 /* tables: the A6's per-layer page tables (H5P), or NULL for the display's DART */
 static void fb_plan_into(S5L8930DisplayState *s, GArray *plan, uint32_t va, size_t off, size_t len,
                          const uint32_t *tables)
 {
     while (len) {
         size_t n = MIN(len, 0x1000 - (va & 0xfff));
-        hwaddr pa = tables ? h5p_ui_xlate_cached(s, tables, va) : dart_xlate(s, va);
+        hwaddr pa = tables ? h5p_ui_xlate(tables, va) : dart_xlate(s, va);
         FbSeg *last = plan->len ? &g_array_index(plan, FbSeg, plan->len - 1) : NULL;
 
         /* Pages contiguous in both: one read (an IOSurface is mostly physically contiguous). */
@@ -981,7 +937,6 @@ static size_t layers_fetch(S5L8930DisplayState *s, const UILayer u[2], const boo
     for (int l = 0; l < 2; l++) {
         need += on[l] ? layer_row_bytes(&u[l]) * (u[l].y1 - u[l].y0) : 0;
     }
-    s->h5p_cached = (hwaddr)-1;
     if (need > s->src_size) {
         s->src = g_realloc(s->src, need);
         s->src_next = g_realloc(s->src_next, need);
@@ -1641,8 +1596,6 @@ static void s5l8930_display_init(Object *obj)
 {
     S5L8930DisplayState *s = S5L8930_DISPLAY(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
-
-    s->h5p_cached = (hwaddr)-1;
 
     /* Order matches the header: pipe0, CLCD, DART2, RGBOUT (= AppleRGBOUT's
      * own DisplayPipe, reg index 0), TVOUT, RGBOUT2 (its control block). */
