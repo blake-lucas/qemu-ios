@@ -2,7 +2,7 @@
  * SLICE hw/usb/dev-mdm9x15.c define MDM_INTERFACES|MDM_MAX_FRAME|MDM_BOOT_SRAM_BASE|MDM_BOOT_SRAM_SIZE|MDM_MAX_IMAGE|MDM_NAS_CLIENTS|MDM_NAS_SERVING|MDM_NAS_SYSTEM|MDM_PDS_SV_IN_FIX
  * SLICE:NAS hw/usb/dev-mdm9x15.c typedef MdmNasClient
  * SLICE hw/usb/dev-mdm9x15.c typedef MdmDownloadState
- * SLICE hw/usb/dev-mdm9x15.c fn mdm_power_filter_reset mdm_power_filter_allows mdm_fuse_serial tlv find_tlv mdm_pds_reset mdm_wake mdm_qmi_ready mdm_sim_pin_state mdm_registered mdm_uim_card_status mdm_uim_file mdm_nas_plmn mdm_nas_serving mdm_nas_system_info mdm_nas_client mdm_nas_register mdm_qmi_trace mdm_qmi_output mdm_pri_version mdm_pri_start mdm_pri_text mdm_pri_end mdm_bsp_parse_pri mdm_bsp_file_write mdm_bsp_file_reset mdm_bsp_file_indicate mdm_nas_indicate mdm_dms_mode mdm_dms_indicate mdm_voice_state mdm_voice_changed mdm_voice_info mdm_voice_indicate mdm_pds_tracking_state mdm_pds_indicate mdm_pds_float mdm_pds_double mdm_pds_position mdm_pds_fix_indicate mdm_wms_smsc mdm_wms_smsc_indicate mdm_wms_indicate mdm_wms_pdu mdm_wms_forget_slot mdm_wms_received mdm_wms_receive_indicate mdm_uim_indicate mdm_qmi_events mdm_qmi_reply mdm_qmi mdm_qmux_receive mdm_dload_crc mdm_hdlc_encode mdm_dload_reply mdm_download_free mdm_sahara_packet mdm_sahara_begin mdm_sahara_read_image mdm_sahara_image_header mdm_sahara_image_data mdm_sahara_finish_image mdm_sahara_receive mdm_dload_boot mdm_dload_command mdm_dload_receive mdm_receive mdm_read
+ * SLICE hw/usb/dev-mdm9x15.c fn mdm_power_filter_reset mdm_power_filter_allows mdm_fuse_serial tlv find_tlv mdm_pds_reset mdm_wake mdm_qmi_ready mdm_sim_pin_state mdm_registered mdm_uim_card_status mdm_uim_file mdm_nas_ucs2_name mdm_nas_plmn_name mdm_nas_plmn mdm_nas_serving mdm_nas_system_info mdm_nas_client mdm_nas_register mdm_qmi_trace mdm_qmi_output mdm_pri_version mdm_pri_start mdm_pri_text mdm_pri_end mdm_bsp_parse_pri mdm_bsp_file_write mdm_bsp_file_reset mdm_bsp_file_indicate mdm_nas_indicate mdm_dms_mode mdm_dms_indicate mdm_voice_state mdm_voice_changed mdm_voice_info mdm_voice_indicate mdm_pds_tracking_state mdm_pds_indicate mdm_pds_float mdm_pds_double mdm_pds_position mdm_pds_fix_indicate mdm_wms_smsc mdm_wms_smsc_indicate mdm_wms_indicate mdm_wms_pdu mdm_wms_forget_slot mdm_wms_received mdm_wms_receive_indicate mdm_uim_indicate mdm_qmi_events mdm_qmi_reply mdm_qmi mdm_qmux_receive mdm_dload_crc mdm_hdlc_encode mdm_dload_reply mdm_download_free mdm_sahara_packet mdm_sahara_begin mdm_sahara_read_image mdm_sahara_image_header mdm_sahara_image_data mdm_sahara_finish_image mdm_sahara_receive mdm_dload_boot mdm_dload_command mdm_dload_receive mdm_receive mdm_read
  * SLICE hw/misc/ios_baseband_core.c range static const char *const gsm7_main | static bool gsm7_encodable
  * SLICE hw/misc/ios_baseband_core.c fn digits_to_semi ios_bb_sim_read_file
  * SLICE:CALL include/hw/misc/ios_baseband_core.h range /* +XCALLSTAT states | typedef struct IosBbAtChan
@@ -37,7 +37,7 @@
 typedef struct {
     IosBbSms store[4];
     char sca[24];
-    char imei[16], imsi[16], iccid[21], operator_long[33], plmn[7];
+    char imei[16], imsi[16], iccid[21], operator_long[33], operator_short[17], plmn[7];
     bool off, sim_present, registered, pin_on, pin_ok, cops_detached;
     int cfun, pin_left, puk_left, signal_dbm;
     int64_t now_ms;
@@ -688,6 +688,21 @@ int main(void)
     result = find_tlv(out + 13, n - 13, 0x12, &size);
     assert(result && size == 16 && lduw_le_p(result) == 1 &&
            lduw_le_p(result + 2) == 1 && result[4] == 11);
+    /* Get PLMN Name: the network's names in UCS-2 LE for its own PLMN (SPN, then short and long with their
+     * country-initials and spare-bits bytes); none for another PLMN. */
+    uint8_t name_req[] = {1, 19, 0, 0, 3, 1, 0, 1, 0, 0x44, 0, 7, 0, 1, 4, 0, 1, 0, 1, 0};
+    mdm_receive(&s, 5, name_req, sizeof name_req);
+    n = mdm_read(&s, 5, out, sizeof out);
+    result = find_tlv(out + 13, n - 13, 0x10, &size);
+    assert(result && size == 2 + 22 + 2 * (4 + 22) && result[0] == 1 && result[1] == 22 && result[2] == 'L' &&
+           !result[3] && result[24] == 1 && result[27] == 22 && result[50] == 1 && result[53] == 22 &&
+           result[54] == 'L' && result[74] == 'h');
+    name_req[13 + 3] = 0x36; /* MCC 310 */
+    name_req[13 + 4] = 1;
+    mdm_receive(&s, 5, name_req, sizeof name_req);
+    n = mdm_read(&s, 5, out, sizeof out);
+    result = find_tlv(out + 13, n - 13, 0x10, &size);
+    assert(result && size == 2 + 4 + 4 && !result[1] && !result[5] && !result[9]);
     backend.bb.registered = false;
     mdm_receive(&s, 5, service_req, sizeof service_req);
     n = mdm_read(&s, 5, out, sizeof out);
