@@ -354,9 +354,18 @@ static inline const char *gles_id_name(uint32_t id)
 #define GLES_OP_BIND_SURFACE            (GLES_OP_BASE + 3)
 #define GLES_SURFACE_WINDOW_ORDER       0x80000000u
 /* Native context lifecycle. New operations return opaque positive handles;
- * a zero sharegroup handle means the backend only supports legacy contexts. */
+ * a zero sharegroup handle means the backend only supports legacy contexts.
+ *
+ * Process exit. A guest process that dies never deletes its contexts, so their objects would stay charged until the
+ * device stops. NEW_SHAREGROUP's [pid, start seconds, start microseconds] form names the process that made the group
+ * (its owner): the start time is the kernel's (sysctl KERN_PROC_PID), so the guest agent can tell the process from a
+ * later one with the same pid. When the shim could not read it, seconds is 0 and microseconds is a per-process token
+ * with GLES_OWNER_NOT_START set. The group's contexts take its owner. DELETE_SHAREGROUP's [pid, seconds,
+ * microseconds] form says that process has exited: every sharegroup and context it owns is freed. Groups made with
+ * the old zero-argument form have no owner and are kept until the guest stops or reboots. */
 #define GLES_OP_NEW_SHAREGROUP          (GLES_OP_BASE + 4)
 #define GLES_OP_DELETE_SHAREGROUP       (GLES_OP_BASE + 5)
+#define GLES_OWNER_NOT_START            0x80000000u
 /* NEW_CONTEXT accepts [sharegroup] from older shims or [sharegroup, API]
  * with explicit API 1/2. The older form remains unknown (0), never guessed
  * from the current program or firmware. CGL accepts both; EGL requires API.
@@ -387,6 +396,13 @@ static inline const char *gles_id_name(uint32_t id)
 /* args: an ES error. A call the guest shim refuses itself (gles_stub: an entry point with no host implementation)
  * sets the context's error the way a refusal on the host does, so the app's glGetError sees it. */
 #define GLES_OP_SET_ERROR               (GLES_OP_BASE + 11)
+/* The processes that own sharegroups, for the guest agent (contrib/it-agent) to watch for exit.
+ * args: guest buffer, max entries, entries to skip, the generation the caller last saw.
+ * Returns generation << 32 | number of owners. The generation changes whenever an owner is added or removed; when the
+ * caller's matches, nothing is written. Otherwise entries skip.. (up to max) are written as {pid, seconds,
+ * microseconds} words, sorted. */
+#define GLES_OP_OWNERS                  (GLES_OP_BASE + 12)
+#define GLES_OWNERS_MAX                 64u
 #define GLES_BATCH_MAX_WORDS            4096
 
 /* Surface pixel formats, as IOSurfaceGetPixelFormat reports them (FourCC). */

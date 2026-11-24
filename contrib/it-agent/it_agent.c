@@ -295,6 +295,7 @@ static int clipboard_main(void)
 
 #ifndef IT_AGENT_CLIPBOARD_ONLY   /* contrib/it-pasteboard/it_pbd.c: the clipboard above, its own main */
 #include "agent-ops.h"
+#include "agent-glexit.h"
 
 int main(int argc, char **argv, char **environment);
 /* Without LEGACY_LINK, armv6.sh's link has no crt1: the process enters at its entry point with argc, argv[], 0,
@@ -325,6 +326,8 @@ int main(int argc, char **argv, char **environment)
         /* File/command RPC needs no UIKit initialization. Start immediately so
          * boot-time provisioning does not wait for the clipboard grace period. */
         agent_tick();
+        /* GL processes that exited, for the host to free their objects (agent-glexit.h): every 2 s */
+        glexit_tick();
         /* UIPasteboard makes synchronous IPC calls. A sleeping or unavailable
          * pasteboard server must not stop command polling or child reaping.
          * Re-exec a worker rather than forking after ObjC has initialized. It

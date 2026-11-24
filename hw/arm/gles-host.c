@@ -487,11 +487,17 @@ typedef struct {
     unsigned immutable_levels;
 } GLESPVRTC;
 
+/* The guest process a sharegroup or context belongs to (GLES_OP_NEW_SHAREGROUP's owner form); pid 0: unknown. */
+typedef struct {
+    uint32_t pid, sec, usec;
+} GLESOwner;
+
 typedef struct {
 #if !defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE) || defined(GLES_HOST_EGL)
     CGLContextObj root;
 #endif
     unsigned refs;
+    GLESOwner owner;
     GHashTable *buffers, *surfaces, *rb_sized, *pvrtc;
     GHashTable *charged;        /* gles_charge_key -> bytes, the group's named objects */
     uint32_t next_buffer_name;
@@ -651,6 +657,9 @@ typedef struct {
     GHashTable *fbo_drawable;   /* framebuffer name -> guest drawable renderbuffer */
     uint32_t bound_renderbuffer;
     uint32_t bound_framebuffer;
+    /* APPLE_framebuffer_multisample's READ_FRAMEBUFFER_APPLE binding, the source of
+     * glResolveMultisampleFramebufferAPPLE; bound_framebuffer is the draw one. */
+    uint32_t read_framebuffer;
     /* Set whenever the render target or its attachments change; the draw path
      * revalidates completeness only when it is set, which is what makes the
      * check cheap enough to leave on permanently. */
@@ -808,6 +817,7 @@ typedef struct {
     GLESMatrixStack matrix_stack[GLES_MATRIX_STACKS];
     uint32_t matrices_kept;
     GLint host_stack_max[3];
+    GLESOwner owner;            /* its sharegroup's, taken when it was made */
 } GLESHost;
 
 /* Old guest engines retain their legacy context. New engines pass opaque
@@ -948,9 +958,10 @@ static GHashTable *gles_charge_table(bool own)
  * forgets it); *old, if given, gets what that was. False, with nothing
  * changed, when the total would pass GLES_MAX_GPU_BYTES: the caller fails the
  * call with GL_OUT_OF_MEMORY instead of allocating. */
+static uint64_t gles_charge_reported;   /* the largest total logged, in 64 MiB steps (lowered by a process exit) */
+
 static bool gles_charge(GHashTable *table, gpointer key, uint64_t bytes, uint64_t *old)
 {
-    static uint64_t reported;   /* the largest total logged, in 64 MiB steps */
     uint64_t held = (uintptr_t)g_hash_table_lookup(table, key);
 
     if (old) *old = held;
@@ -965,8 +976,8 @@ static bool gles_charge(GHashTable *table, gpointer key, uint64_t bytes, uint64_
     gles_held_bytes = gles_held_bytes - held + bytes;
     if (bytes) g_hash_table_insert(table, key, (gpointer)(uintptr_t)bytes);
     else g_hash_table_remove(table, key);
-    if ((gles_held_bytes + gles_buffer_bytes) >> 26 > reported) {
-        reported = (gles_held_bytes + gles_buffer_bytes) >> 26;
+    if ((gles_held_bytes + gles_buffer_bytes) >> 26 > gles_charge_reported) {
+        gles_charge_reported = (gles_held_bytes + gles_buffer_bytes) >> 26;
         fprintf(stderr, "[gles] GL objects hold %" PRIu64 " MiB (cap %" PRIu64 " MiB)\n",
                 (gles_held_bytes + gles_buffer_bytes) >> 20, GLES_MAX_GPU_BYTES >> 20);
     }
@@ -6008,6 +6019,159 @@ static bool gles_resolve_drawable(void)
     return true;
 }
 
+/*
+ * APPLE_framebuffer_multisample, which the SGX's drivers had from 4.0 on. The front end doesn't list it, and the
+ * host answers MAX_SAMPLES_APPLE 0, but Unreal Engine 3 uses it unasked where the device had it: Epic Citadel on
+ * the iPhone 5 draws its scene into a multisample renderbuffer and resolves that into the screen's. With the two
+ * calls dropped the scene went nowhere and the screen stayed black. The resolve is a blit, as the extension is
+ * defined. Desktop GL gives the renderbuffer up to 4 samples (the SGX 543's); Android's native driver, where the
+ * context is ES 3, a single-sampled one (see gles_renderbuffer_storage_multisample). ANGLE and ES 2-only drivers
+ * still drop the calls.
+ */
+#define GLES_READ_FRAMEBUFFER_APPLE 0x8CA8
+#define GLES_DRAW_FRAMEBUFFER_APPLE 0x8CA9
+#if !defined(GLES_HOST_EAGL) || (defined(GLES_HOST_EGL_ES) && !defined(GLES_HOST_ANGLE))
+#define GLES_HOST_MULTISAMPLE 1
+#endif
+#ifdef GLES_HOST_MULTISAMPLE
+#ifndef GL_READ_FRAMEBUFFER_EXT
+#define GL_READ_FRAMEBUFFER_EXT 0x8CA8
+#define GL_DRAW_FRAMEBUFFER_EXT 0x8CA9
+#endif
+#ifndef GL_MAX_SAMPLES_EXT
+#define GL_MAX_SAMPLES_EXT 0x8D57
+#endif
+#ifndef GL_RENDERBUFFER_WIDTH_EXT
+#define GL_RENDERBUFFER_WIDTH_EXT 0x8D42
+#define GL_RENDERBUFFER_HEIGHT_EXT 0x8D43
+#endif
+#ifdef GLES_HOST_EGL_ES
+/* ES 3 core; an ES 2 context's driver needn't have them, so they are looked up, and only an ES 3 context uses them. */
+static PFNGLBLITFRAMEBUFFERPROC gles_es3_blit;
+static PFNGLRENDERBUFFERSTORAGEMULTISAMPLEPROC gles_es3_storage;
+#define gles_ms_blit gles_es3_blit
+#define gles_ms_storage gles_es3_storage
+#else
+#define gles_ms_blit glBlitFramebufferEXT
+#define gles_ms_storage glRenderbufferStorageMultisampleEXT
+#endif
+
+/* LT_GLES_MULTISAMPLE=off: the two calls dropped as before, for an A/B run. */
+static bool gles_multisample_on(void)
+{
+    static int on = -1;
+#ifdef GLES_HOST_EGL_ES
+    if (gh.api_version != 2) return false;     /* before the lookup below, which needs an ES 2+ context's version */
+#endif
+    if (on < 0) {
+        on = g_strcmp0(getenv("LT_GLES_MULTISAMPLE"), "off") != 0;
+#ifdef GLES_HOST_EGL_ES
+        const char *version = (const char *)glGetString(GL_VERSION);
+        if (on && version && strstr(version, "OpenGL ES 3")) {
+            gles_es3_blit = (PFNGLBLITFRAMEBUFFERPROC)eglGetProcAddress("glBlitFramebuffer");
+            gles_es3_storage = (PFNGLRENDERBUFFERSTORAGEMULTISAMPLEPROC)
+                eglGetProcAddress("glRenderbufferStorageMultisample");
+        }
+        on = on && gles_es3_blit && gles_es3_storage;
+#elif defined(GLES_HOST_WGL)
+        on = on && glRenderbufferStorageMultisampleEXT && glBlitFramebufferEXT;     /* GLEW's, null if missing */
+#endif
+    }
+    return on;
+}
+
+static int64_t gles_multisample_dropped(uint32_t slot)
+{
+    if (gles_refuse("slot:%u", slot)) {
+        fprintf(stderr, "[gles] UNHANDLED %s (id %u): no multisampling on this host, or LT_GLES_MULTISAMPLE=off -- "
+                "the guest will render wrong\n", gles_id_name(slot), slot);
+    }
+    gles_reject(GL_INVALID_OPERATION);
+    return 0;
+}
+
+static int64_t gles_renderbuffer_storage_multisample(uint32_t format, uint32_t samples, uint32_t w, uint32_t h)
+{
+    GHashTable *table = gles_charge_table(false);
+    gpointer key = gles_charge_key(GLES_CHARGE_RENDERBUFFER, gh.bound_renderbuffer, 0, 0);
+    GLint host_max = 0;
+    uint64_t old;
+
+    if (!gles_multisample_on()) return gles_multisample_dropped(GLES_ID_glRenderbufferStorageMultisampleAPPLE);
+    gh.fb_dirty = true;     /* an attached renderbuffer's storage decides completeness */
+    glGetIntegerv(GL_MAX_SAMPLES_EXT, &host_max);
+    uint32_t asked = samples;
+    samples = MIN(samples, MIN(4u, (uint32_t)MAX(host_max, 0)));
+#ifdef GLES_HOST_EGL_ES
+    /* ES 3 resolves a multisampled source only into a color buffer of the identical format, which the screen's
+     * (gles_layer_storage) needn't be; a single-sampled source blits into any. */
+    samples = 0;
+#endif
+    static unsigned said;
+    if (said < 4) {
+        said++;
+        fprintf(stderr, "[gles] multisample renderbuffer %ux%u format 0x%x: %u samples asked, %u given\n",
+                w, h, format, asked, samples);
+    }
+    uint64_t bytes = (uint64_t)w * h * 4 * MAX(samples, 1u);
+    if ((uint64_t)w * h * 4 > GLES_MAX_TEX_BYTES) {
+        gles_refuse("cap:glRenderbufferStorageMultisample");
+        return gles_reject(GL_INVALID_VALUE);
+    }
+    if (!gles_charge(table, key, bytes, &old)) {
+        return gles_reject(GL_OUT_OF_MEMORY);
+    }
+    g_hash_table_add(gh.rb_sized, GUINT_TO_POINTER(gh.bound_renderbuffer));
+    gles_texture_begin();
+    gles_ms_storage(GL_RENDERBUFFER_EXT, samples, gles_rb_format(format), w, h);
+    GLenum error = glGetError();
+    if (error) {
+        gles_charge(table, key, old, NULL);
+        gles_refuse("multisample:storage:0x%x", error);
+        return gles_reject(error);
+    }
+    return 0;
+}
+
+/* The read framebuffer's color into the draw framebuffer's, the read one's size (the extension wants them equal),
+ * within the scissor box if the test is on. */
+static int64_t gles_resolve_multisample(void)
+{
+    GLuint read = gles_host_fbo(gh.read_framebuffer), draw = gles_host_fbo(gh.bound_framebuffer);
+    GLint type = 0, name = 0, bound = 0, width = 0, height = 0;
+
+    if (!gles_multisample_on()) return gles_multisample_dropped(GLES_ID_glResolveMultisampleFramebufferAPPLE);
+    if (read == draw) {
+        gles_refuse("multisample:resolve:same");
+        return gles_reject(GL_INVALID_OPERATION);
+    }
+    gles_texture_begin();
+    glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, read);
+    glBindFramebufferEXT(GL_DRAW_FRAMEBUFFER_EXT, draw);
+    glGetFramebufferAttachmentParameterivEXT(GL_READ_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
+                                             GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_EXT, &type);
+    glGetFramebufferAttachmentParameterivEXT(GL_READ_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
+                                             GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_EXT, &name);
+    if (type != GL_RENDERBUFFER_EXT) {
+        gles_refuse("multisample:resolve:source:0x%x", type);
+        return gles_reject(GL_INVALID_OPERATION);
+    }
+    glGetIntegerv(GL_RENDERBUFFER_BINDING_EXT, &bound);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, name);
+    glGetRenderbufferParameterivEXT(GL_RENDERBUFFER_EXT, GL_RENDERBUFFER_WIDTH_EXT, &width);
+    glGetRenderbufferParameterivEXT(GL_RENDERBUFFER_EXT, GL_RENDERBUFFER_HEIGHT_EXT, &height);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, bound);
+    gles_ms_blit(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    GLenum error = glGetError();
+    if (error) {
+        gles_refuse("multisample:resolve:0x%x", error);
+        return gles_reject(error);
+    }
+    if (gles_is_drawable(gh.bound_framebuffer)) gh.draws_drawable++;
+    return 0;
+}
+#endif
+
 static bool gles_surface_range(uint32_t base, uint32_t stride, unsigned rows,
                                unsigned rowbytes)
 {
@@ -10162,7 +10326,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         case 0x8B8D: v.i[0] = gh.program; break;    /* CURRENT_PROGRAM */
         case 0x8DFA: v.i[0] = 1; break;             /* SHADER_COMPILER */
         case 0x8DF9: v.i[0] = 0; break;             /* NUM_SHADER_BINARY_FORMATS */
-        case 0x8D57: v.i[0] = 0; break;             /* MAX_SAMPLES_APPLE: no multisampling here */
+        /* MAX_SAMPLES_APPLE: 0, so an app that asks first keeps away from multisampling; one that doesn't (Unreal
+         * Engine 3) still gets it, see gles_renderbuffer_storage_multisample. */
+        case 0x8D57: v.i[0] = 0; break;
         case GL_MODELVIEW_STACK_DEPTH: case GL_PROJECTION_STACK_DEPTH: case GL_TEXTURE_STACK_DEPTH:
         case GL_MAX_MODELVIEW_STACK_DEPTH: case GL_MAX_PROJECTION_STACK_DEPTH: case GL_MAX_TEXTURE_STACK_DEPTH:
             if (gh.api_version != 2) {
@@ -11023,6 +11189,14 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             if (gles_refuse("name:private:%u", slot)) fprintf(stderr, "[gles] guest named %#x\n", a[1]);
             return gles_reject(GL_INVALID_OPERATION);
         }
+#ifdef GLES_HOST_MULTISAMPLE
+        /* The resolve's source alone: the draw target, and all the bookkeeping that follows it, stay. */
+        if (a[0] == GLES_READ_FRAMEBUFFER_APPLE && gles_multisample_on()) {
+            gh.read_framebuffer = a[1];
+            glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, gles_host_fbo(a[1]));
+            return 0;
+        }
+#endif
         if (gles_sync_surface(cpu)) return -1;
         /* Back to the default framebuffer: the offscreen passes are done. 3.1.3's
          * CoreAnimation never flushes (it double-buffers its display surfaces and
@@ -11103,7 +11277,22 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         gh.bound_framebuffer = a[1];
         gh.fb_dirty = true;
         glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gles_host_fbo(a[1]));
+#ifdef GLES_HOST_MULTISAMPLE
+        if (a[0] == GLES_DRAW_FRAMEBUFFER_APPLE && gles_multisample_on()) {
+            glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, gles_host_fbo(gh.read_framebuffer));
+            return 0;
+        }
+#endif
+        gh.read_framebuffer = a[1];
         return 0;
+
+#ifdef GLES_HOST_MULTISAMPLE
+    case GLES_ID_glRenderbufferStorageMultisampleAPPLE:     /* target, samples, internalformat, w, h */
+        return gles_renderbuffer_storage_multisample(a[2], a[1], a[3], a[4]);
+
+    case GLES_ID_glResolveMultisampleFramebufferAPPLE:
+        return gles_resolve_multisample();
+#endif
 
     case GLES_SLOT_RENDERBUFFER_STORAGE: { /* target, internalformat, w, h */
         gh.fb_dirty = true;     /* an attached renderbuffer's storage decides completeness */
@@ -11388,6 +11577,145 @@ static void gles_context_free(GLESHost *state)
     else g_free(state);
 }
 
+/* ------------------------------------------------------ process exit ----
+ *
+ * A guest process that exits never sends DELETE_CONTEXT, so its contexts and every object in their sharegroups stayed
+ * charged until the device stopped. Each sharegroup now carries the process that made it (gles.h, the owner form of
+ * NEW_SHAREGROUP), the guest agent watches those processes (GLES_OP_OWNERS) and reports the ones that exit, and they
+ * are freed here. Being wrong is worse than the leak (a live app would lose its textures), so only an owner the guest
+ * names is freed, and only with all three words matching: a later process with the same pid is another owner.
+ * LT_GLES_PROC_EXIT=off records and lists owners as usual but frees nothing, for an A/B run. */
+static uint32_t gles_owner_gen = 1;     /* GLES_OP_OWNERS' generation: changes with the owner set */
+
+static bool gles_proc_exit_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) on = g_strcmp0(getenv("LT_GLES_PROC_EXIT"), "off") != 0;
+    return on;
+}
+
+static bool gles_owner_eq(const GLESOwner *a, const GLESOwner *b)
+{
+    return a->pid == b->pid && a->sec == b->sec && a->usec == b->usec;
+}
+
+static void gles_owner_changed(void)
+{
+    gles_owner_gen = gles_owner_gen % 0x7fffffffu + 1;  /* 1..2^31-1: the reply stays positive */
+}
+
+/* Frees every context and sharegroup `o` owns. Returns the contexts freed. */
+static unsigned gles_owner_free(const GLESOwner *o, const char *why)
+{
+    uint64_t before = gles_held_bytes + gles_buffer_bytes;
+    unsigned contexts = 0, groups = 0;
+    GHashTableIter it;
+    gpointer key, value;
+
+    if (!o->pid || !gles_contexts) return 0;
+    if (!gles_proc_exit_on()) {
+        fprintf(stderr, "[gles] process %u %s; LT_GLES_PROC_EXIT=off keeps its GL objects\n", o->pid, why);
+        return 0;
+    }
+    g_hash_table_iter_init(&it, gles_contexts);
+    while (g_hash_table_iter_next(&it, &key, &value)) {
+        GLESHost *state = value;
+
+        if (!gles_owner_eq(&state->owner, o)) continue;
+        g_hash_table_iter_remove(&it);
+        gles_end_context();
+        if (trace_event_get_state_backends(TRACE_GLES_CONTEXT_LOG)) TRACE_PRINTF(trace_gles_context_log, "[gles-context] freed %08x %p: process %u exited\n", GPOINTER_TO_UINT(key), (void *)state, o->pid);
+        gles_context_free(state);
+        contexts++;
+    }
+    g_hash_table_iter_init(&it, gles_groups);
+    while (g_hash_table_iter_next(&it, NULL, &value)) {
+        GLESGroup *group = value;
+
+        if (!gles_owner_eq(&group->owner, o)) continue;
+        g_hash_table_iter_remove(&it);
+        gles_group_unref(group);
+        groups++;
+    }
+    if (!contexts && !groups) return 0;
+    gles_owner_changed();
+    uint64_t after = gles_held_bytes + gles_buffer_bytes;
+    gles_charge_reported = after >> 26;     /* the climb after a relaunch is logged again */
+    fprintf(stderr, "[gles] process %u %s: freed %u contexts and %u sharegroups, %" PRIu64 " MiB; GL objects hold %"
+            PRIu64 " MiB\n", o->pid, why, contexts, groups, (before - MIN(before, after)) >> 20, after >> 20);
+    return contexts;
+}
+
+/* A new owner with the pid of an older one: the older process has exited, as one process always sends the same
+ * start time (or token) for its pid. */
+static void gles_owner_replaces(const GLESOwner *o)
+{
+    GHashTableIter it;
+    gpointer value;
+    GLESOwner stale[8];
+    unsigned n = 0;
+
+    for (int t = 0; t < 2; t++) {
+        g_hash_table_iter_init(&it, t ? gles_contexts : gles_groups);
+        while (g_hash_table_iter_next(&it, NULL, &value) && n < G_N_ELEMENTS(stale)) {
+            GLESOwner *g = t ? &((GLESHost *)value)->owner : &((GLESGroup *)value)->owner;
+            bool seen = false;
+
+            if (g->pid != o->pid || gles_owner_eq(g, o)) continue;
+            for (unsigned i = 0; i < n; i++) seen |= gles_owner_eq(&stale[i], g);
+            if (!seen) stale[n++] = *g;
+        }
+    }
+    for (unsigned i = 0; i < n; i++) gles_owner_free(&stale[i], "exited (its pid was reused)");
+}
+
+static int owner_cmp(const void *a, const void *b)
+{
+    const GLESOwner *x = a, *y = b;
+
+    if (x->pid != y->pid) return x->pid < y->pid ? -1 : 1;
+    if (x->sec != y->sec) return x->sec < y->sec ? -1 : 1;
+    return x->usec < y->usec ? -1 : x->usec > y->usec;
+}
+
+/* GLES_OP_OWNERS (gles.h). */
+static int64_t gles_owner_list(CPUState *cpu, unsigned argc, const uint32_t *a)
+{
+    g_autoptr(GArray) owners = g_array_new(false, false, sizeof(GLESOwner));
+    GHashTableIter it;
+    gpointer value;
+    uint32_t total, n;
+
+    if (argc != 4) return -1;
+    if (gles_groups) {
+        g_hash_table_iter_init(&it, gles_groups);
+        while (g_hash_table_iter_next(&it, NULL, &value)) {
+            if (((GLESGroup *)value)->owner.pid) g_array_append_val(owners, ((GLESGroup *)value)->owner);
+        }
+        /* A context outlives its group's handle when the guest deletes the group first. */
+        g_hash_table_iter_init(&it, gles_contexts);
+        while (g_hash_table_iter_next(&it, NULL, &value)) {
+            if (((GLESHost *)value)->owner.pid) g_array_append_val(owners, ((GLESHost *)value)->owner);
+        }
+    }
+    g_array_sort(owners, owner_cmp);
+    total = 0;
+    for (guint i = 0; i < owners->len; i++) {
+        if (!total || owner_cmp(&g_array_index(owners, GLESOwner, total - 1), &g_array_index(owners, GLESOwner, i))) {
+            g_array_index(owners, GLESOwner, total++) = g_array_index(owners, GLESOwner, i);
+        }
+    }
+    if (a[3] != gles_owner_gen && a[0] && a[2] < total) {
+        n = MIN(MIN(a[1], GLES_OWNERS_MAX), total - a[2]);
+        if (n && gles_guest_rw(cpu, a[0], (uint8_t *)&g_array_index(owners, GLESOwner, a[2]),
+                               n * sizeof(GLESOwner), 1)) {
+            return -1;
+        }
+    }
+    return (int64_t)gles_owner_gen << 32 | total;
+}
+
 static int64_t gles_context_operation(unsigned slot, unsigned ctx, unsigned argc,
                                       const uint32_t *args)
 {
@@ -11396,10 +11724,19 @@ static int64_t gles_context_operation(unsigned slot, unsigned ctx, unsigned argc
         gles_groups = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
     if (slot == GLES_OP_NEW_SHAREGROUP) {
-        if (argc || gles_handle == UINT32_MAX ||
-            g_hash_table_size(gles_groups) >= GLES_MAX_CONTEXTS) return -1;
+        if ((argc != 0 && argc != 3) || gles_handle == UINT32_MAX) return -1;
+        if (argc == 3 && args[0]) {
+            GLESOwner o = { args[0], args[1], args[2] };
+
+            gles_owner_replaces(&o);
+        }
+        if (g_hash_table_size(gles_groups) >= GLES_MAX_CONTEXTS) return -1;
         GLESGroup *group = g_new0(GLESGroup, 1);
         group->refs = 1;
+        if (argc == 3) {
+            group->owner = (GLESOwner){ args[0], args[1], args[2] };
+            gles_owner_changed();
+        }
         group->buffers = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, gles_buffer_destroy);
         group->surfaces = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
         group->rb_sized = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -11430,6 +11767,7 @@ static int64_t gles_context_operation(unsigned slot, unsigned ctx, unsigned argc
         state->rb_sized = group->rb_sized;
         state->pvrtc = group->pvrtc;
         state->charged = group->charged;
+        state->owner = group->owner;
         uint32_t handle = ++gles_handle;
         g_hash_table_insert(gles_contexts, GUINT_TO_POINTER(handle), state);
         if (trace_event_get_state_backends(TRACE_GLES_CONTEXT_LOG)) TRACE_PRINTF(trace_gles_context_log, "[gles-context] created %08x %p api=%u\n", handle, (void *)state, state->api_version);
@@ -11445,11 +11783,17 @@ static int64_t gles_context_operation(unsigned slot, unsigned ctx, unsigned argc
         gles_context_free(state);
         return 0;
     }
+    if (slot == GLES_OP_DELETE_SHAREGROUP && argc == 3) {
+        GLESOwner o = { args[0], args[1], args[2] };
+
+        return o.pid ? gles_owner_free(&o, "exited") : -1;
+    }
     if (slot == GLES_OP_DELETE_SHAREGROUP) {
         if (argc != 1) return -1;
         GLESGroup *group = g_hash_table_lookup(gles_groups, GUINT_TO_POINTER(args[0]));
         if (!group) return -1;
         g_hash_table_remove(gles_groups, GUINT_TO_POINTER(args[0]));
+        if (group->owner.pid) gles_owner_changed();
         gles_group_unref(group);
         return 0;
     }
@@ -11481,6 +11825,7 @@ static void gles_drop_all(void)
         g_hash_table_remove_all(gles_groups);
     }
     gles_context_free(&gh_legacy);
+    gles_owner_changed();
     qatomic_set(&gles_live_contexts, 0);
     if (gles_save_blocker) migrate_del_blocker(&gles_save_blocker);
 }
@@ -11530,9 +11875,10 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
     }
     qemu_ios_crash_note_data.gl_calls++;
 
-    if (slot >= GLES_OP_NEW_SHAREGROUP && slot <= GLES_OP_DELETE_CONTEXT) {
+    if ((slot >= GLES_OP_NEW_SHAREGROUP && slot <= GLES_OP_DELETE_CONTEXT) || slot == GLES_OP_OWNERS) {
 #if !defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE) || defined(GLES_HOST_EGL)
-        r = gles_context_operation(slot, ctx, argc, a);
+        /* The owner list only reads the tables: it runs without the BQL (qemu_call_needs_bql) and needs no context. */
+        r = slot == GLES_OP_OWNERS ? gles_owner_list(cpu, argc, a) : gles_context_operation(slot, ctx, argc, a);
         qemu_ios_crash_note_data.gl_stage = 0;
         if (r < 0) gles_refuse("context:op:%u", slot);
         return r;

@@ -864,14 +864,68 @@ static int s_bufferSubData(void *gc, unsigned target, unsigned offset,
  * so its contents are ours; the host keys off the same pointer. */
 
 
+/*
+ * This process, as the host records a sharegroup's owner (gles.h, GLES_OP_NEW_SHAREGROUP): its pid and the kernel's
+ * start time for it. A process that dies never deletes its contexts; the guest agent watches the owners the host
+ * lists and reports the ones that exit, comparing this start time with the kernel's to tell this process from a later
+ * one with the same pid. Where sysctl refuses, the seconds are 0 and the microseconds a token of this process's own
+ * (GLES_OWNER_NOT_START set), and the agent goes by the pid alone. Read once per process (per pid: a forked child
+ * reads its own).
+ */
+#define GLES_OWNER_NOT_START 0x80000000u
+extern int getpid(void);
+extern int sysctl(int *, unsigned, void *, unsigned long *, void *, unsigned long);
+extern unsigned long long mach_absolute_time(void);
+static unsigned gles_owner_words[3];
+static volatile int gles_owner_lock;    /* OSSpinLock */
+
+static void gles_owner(unsigned out[3])
+{
+    int pid = getpid(), first = 0;
+    /* kinfo_proc's extern_proc (32-bit): p_starttime at 0, p_pid at 24, p_comm[17] at 163 */
+    unsigned kp[256];
+    const char *comm = "?";
+
+    OSSpinLockLock(&gles_owner_lock);
+    if (gles_owner_words[0] != (unsigned)pid) {
+        int mib[4] = { 1 /* CTL_KERN */, 14 /* KERN_PROC */, 1 /* KERN_PROC_PID */, pid };
+        unsigned long len = sizeof(kp);
+
+        kp[0] = kp[1] = kp[6] = 0;
+        if (!sysctl(mib, 4, kp, &len, 0, 0) && len >= 180 && kp[6] == (unsigned)pid && (kp[0] || kp[1])) {
+            gles_owner_words[1] = kp[0];
+            gles_owner_words[2] = kp[1];
+            ((char *)kp)[163 + 16] = 0;
+            comm = (const char *)kp + 163;
+        } else {
+            gles_owner_words[1] = 0;
+            gles_owner_words[2] = ((unsigned)mach_absolute_time() & ~GLES_OWNER_NOT_START) | GLES_OWNER_NOT_START;
+        }
+        gles_owner_words[0] = (unsigned)pid;
+        first = 1;
+    }
+    out[0] = gles_owner_words[0];
+    out[1] = gles_owner_words[1];
+    out[2] = gles_owner_words[2];
+    OSSpinLockUnlock(&gles_owner_lock);
+    if (first) {
+        w("[gles] process "); wd((unsigned)pid); w(" ("); w(comm); w(") owns GL sharegroups\n");
+    }
+}
+
 /* Stock 7E18 engine 0xa0d4 stores through argument 0 and returns 1. */
 static int GLESCreateSharegroup(void **out)
 {
+    unsigned owner[3];
+
     if (!out) return 0;
     *out = 0;
     GuestGC *group = calloc(1, sizeof(*group));
     if (!group) return 0;
-    long long host = qc(GLES_OP_NEW_SHAREGROUP, 0, 0, A(0));
+    gles_owner(owner);
+    long long host = qc(GLES_OP_NEW_SHAREGROUP, 0, 3, owner);
+    /* Older hosts accept only the form without an owner. */
+    if (host == -1) host = qc(GLES_OP_NEW_SHAREGROUP, 0, 0, A(0));
     if (host < 0) { free(group); return 0; }
     group->host = (unsigned)host;
     *out = group;
