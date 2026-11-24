@@ -651,6 +651,9 @@ typedef struct {
     GHashTable *fbo_drawable;   /* framebuffer name -> guest drawable renderbuffer */
     uint32_t bound_renderbuffer;
     uint32_t bound_framebuffer;
+    /* APPLE_framebuffer_multisample's READ_FRAMEBUFFER_APPLE binding, the source of
+     * glResolveMultisampleFramebufferAPPLE; bound_framebuffer is the draw one. */
+    uint32_t read_framebuffer;
     /* Set whenever the render target or its attachments change; the draw path
      * revalidates completeness only when it is set, which is what makes the
      * check cheap enough to leave on permanently. */
@@ -6008,6 +6011,144 @@ static bool gles_resolve_drawable(void)
     return true;
 }
 
+/*
+ * APPLE_framebuffer_multisample, which the SGX's drivers had from 4.0 on. The front end doesn't list it, and the
+ * host answers MAX_SAMPLES_APPLE 0, but Unreal Engine 3 uses it unasked where the device had it: Epic Citadel on
+ * the iPhone 5 draws its scene into a multisample renderbuffer and resolves that into the screen's. With the two
+ * calls dropped the scene went nowhere and the screen stayed black. The host gives the renderbuffer up to 4
+ * samples (the SGX 543's) and resolves with a blit, as the extension is defined: desktop GL, and Android's native
+ * driver where the context is ES 3 (ANGLE and ES 2-only drivers still drop the calls).
+ */
+#define GLES_READ_FRAMEBUFFER_APPLE 0x8CA8
+#define GLES_DRAW_FRAMEBUFFER_APPLE 0x8CA9
+#if !defined(GLES_HOST_EAGL) || (defined(GLES_HOST_EGL_ES) && !defined(GLES_HOST_ANGLE))
+#define GLES_HOST_MULTISAMPLE 1
+#endif
+#ifdef GLES_HOST_MULTISAMPLE
+#ifndef GL_READ_FRAMEBUFFER_EXT
+#define GL_READ_FRAMEBUFFER_EXT 0x8CA8
+#define GL_DRAW_FRAMEBUFFER_EXT 0x8CA9
+#endif
+#ifndef GL_MAX_SAMPLES_EXT
+#define GL_MAX_SAMPLES_EXT 0x8D57
+#endif
+#ifndef GL_RENDERBUFFER_WIDTH_EXT
+#define GL_RENDERBUFFER_WIDTH_EXT 0x8D42
+#define GL_RENDERBUFFER_HEIGHT_EXT 0x8D43
+#endif
+#ifdef GLES_HOST_EGL_ES
+/* ES 3 core; an ES 2 context's driver needn't have them, so they are looked up, and only an ES 3 context uses them. */
+static PFNGLBLITFRAMEBUFFERPROC gles_es3_blit;
+static PFNGLRENDERBUFFERSTORAGEMULTISAMPLEPROC gles_es3_storage;
+#define gles_ms_blit gles_es3_blit
+#define gles_ms_storage gles_es3_storage
+#else
+#define gles_ms_blit glBlitFramebufferEXT
+#define gles_ms_storage glRenderbufferStorageMultisampleEXT
+#endif
+
+/* LT_GLES_MULTISAMPLE=off: the two calls dropped as before, for an A/B run. */
+static bool gles_multisample_on(void)
+{
+    static int on = -1;
+#ifdef GLES_HOST_EGL_ES
+    if (gh.api_version != 2) return false;     /* before the lookup below, which needs an ES 2+ context's version */
+#endif
+    if (on < 0) {
+        on = g_strcmp0(getenv("LT_GLES_MULTISAMPLE"), "off") != 0;
+#ifdef GLES_HOST_EGL_ES
+        const char *version = (const char *)glGetString(GL_VERSION);
+        if (on && version && strstr(version, "OpenGL ES 3")) {
+            gles_es3_blit = (PFNGLBLITFRAMEBUFFERPROC)eglGetProcAddress("glBlitFramebuffer");
+            gles_es3_storage = (PFNGLRENDERBUFFERSTORAGEMULTISAMPLEPROC)
+                eglGetProcAddress("glRenderbufferStorageMultisample");
+        }
+        on = on && gles_es3_blit && gles_es3_storage;
+#endif
+    }
+    return on;
+}
+
+static int64_t gles_multisample_dropped(uint32_t slot)
+{
+    if (gles_refuse("slot:%u", slot)) {
+        fprintf(stderr, "[gles] UNHANDLED %s (id %u): no multisampling on this host, or LT_GLES_MULTISAMPLE=off -- "
+                "the guest will render wrong\n", gles_id_name(slot), slot);
+    }
+    gles_reject(GL_INVALID_OPERATION);
+    return 0;
+}
+
+static int64_t gles_renderbuffer_storage_multisample(uint32_t format, uint32_t samples, uint32_t w, uint32_t h)
+{
+    GHashTable *table = gles_charge_table(false);
+    gpointer key = gles_charge_key(GLES_CHARGE_RENDERBUFFER, gh.bound_renderbuffer, 0, 0);
+    GLint host_max = 0;
+    uint64_t old;
+
+    if (!gles_multisample_on()) return gles_multisample_dropped(GLES_ID_glRenderbufferStorageMultisampleAPPLE);
+    gh.fb_dirty = true;     /* an attached renderbuffer's storage decides completeness */
+    glGetIntegerv(GL_MAX_SAMPLES_EXT, &host_max);
+    samples = MIN(samples, MIN(4u, (uint32_t)MAX(host_max, 0)));
+    uint64_t bytes = (uint64_t)w * h * 4 * MAX(samples, 1u);
+    if ((uint64_t)w * h * 4 > GLES_MAX_TEX_BYTES) {
+        gles_refuse("cap:glRenderbufferStorageMultisample");
+        return gles_reject(GL_INVALID_VALUE);
+    }
+    if (!gles_charge(table, key, bytes, &old)) {
+        return gles_reject(GL_OUT_OF_MEMORY);
+    }
+    g_hash_table_add(gh.rb_sized, GUINT_TO_POINTER(gh.bound_renderbuffer));
+    gles_texture_begin();
+    gles_ms_storage(GL_RENDERBUFFER_EXT, samples, gles_rb_format(format), w, h);
+    GLenum error = glGetError();
+    if (error) {
+        gles_charge(table, key, old, NULL);
+        gles_refuse("multisample:storage:0x%x", error);
+        return gles_reject(error);
+    }
+    return 0;
+}
+
+/* The read framebuffer's color into the draw framebuffer's, the read one's size (the extension wants them equal),
+ * within the scissor box if the test is on. */
+static int64_t gles_resolve_multisample(void)
+{
+    GLuint read = gles_host_fbo(gh.read_framebuffer), draw = gles_host_fbo(gh.bound_framebuffer);
+    GLint type = 0, name = 0, bound = 0, width = 0, height = 0;
+
+    if (!gles_multisample_on()) return gles_multisample_dropped(GLES_ID_glResolveMultisampleFramebufferAPPLE);
+    if (read == draw) {
+        gles_refuse("multisample:resolve:same");
+        return gles_reject(GL_INVALID_OPERATION);
+    }
+    gles_texture_begin();
+    glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, read);
+    glBindFramebufferEXT(GL_DRAW_FRAMEBUFFER_EXT, draw);
+    glGetFramebufferAttachmentParameterivEXT(GL_READ_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
+                                             GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_EXT, &type);
+    glGetFramebufferAttachmentParameterivEXT(GL_READ_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
+                                             GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_EXT, &name);
+    if (type != GL_RENDERBUFFER_EXT) {
+        gles_refuse("multisample:resolve:source:0x%x", type);
+        return gles_reject(GL_INVALID_OPERATION);
+    }
+    glGetIntegerv(GL_RENDERBUFFER_BINDING_EXT, &bound);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, name);
+    glGetRenderbufferParameterivEXT(GL_RENDERBUFFER_EXT, GL_RENDERBUFFER_WIDTH_EXT, &width);
+    glGetRenderbufferParameterivEXT(GL_RENDERBUFFER_EXT, GL_RENDERBUFFER_HEIGHT_EXT, &height);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, bound);
+    gles_ms_blit(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    GLenum error = glGetError();
+    if (error) {
+        gles_refuse("multisample:resolve:0x%x", error);
+        return gles_reject(error);
+    }
+    if (gles_is_drawable(gh.bound_framebuffer)) gh.draws_drawable++;
+    return 0;
+}
+#endif
+
 static bool gles_surface_range(uint32_t base, uint32_t stride, unsigned rows,
                                unsigned rowbytes)
 {
@@ -10162,7 +10303,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         case 0x8B8D: v.i[0] = gh.program; break;    /* CURRENT_PROGRAM */
         case 0x8DFA: v.i[0] = 1; break;             /* SHADER_COMPILER */
         case 0x8DF9: v.i[0] = 0; break;             /* NUM_SHADER_BINARY_FORMATS */
-        case 0x8D57: v.i[0] = 0; break;             /* MAX_SAMPLES_APPLE: no multisampling here */
+        /* MAX_SAMPLES_APPLE: 0, so an app that asks first keeps away from multisampling; one that doesn't (Unreal
+         * Engine 3) still gets it, see gles_renderbuffer_storage_multisample. */
+        case 0x8D57: v.i[0] = 0; break;
         case GL_MODELVIEW_STACK_DEPTH: case GL_PROJECTION_STACK_DEPTH: case GL_TEXTURE_STACK_DEPTH:
         case GL_MAX_MODELVIEW_STACK_DEPTH: case GL_MAX_PROJECTION_STACK_DEPTH: case GL_MAX_TEXTURE_STACK_DEPTH:
             if (gh.api_version != 2) {
@@ -11023,6 +11166,14 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             if (gles_refuse("name:private:%u", slot)) fprintf(stderr, "[gles] guest named %#x\n", a[1]);
             return gles_reject(GL_INVALID_OPERATION);
         }
+#ifdef GLES_HOST_MULTISAMPLE
+        /* The resolve's source alone: the draw target, and all the bookkeeping that follows it, stay. */
+        if (a[0] == GLES_READ_FRAMEBUFFER_APPLE && gles_multisample_on()) {
+            gh.read_framebuffer = a[1];
+            glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, gles_host_fbo(a[1]));
+            return 0;
+        }
+#endif
         if (gles_sync_surface(cpu)) return -1;
         /* Back to the default framebuffer: the offscreen passes are done. 3.1.3's
          * CoreAnimation never flushes (it double-buffers its display surfaces and
@@ -11103,7 +11254,22 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         gh.bound_framebuffer = a[1];
         gh.fb_dirty = true;
         glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gles_host_fbo(a[1]));
+#ifdef GLES_HOST_MULTISAMPLE
+        if (a[0] == GLES_DRAW_FRAMEBUFFER_APPLE && gles_multisample_on()) {
+            glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, gles_host_fbo(gh.read_framebuffer));
+            return 0;
+        }
+#endif
+        gh.read_framebuffer = a[1];
         return 0;
+
+#ifdef GLES_HOST_MULTISAMPLE
+    case GLES_ID_glRenderbufferStorageMultisampleAPPLE:     /* target, samples, internalformat, w, h */
+        return gles_renderbuffer_storage_multisample(a[2], a[1], a[3], a[4]);
+
+    case GLES_ID_glResolveMultisampleFramebufferAPPLE:
+        return gles_resolve_multisample();
+#endif
 
     case GLES_SLOT_RENDERBUFFER_STORAGE: { /* target, internalformat, w, h */
         gh.fb_dirty = true;     /* an attached renderbuffer's storage decides completeness */
