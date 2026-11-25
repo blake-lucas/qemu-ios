@@ -883,6 +883,34 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
             if (!u->regions) return false;
             sorg = 0;
             send = width << 16 | height;
+        } else if (regions && (ui[0x50 / 4] >> 16 & 0x3fff) && (ui[0x50 / 4] & 0x3fff)) {
+            /*
+             * One region of the +50 extent, the rest of the layer transparent: the layer reads as that region,
+             * placed where it falls in the destination (+54..+58, which the whole extent fills). CoreAnimation
+             * puts the volume HUD over a full-screen EAGL layer as UI1 that way on 14G61: a 640x1136 extent and
+             * destination with region 0 the HUD's 310x310 square. Taken as the source rectangle and scaled to the
+             * destination, the region stretched the HUD over the whole panel. A full-extent region, as UI0's,
+             * maps to itself.
+             */
+            unsigned i = ctz32(regions);
+            unsigned width = ui[0x50 / 4] >> 16 & 0x3fff, height = ui[0x50 / 4] & 0x3fff;
+            uint32_t first = ui[(0x60 + i * 4) / 4], last = ui[(0x70 + i * 4) / 4];
+            unsigned x0 = first >> 16 & 0x3fff, y0 = first & 0x3fff;
+            unsigned x1 = MIN(last >> 16 & 0x3fff, width), y1 = MIN(last & 0x3fff, height);
+            unsigned ox = org >> 16, oy = org & 0xffff;
+            uint64_t dw = end ? (end >> 16) - MIN(ox, end >> 16) : width;
+            uint64_t dh = end ? (end & 0xffff) - MIN(oy, end & 0xffff) : height;
+
+            if (x0 >= x1 || y0 >= y1) {
+                return false;
+            }
+            sorg = x0 << 16 | y0;
+            send = x1 << 16 | y1;
+            org = (uint32_t)(ox + x0 * dw / width) << 16 | (uint32_t)(oy + y0 * dh / height);
+            end = (uint32_t)(ox + x1 * dw / width) << 16 | (uint32_t)(oy + y1 * dh / height);
+        } else {
+            sorg = ui[(0x60 + (regions ? ctz32(regions) : 0) * 4) / 4];
+            send = ui[(0x70 + (regions ? ctz32(regions) : 0) * 4) / 4];
         }
     }
 
