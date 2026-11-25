@@ -21,6 +21,7 @@
  * 0x80a5cc9c, 0x80a5cd26, 0x80a5d578, 0x80a5bb98 in 14G61's kernelcache), not from a datasheet.
  */
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "hw/ssi/ssi.h"
@@ -41,6 +42,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(CS42L65State, CS42L65)
 #define CS42L65_MIKEY_INT2   0x76   /* bits 3-4: type detect done (read clears) */
 #define CS42L65_INT_JACK     0x20
 #define CS42L65_REG_RATE     0x12   /* bits 0-3: the I2S frame rate */
+#define CS42L65_REG_HP_VOL   0x246  /* the headphone output's level, signed 1 dB steps, 0x40 muted */
 #define CS42L65_INT_TYPE     0x18
 
 struct CS42L65State {
@@ -113,6 +115,23 @@ static uint8_t cs42l65_read(CS42L65State *s, uint16_t reg)
     default:
         return v;
     }
+}
+
+/*
+ * The headphone output's level, which the host hears: on the Headphones route iOS leaves the PCM at full scale for
+ * the upper volume steps and sets 0x246 (14G61 AppleCS42L65Audio 0x810415f8: the step's dB, clamped to +12..-50,
+ * then & 0x7f; 0x40 when muted), +2 at the top, -1, -4, -8 ... -30 dB as the buttons step down, below which it
+ * scales the PCM itself. The finer 0.5 dB part in 0x244 is left out. The top plays at unity, as the iPods' codecs.
+ */
+double cs42l65_output_gain(void *opaque)
+{
+    CS42L65State *s = CS42L65(opaque);
+    uint8_t v = s->regs[CS42L65_REG_HP_VOL] & 0x7f;
+
+    if (v == 0x40) {
+        return 0.0;
+    }
+    return pow(10.0, MIN((int8_t)(v << 1) / 2 - 2, 0) / 20.0);
 }
 
 void cs42l65_set_headphones(DeviceState *dev, bool on)

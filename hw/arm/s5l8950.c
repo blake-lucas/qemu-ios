@@ -1916,6 +1916,7 @@ static void a6_init(MachineState *machine)
             qdev_prop_set_uint8(port, "port", i);
             if (i == 0 && codec) {
                 qdev_connect_clock_in(port, "lrclk", qdev_get_clock_out(codec, "lrclk"));
+                s5l8930_i2s_set_gain_source(port, cs42l65_output_gain, codec);
             }
             sysbus_realize_and_unref(SYS_BUS_DEVICE(port), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(port), 0, 0x34190000 + i * 0x1000);

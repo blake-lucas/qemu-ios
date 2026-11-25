@@ -9,4 +9,7 @@
 /* Report a plain headphone in the jack (before the guest starts); its interrupt is the device's GPIO out 0. */
 void cs42l65_set_headphones(DeviceState *dev, bool on);
 
+/* Its headphone output's level as a gain for the host (its I2S port's gain source). */
+double cs42l65_output_gain(void *opaque);
+
 #endif
