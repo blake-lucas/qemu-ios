@@ -4945,6 +4945,8 @@ static void gles_trace_surface_mapping(CPUState *cpu, uint32_t ctx,
 
 #ifdef GLES_HOST_AHB
 #include "gles-host-present-async.c.inc"
+#elif !defined(__APPLE__) && !defined(_WIN32)
+#include "gles-host-present-queue.c.inc"
 #else
 static inline bool gles_present_async_submit(CPUState *cpu, uint32_t base, uint32_t stride,
                                              uint32_t rw, uint32_t rh)
@@ -4960,6 +4962,13 @@ static inline GlesPresentPrep *gles_present_async_prepare(CPUState *cpu, uint32_
 }
 static inline void gles_present_async_run(GlesPresentPrep *prep, bool begin) {}
 static inline void gles_present_async_no_queue(void) {}
+#endif
+#if defined(GLES_HOST_AHB) || defined(__APPLE__) || defined(_WIN32)
+static inline int gles_present_write_row(CPUState *cpu, uint32_t base, uint32_t y, uint32_t stride,
+                                         const uint8_t *src, size_t len)
+{
+    return gles_guest_rw(cpu, base + (hwaddr)y * stride, (void *)src, len, 1);
+}
 #endif
 
 static int gles_present_to_surface_impl(CPUState *cpu, uint32_t base, uint32_t stride,
@@ -5213,8 +5222,7 @@ static int gles_present_to_surface_impl(CPUState *cpu, uint32_t base, uint32_t s
              * already in the destination's layout. */
             uint8_t *src = gh.readback + (size_t)(rh - 1 - y) * rw * bpp;
 
-            if (gles_guest_rw(cpu, base + (hwaddr)y * stride,
-                                    src, rw * bpp, 1) != 0) {
+            if (gles_present_write_row(cpu, base, y, stride, src, rw * bpp) != 0) {
                 if (!gles_guest_fault_pending() && gles_refuse("present:write")) {
                     fprintf(stderr, "[gles] present-surface: write failed at row %u "
                             "(guest 0x%08x)\n", y, base + y * stride);
