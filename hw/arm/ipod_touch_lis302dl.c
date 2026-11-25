@@ -348,13 +348,32 @@ static void lis3dsh_measure(LIS302DLState *s, int64_t now)
     }
 }
 
+/*
+ * LT_LIS3DSH_WTM_STRICT=off: the watermark flag (and its INT1 route) from WTM samples on, as before. By default it is up
+ * only with more than WTM samples. iOS 10 sets WTM 1 and, on INT1, reads FIFO_SRC and drains the FIFO only once it
+ * holds two samples: with the flag at one sample, the level interrupt stayed asserted between samples and the AP core
+ * took it again and again, ~900-1,500 FIFO_SRC reads a second in Epic Citadel against ~50 drains.
+ */
+static bool lis3dsh_wtm_strict(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_LIS3DSH_WTM_STRICT");
+
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    return on;
+}
+
 static uint8_t lis3dsh_fifo_src(LIS302DLState *s)
 {
     uint8_t wtm = s->ds_regs[DS_FIFO_CTRL] & 0x1f;
+    unsigned need = lis3dsh_wtm_strict() ? wtm + 1u : MAX(wtm, 1);
 
     /* WTM only with samples to read: AppleAP3DSH reads FSS of them and does nothing for 0, so a flag up on an
      * empty FIFO would hold INT1 asserted (the gyro model's storm). FSS has five bits: a full FIFO reads 31. */
-    return (s->ds_level && s->ds_level >= MAX(wtm, 1) ? 0x80 : 0) | (s->ds_ovrn ? 0x40 : 0) |
+    return (s->ds_level && s->ds_level >= need ? 0x80 : 0) | (s->ds_ovrn ? 0x40 : 0) |
            (s->ds_level ? 0 : 0x20) | MIN(s->ds_level, 0x1f);
 }
 
