@@ -3,7 +3,9 @@
  * context is wanted with each sample).
  *
  * Each vCPU thread gets a timer on its own CPU-time clock that signals that thread; the handler stores the host PC
- * and the guest's PC, CPSR, TTBR0 (the process) and TPIDRURO (the thread). Sampling runs while a profile capture
+ * and the guest's PC, CPSR, TTBR0 (the process) and TPIDRURO (the thread); a host PC outside the engine (libc, the
+ * vDSO, a GL driver, translated code) also gets the engine return address nearest the top of the stack, its caller
+ * as far as the engine goes. Sampling runs while a profile capture
  * does (qemu_ios_profile_start/stop), and the stop writes CAPTURE.samples: the samples, the host mappings to
  * symbolize them, and for each sample whether its host PC was in translated code.
  */
@@ -26,7 +28,7 @@
 #endif
 
 typedef struct {
-    uint64_t hpc;
+    uint64_t hpc, caller;
     uint32_t gpc, cpsr, ttbr0, tpid;
 } ItSample;
 
@@ -45,6 +47,7 @@ typedef struct {
 static ItSamplerThread it_st[IT_SAMPLER_THREADS];
 static int it_st_n;
 static long it_sampler_period_ns;
+static uintptr_t it_engine_lo, it_engine_hi;    /* the engine's executable mapping */
 static bool it_sampler_on;
 static bool it_sampler_handler_set;
 
@@ -71,10 +74,27 @@ static void it_sampler_signal(int sig, siginfo_t *si, void *ucv)
         CPUARMState *env = cpu_env(t->cpu);
 
 #ifdef __x86_64__
+        uintptr_t *sp = (uintptr_t *)uc->uc_mcontext.gregs[REG_RSP];
+
         s->hpc = uc->uc_mcontext.gregs[REG_RIP];
+        s->caller = 0;
 #else
+        uintptr_t *sp = (uintptr_t *)uc->uc_mcontext.sp;
+
         s->hpc = uc->uc_mcontext.pc;
+        s->caller = uc->uc_mcontext.regs[30];
+        if (s->caller < it_engine_lo || s->caller >= it_engine_hi) {
+            s->caller = 0;
+        }
 #endif
+        if ((s->hpc < it_engine_lo || s->hpc >= it_engine_hi) && !s->caller) {
+            for (int k = 0; k < 48; k++) {
+                if (sp[k] >= it_engine_lo && sp[k] < it_engine_hi) {
+                    s->caller = sp[k];
+                    break;
+                }
+            }
+        }
         s->gpc = env->regs[15];
         s->cpsr = env->uncached_cpsr;
         s->ttbr0 = env->cp15.ttbr0_ns ? env->cp15.ttbr0_ns : env->cp15.ttbr0_s;
@@ -143,6 +163,21 @@ void it_sampler_start(void)
     it_sampler_period_ns = 1000000000L / MIN(hz, 20000);
     if (!it_sampler_handler_set) {
         struct sigaction sa = { 0 };
+        FILE *maps = fopen("/proc/self/maps", "r");
+        char line[512];
+
+        while (maps && fgets(line, sizeof(line), maps)) {
+            unsigned long lo, hi;
+
+            if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && strstr(line, " r-xp ") &&
+                (uintptr_t)it_sampler_start >= lo && (uintptr_t)it_sampler_start < hi) {
+                it_engine_lo = lo;
+                it_engine_hi = hi;
+            }
+        }
+        if (maps) {
+            fclose(maps);
+        }
 
         sa.sa_sigaction = it_sampler_signal;
         sa.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -209,8 +244,8 @@ void it_sampler_stop(const char *capture)
             ItSample *s = &t->buf[k];
             TranslationBlock *tb = tcg_tb_lookup(s->hpc);
 
-            fprintf(f, "S %d %" PRIx64 " %x %x %x %x %d\n", t->cpu->cpu_index, s->hpc, s->gpc, s->cpsr, s->ttbr0,
-                    s->tpid, tb ? 1 : 0);
+            fprintf(f, "S %d %" PRIx64 " %x %x %x %x %d %" PRIx64 "\n", t->cpu->cpu_index, s->hpc, s->gpc, s->cpsr,
+                    s->ttbr0, s->tpid, tb ? 1 : 0, s->caller);
         }
     }
     fclose(f);
