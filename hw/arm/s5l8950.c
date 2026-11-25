@@ -1761,6 +1761,12 @@ static void a6_init(MachineState *machine)
      * file I/O without the BQL for the IOP. */
     tlb_shootdown_board = true;
     nand_disk_unlocked_io = true;
+    {
+        /* The indirect-branch caches in the two AP cores' shared TBs (with indirect-cache=on); LT_IBTC_PARALLEL=off. */
+        const char *v = getenv("LT_IBTC_PARALLEL");
+
+        tcg_indirect_cache_parallel = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
     if (s->restore_image) {
         struct stat st;
         s->restore_fd = qemu_open_old(s->restore_image, O_RDONLY | O_BINARY);

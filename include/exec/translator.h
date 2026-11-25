@@ -165,8 +165,9 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest);
  *
  * Return true if an indirect exit of this TB may use
  * tcg_gen_lookup_and_goto_ptr_cached: the accelerator's indirect-cache
- * option is on and the TB runs with one vCPU, no icount and may goto_ptr
- * (gdb single-step clears that).
+ * option is on and the TB runs with one vCPU (or the board opted in to
+ * tcg_indirect_cache_parallel), no icount and may goto_ptr (gdb single-step
+ * clears that).
  */
 bool translator_use_indirect_cache(DisasContextBase *db);
 

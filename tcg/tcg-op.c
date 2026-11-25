@@ -2589,6 +2589,29 @@ void tcg_gen_lookup_and_goto_ptr(void)
     tcg_temp_free_ptr(ptr);
 }
 
+/*
+ * In a TB that several vCPUs run (CF_PARALLEL), another vCPU can refill an
+ * entry between this one's load of its key and of its host code. A fill
+ * clears the key, writes the host code, then writes the new key (in order,
+ * cpu-exec.c indirect_site_fill), and only this vCPU writes keys carrying its
+ * context id, so the key read again after the host code still being ours
+ * means the host code belongs to it. Otherwise go on as for a miss.
+ */
+static void gen_indirect_recheck(TranslationBlock *tb, TCGv_i64 key, TCGv_ptr base, intptr_t ofs,
+                                 TCGLabel *miss)
+{
+    TCGv_i64 again;
+
+    if (!(tb->cflags & CF_PARALLEL)) {
+        return;
+    }
+    tcg_gen_mb(TCG_MO_LD_LD | TCG_BAR_SC);
+    again = tcg_temp_ebb_new_i64();
+    tcg_gen_ld_i64(again, base, ofs);
+    tcg_gen_brcond_i64(TCG_COND_NE, key, again, miss);
+    tcg_temp_free_i64(again);
+}
+
 #define RAS_OFS(field) (offsetof(CPUState, neg.field) - sizeof(CPUState))
 #define RAS_MASK (ARRAY_SIZE(((CPUNegativeOffsetState *)0)->ras) - 1)
 
@@ -2678,6 +2701,7 @@ void tcg_gen_lookup_and_goto_ptr_ras(TCGv_i32 site_key, uint64_t sig)
     tcg_temp_free_i64(cached);
     ptr = tcg_temp_ebb_new_ptr();
     tcg_gen_ld_ptr(ptr, slot, offsetof(TCGRasSlot, host));
+    gen_indirect_recheck(tb, key, slot, offsetof(TCGRasSlot, key), next);
     tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
     tcg_temp_free_ptr(ptr);
     gen_set_label(next);
@@ -2691,6 +2715,7 @@ void tcg_gen_lookup_and_goto_ptr_ras(TCGv_i32 site_key, uint64_t sig)
         tcg_temp_free_i64(cached);
         ptr = tcg_temp_ebb_new_ptr();
         tcg_gen_ld_ptr(ptr, site, offsetof(TCGIndirectSlot, e[i].host));
+        gen_indirect_recheck(tb, key, site, offsetof(TCGIndirectSlot, e[i].key), n);
         tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
         tcg_temp_free_ptr(ptr);
         if (n != miss) {
@@ -2740,6 +2765,7 @@ void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i32 site_key)
         tcg_temp_free_i64(cached);
         ptr = tcg_temp_ebb_new_ptr();
         tcg_gen_ld_ptr(ptr, slot, offsetof(TCGIndirectSlot, e[i].host));
+        gen_indirect_recheck(tb, key, slot, offsetof(TCGIndirectSlot, e[i].key), next);
         tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
         tcg_temp_free_ptr(ptr);
         if (next != miss) {

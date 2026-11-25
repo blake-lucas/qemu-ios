@@ -1126,6 +1126,11 @@ void it_acct_excl_note(void *fn, int64_t wait, int64_t work);
 void tlb_shootdown_service_slow(CPUState *cpu);
 extern bool tlb_shootdown_inline;
 extern bool tlb_shootdown_board;
+/*
+ * The indirect-branch caches (indirect-cache=on) also in TBs that several vCPUs run (CF_PARALLEL): a board opt-in,
+ * as they rest on the guest never remapping code in place (accel/tcg/translator.c, cross-page-chain).
+ */
+extern bool tcg_indirect_cache_parallel;
 static inline void tlb_shootdown_service(CPUState *cpu)
 {
     if (unlikely(tlb_shootdown_inline) && cpu->tlb_sd) {
