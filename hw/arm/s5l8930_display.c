@@ -18,6 +18,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/arm/s5l8930.h"
+#include "hw/arm/ipod_touch_lcd.h"
 #include "hw/arm/frame-timeline.h"
 #include "hw/arm/panel-gamma.h"
 #include "hw/arm/gles-present.h"
@@ -428,10 +429,36 @@ static bool quiet_relatch_due(S5L8930DisplayState *s)
     return !s->h5p || every <= 1 || s->quiet_vbls < 60 || s->quiet_vbls % every == 0;
 }
 
+/*
+ * Tell the front end when this VBL was due (ipod_lcd_vsync_due), so the frame it latches is stamped on the panel's
+ * exact 60 Hz grid instead of when the main loop got round to the tick (+/-2 ms on a phone); the Android presenter
+ * posts frames on that grid. The virtual clock is the host's less time spent paused, so the deadline maps across by
+ * how late the tick runs. LT_VBL_STAMP=off stamps frames when they are captured, as before.
+ */
+static void vbl_note_due(S5L8930DisplayState *s)
+{
+    static int on = -1;
+    int64_t now;
+
+    if (on < 0) {
+        const char *v = getenv("LT_VBL_STAMP");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    if (!on || !ipod_lcd_vsync_due) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->next_vbl <= now) {
+        ipod_lcd_vsync_due(qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - (now - s->next_vbl));
+    }
+}
+
 /* One frame: the queued swaps complete and the VBLs fire. */
 static void vbl_tick(void *opaque)
 {
     S5L8930DisplayState *s = opaque;
+
+    vbl_note_due(s);
 
     /* stop-after-vsyncs: the jank harness steps the machine one input sample per N vsyncs, so a gesture's
      * touch timing is fixed in virtual time instead of following the host's wall clock (docs/perf-jank.md). */
@@ -856,6 +883,34 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
             if (!u->regions) return false;
             sorg = 0;
             send = width << 16 | height;
+        } else if (regions && (ui[0x50 / 4] >> 16 & 0x3fff) && (ui[0x50 / 4] & 0x3fff)) {
+            /*
+             * One region of the +50 extent, the rest of the layer transparent: the layer reads as that region,
+             * placed where it falls in the destination (+54..+58, which the whole extent fills). CoreAnimation
+             * puts the volume HUD over a full-screen EAGL layer as UI1 that way on 14G61: a 640x1136 extent and
+             * destination with region 0 the HUD's 310x310 square. Taken as the source rectangle and scaled to the
+             * destination, the region stretched the HUD over the whole panel. A full-extent region, as UI0's,
+             * maps to itself.
+             */
+            unsigned i = ctz32(regions);
+            unsigned width = ui[0x50 / 4] >> 16 & 0x3fff, height = ui[0x50 / 4] & 0x3fff;
+            uint32_t first = ui[(0x60 + i * 4) / 4], last = ui[(0x70 + i * 4) / 4];
+            unsigned x0 = first >> 16 & 0x3fff, y0 = first & 0x3fff;
+            unsigned x1 = MIN(last >> 16 & 0x3fff, width), y1 = MIN(last & 0x3fff, height);
+            unsigned ox = org >> 16, oy = org & 0xffff;
+            uint64_t dw = end ? (end >> 16) - MIN(ox, end >> 16) : width;
+            uint64_t dh = end ? (end & 0xffff) - MIN(oy, end & 0xffff) : height;
+
+            if (x0 >= x1 || y0 >= y1) {
+                return false;
+            }
+            sorg = x0 << 16 | y0;
+            send = x1 << 16 | y1;
+            org = (uint32_t)(ox + x0 * dw / width) << 16 | (uint32_t)(oy + y0 * dh / height);
+            end = (uint32_t)(ox + x1 * dw / width) << 16 | (uint32_t)(oy + y1 * dh / height);
+        } else {
+            sorg = ui[(0x60 + (regions ? ctz32(regions) : 0) * 4) / 4];
+            send = ui[(0x70 + (regions ? ctz32(regions) : 0) * 4) / 4];
         }
     }
 
