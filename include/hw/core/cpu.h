@@ -589,6 +589,14 @@ struct CPUState {
      * if it were the only CPU (no CF_PARALLEL). See mttcg_start_vcpu_thread.
      */
     bool tcg_unshared;
+    /*
+     * Set by a board: CPUs in different TLB domains never share translations, so a guest's broadcast TLB
+     * maintenance (TLBI...IS) reaches only its own domain (cputlb.c). The A6's IOP and AE2 cores run their own
+     * firmware on their own memory maps beside the two AP cores. 0 for every CPU unless the board sets it.
+     */
+    int tlb_domain;
+    /* Broadcast TLB flushes queued for this CPU, run at its next TB boundary (cputlb.c, tlb_shootdown_service). */
+    struct TLBShootdownQueue *tlb_sd;
     uint32_t tcg_cflags;
     uint32_t halted;
     int32_t exception_index;
@@ -1107,6 +1115,23 @@ void free_queued_cpu_work(CPUState *cpu);
  * @cpu: The CPU which work queue to process.
  */
 void process_queued_cpu_work(CPUState *cpu);
+
+/* Exclusive work by function (cpu-common.c), printed by the vCPU accounting. */
+struct it_acct_excl { void *fn; uint64_t n, wait_ns, work_ns, max_wait; };
+extern bool it_acct_excl_on;
+extern struct it_acct_excl it_acct_excl[16];
+void it_acct_excl_note(void *fn, int64_t wait, int64_t work);
+
+/* Run the broadcast TLB flushes queued for @cpu, on its own thread, without the BQL (cputlb.c). */
+void tlb_shootdown_service_slow(CPUState *cpu);
+extern bool tlb_shootdown_inline;
+extern bool tlb_shootdown_board;
+static inline void tlb_shootdown_service(CPUState *cpu)
+{
+    if (unlikely(tlb_shootdown_inline) && cpu->tlb_sd) {
+        tlb_shootdown_service_slow(cpu);
+    }
+}
 
 /**
  * cpu_exec_start:

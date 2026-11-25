@@ -411,6 +411,23 @@ static void clcd_frame_end(S5L8930DisplayState *s)
     clcd_update_irq(s);
 }
 
+/*
+ * On the iPhone 5, after a second without swaps the re-latch runs every LT_QUIET_RELATCH_EVERY-th vsync (default 4,
+ * 1 = every vsync as before): a still screen's re-latch reads and compares both 640x1136 layers, the main loop's
+ * largest cost on a phone. Only content written into the scanned-out buffer without a swap (Accessibility Zoom)
+ * reaches the screen up to three vsyncs later; swaps are latched at their vsync as always.
+ */
+static bool quiet_relatch_due(S5L8930DisplayState *s)
+{
+    static int every = -1;
+
+    if (every < 0) {
+        const char *v = getenv("LT_QUIET_RELATCH_EVERY");
+        every = v && atoi(v) > 0 ? atoi(v) : 4;
+    }
+    return !s->h5p || every <= 1 || s->quiet_vbls < 60 || s->quiet_vbls % every == 0;
+}
+
 /* One frame: the queued swaps complete and the VBLs fire. */
 static void vbl_tick(void *opaque)
 {
@@ -480,7 +497,7 @@ static void vbl_tick(void *opaque)
         s->quiet_vbls = 0;
         s->swaps++;
         latch = true;
-    } else if (++s->quiet_vbls >= QUIET_RELATCH_VBLS) {
+    } else if (++s->quiet_vbls >= QUIET_RELATCH_VBLS && quiet_relatch_due(s)) {
         /*
          * No swap for a quarter second, yet the buffer can still change:
          * with Accessibility > Zoom on, CA stops swapping and the scaler
@@ -714,6 +731,54 @@ static void plan_run(GArray *plan, uint8_t *dst)
 static void fetch_run(S5L8930DisplayState *s, uint8_t *dst)
 {
     plan_run(s->fetch, dst);
+}
+
+/*
+ * Whether the planned reads would bring exactly `ref`'s bytes, compared in guest RAM without copying them; false
+ * when a segment isn't plain RAM. A still screen re-latches every vsync (QUIET_RELATCH_VBLS) and almost always
+ * finds the same pixels: copying both 640x1136 layers out first was ~6 MB of memmove a vsync on the main loop,
+ * most of the latch's 0.5-0.8 ms. LT_LATCH_COMPARE_IN_PLACE=off copies first again (A/B).
+ */
+static bool latch_compare_in_place(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_LATCH_COMPARE_IN_PLACE");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    return on;
+}
+
+static bool plan_same(GArray *plan, const uint8_t *ref)
+{
+    for (guint i = 0; i < plan->len; i++) {
+        FbSeg *g = &g_array_index(plan, FbSeg, i);
+        hwaddr done = 0;
+
+        if (g->pa == (hwaddr)-1) {
+            if (!buffer_is_zero(ref + g->off, g->len)) {
+                return false;
+            }
+            continue;
+        }
+        while (done < g->len) {
+            hwaddr l = g->len - done;
+            void *p = address_space_map(&address_space_memory, g->pa + done, &l, false, MEMTXATTRS_UNSPECIFIED);
+            bool same;
+
+            if (!p) {
+                return false;
+            }
+            same = l && !memcmp(p, ref + g->off + done, l);
+            address_space_unmap(&address_space_memory, p, l, false, 0);
+            if (!same) {
+                return false;
+            }
+            done += l;
+        }
+    }
+    return true;
 }
 
 static hwaddr h5p_ui_xlate(const uint32_t tables[64], uint32_t va)
@@ -1291,6 +1356,17 @@ static void front_latch(S5L8930DisplayState *s, bool vbl)
         } else {
             g_free(vp.planes);
         }
+    }
+    /* The same layers as the front's, unchanged in guest RAM: nothing to copy or compose. */
+    if (s->h5p && latch_compare_in_place() && valid && !video && !s->front_video && s->front_valid &&
+        !memcmp(key, s->front_key, sizeof(key)) && len == s->src_len && !memcmp(u, s->src_layers, sizeof(u)) &&
+        plan_same(s->fetch, s->src)) {
+        g_array_set_size(s->fetch, 0);
+        if (unlocked) {
+            bql_lock();
+        }
+        display_trace_latch(s, valid, video, false, key);
+        return;
     }
     fetch_run(s, s->src_next);
     /* The front was composed from these very layers and bytes (and the same movie frame). */

@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "hw/arm/nand-image.h"
 #include "hw/arm/ios-boot-args.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -233,6 +234,7 @@ struct S5L8950State {
     uint32_t ae2_host_pending;
     bool ae2_wfi_seen;
     QEMUTimer *ae2_wfi_timer;
+    bool ae2_wfi_parked;   /* the tick is off: AE2 sits in WFI with its idle event sent (a6_ae2_wfi_tick) */
     uint32_t ae2_regs[0x2000 / 4];
     DeviceState *gpio;
     DeviceState *pmu;
@@ -266,6 +268,9 @@ struct S5L8950State {
     uint32_t pmgr[0x7000 / 4];
     uint64_t pmgr_transition_done;
     bool pmgr_transition_pending;
+    /* PMGR+0x1700-0x172b, the performance-state registers, dispatched without the BQL (a6_pmgr_perf_ops). */
+    MemoryRegion pmgr_perf;
+    QemuSpin pmgr_perf_lock;
     A6I2C *i2c[3];
     /* the motion sensors (a6_motion_init): the accelerometer carries the
      * attitude and the host's samples the gyro and compass read */
@@ -374,16 +379,40 @@ static ssize_t a6_restore_pread(int fd, void *buf, size_t n, uint64_t off)
  * factory-imaging transport supplies one read-only stream only when explicitly
  * configured; its writes use the guest's native block/FTL drivers. */
 
+/* LT_A6_GL_UNLOCKED=off: QEMU_CALL takes the BQL for every call again (ARM_CP_IO), GL calls included (A/B). */
+static bool a6_gl_unlocked(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_A6_GL_UNLOCKED");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    return on;
+}
+
 static void a6_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri,
                          uint64_t value)
 {
     S5L8950State *s = S5L8950_MACHINE(qdev_get_machine());
     CPUState *cpu = env_cpu(env);
     qemu_call_t q;
+    bool locked = false;
     if (qemu_call_rw(cpu, value, &q, false))
         return;
     q.retval = -1;
     q.error = QC_ERR_ENOSYS;
+    if (!bql_locked() && (q.call_number == QC_GLES || q.call_number == QC_GLES_PING)) {
+        /* The register is not ARM_CP_IO (a6_gl_unlocked): GL calls go through the gate without the BQL. */
+        q.retval = q.call_number == QC_GLES ? qc_handle_gles_unlocked(cpu, &q.args.gles) : QC_GLES_PING_MAGIC;
+        q.error = 0;
+        qemu_call_rw(cpu, value, &q, true);
+        return;
+    }
+    if (!bql_locked()) {
+        bql_lock();
+        locked = true;
+    }
     if (q.call_number == QC_GLES || q.call_number == QC_GLES_PING) {
         q.retval = q.call_number == QC_GLES ? qc_handle_gles(cpu, &q.args.gles)
                                             : QC_GLES_PING_MAGIC;
@@ -421,6 +450,9 @@ static void a6_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri,
                 q.error = 5;
         } else
             q.error = 22;
+    }
+    if (locked) {
+        bql_unlock();
     }
     qemu_call_rw(cpu, value, &q, true);
 }
@@ -797,6 +829,39 @@ static void a6_pmgr_write(S5L8950State *s, uint32_t reg, uint32_t value)
     s->pmgr[reg / 4] = value;
 }
 
+/*
+ * iOS 10's performance controller requests a performance state at PMGR+0x1700 and polls it and the finish times
+ * after each request: 400-750 requests a second while the UI works, ~5-10 accesses each, the most frequent MMIO
+ * on the board. They touch only these three fields, so they skip the BQL and take this lock instead.
+ * LT_PMGR_PERF_UNLOCKED=off dispatches them under the BQL again (A/B).
+ */
+static uint64_t a6_pmgr_perf_read(void *opaque, hwaddr offset, unsigned size)
+{
+    S5L8950State *s = opaque;
+    uint32_t value;
+
+    qemu_spin_lock(&s->pmgr_perf_lock);
+    value = a6_pmgr_read(s, 0x1700 + offset);
+    qemu_spin_unlock(&s->pmgr_perf_lock);
+    return value;
+}
+
+static void a6_pmgr_perf_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
+{
+    S5L8950State *s = opaque;
+
+    qemu_spin_lock(&s->pmgr_perf_lock);
+    a6_pmgr_write(s, 0x1700 + offset, value);
+    qemu_spin_unlock(&s->pmgr_perf_lock);
+}
+
+static const MemoryRegionOps a6_pmgr_perf_ops = {
+    .read = a6_pmgr_perf_read,
+    .write = a6_pmgr_perf_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {.min_access_size = 4, .max_access_size = 4},
+};
+
 static uint64_t a6_unimplemented_read(void *opaque, hwaddr offset,
                                       unsigned size)
 {
@@ -961,11 +1026,14 @@ static const MemoryRegionOps a6_iop_ops = {
     .valid = {.min_access_size = 4, .max_access_size = 4},
 };
 
+static void a6_ae2_wfi_unpark(S5L8950State *s);
+
 static void a6_ae2_irq_update(S5L8950State *s)
 {
     if (!s->ae2_cpu) {
         return;
     }
+    a6_ae2_wfi_unpark(s);
     qemu_set_irq(qdev_get_gpio_in(DEVICE(s->ae2_cpu), ARM_CPU_IRQ),
                  (s->ae2_pending & s->ae2_irq_enable) != 0);
     qemu_set_irq(qdev_get_gpio_in(DEVICE(s->ae2_cpu), ARM_CPU_FIQ),
@@ -1058,8 +1126,31 @@ static void a6_ae2_wfi_tick(void *opaque)
     } else {
         s->ae2_wfi_seen = false;
     }
+    /*
+     * Powered off, or idle with its event sent, AE2 has nothing to report until something starts or wakes it, and
+     * only its interrupt lines (a6_ae2_irq_update) or a hold or start do: the tick stops until then instead of
+     * running 1000 times a second on the main loop (~40% of its wakeups; iOS leaves AE2 off until audio needs it).
+     * LT_AE2_WFI_PARK=off keeps it ticking (A/B).
+     */
+    static int park = -1;
+    if (park < 0) {
+        const char *v = getenv("LT_AE2_WFI_PARK");
+        park = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    if (park && ((idle && s->ae2_wfi_seen) || s->ae2_cpu->power_state == PSCI_OFF)) {
+        s->ae2_wfi_parked = true;
+        return;
+    }
     timer_mod(s->ae2_wfi_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+}
+
+static void a6_ae2_wfi_unpark(S5L8950State *s)
+{
+    if (s->ae2_wfi_parked && s->ae2_wfi_timer) {
+        s->ae2_wfi_parked = false;
+        timer_mod(s->ae2_wfi_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    }
 }
 
 static uint64_t a6_ae2_control_read(void *opaque, hwaddr offset, unsigned size)
@@ -1139,6 +1230,7 @@ static void a6_ae2_control_write(void *opaque, hwaddr offset, uint64_t value,
         s->ae2_cpu->env.halt_reason = NOT_HALTED;
         cpu->halted = 0;
         qemu_cpu_kick(cpu);
+        a6_ae2_wfi_unpark(s);
     }
 }
 
@@ -1211,6 +1303,7 @@ static void a6_ae2_init(S5L8950State *s, MemoryRegion *memory)
     /* ISA execution probe; the physical AE2 core identity remains unqualified. */
     Object *core = object_new(ARM_CPU_TYPE_NAME("cortex-a9"));
     s->ae2_cpu = ARM_CPU(core);
+    CPU(core)->tlb_domain = 2;   /* the AP cores' TLB broadcasts don't reach it */
     object_property_set_link(core, "memory", OBJECT(&s->ae2_mem), &error_abort);
     object_property_set_bool(core, "start-powered-off", true, &error_abort);
     qdev_realize(DEVICE(core), NULL, &error_fatal);
@@ -1664,6 +1757,10 @@ static void a6_init(MachineState *machine)
     DeviceState *modem_uart = NULL;
     s->restore_fd = -1;
     gles_host_set_a6(true);
+    /* Opt-ins measured on this board only (docs/PERFORMANCE.md in the app repo): the inline TLB shootdown, page
+     * file I/O without the BQL for the IOP. */
+    tlb_shootdown_board = true;
+    nand_disk_unlocked_io = true;
     if (s->restore_image) {
         struct stat st;
         s->restore_fd = qemu_open_old(s->restore_image, O_RDONLY | O_BINARY);
@@ -1686,6 +1783,15 @@ static void a6_init(MachineState *machine)
     memory_region_init_io(&s->peripheral, OBJECT(s), &a6_unimplemented_ops, s,
                           "a6.unimplemented", 0x10000000);
     memory_region_add_subregion_overlap(memory, 0x30000000, &s->peripheral, -1);
+    qemu_spin_init(&s->pmgr_perf_lock);
+    memory_region_init_io(&s->pmgr_perf, OBJECT(s), &a6_pmgr_perf_ops, s, "a6.pmgr-perf", 0x2c);
+    {
+        const char *v = getenv("LT_PMGR_PERF_UNLOCKED");
+        if (!(v && (!strcmp(v, "off") || !strcmp(v, "0")))) {
+            memory_region_enable_lockless_io(&s->pmgr_perf);
+        }
+    }
+    memory_region_add_subregion(memory, 0x3f101700, &s->pmgr_perf);
     memory_region_init_ram(&s->sram, NULL, "a6.sram", 0x100000, &error_fatal);
     memory_region_add_subregion_overlap(memory, 0x3f000000, &s->sram, 1);
     /* Original N42 ae2/reg entry 4: the audio IOP's dedicated 3 MiB SRAM.
@@ -1702,7 +1808,14 @@ static void a6_init(MachineState *machine)
         object_property_set_bool(cpu, "start-powered-off", i != 0,
                                  &error_abort);
         qdev_realize(DEVICE(cpu), NULL, &error_fatal);
-        define_arm_cp_regs(s->cpu[i], a6_guest_cpregs);
+        if (a6_gl_unlocked()) {
+            ARMCPRegInfo reg = a6_guest_cpregs[0];
+
+            reg.type &= ~ARM_CP_IO;   /* a6_qemu_call takes the BQL for the calls that need it */
+            define_one_arm_cp_reg(s->cpu[i], &reg);
+        } else {
+            define_arm_cp_regs(s->cpu[i], a6_guest_cpregs);
+        }
         object_unref(cpu);
     }
     memory_region_init_io(&s->aic, OBJECT(s), &a6_aic_ops, s, "a6.aic-v1",
@@ -2032,6 +2145,7 @@ static void a6_init(MachineState *machine)
     memory_region_add_subregion(&s->iop_mem, 0x30000000, &s->iop_periph);
     Object *iop = object_new(ARM_CPU_TYPE_NAME("cortex-a9"));
     s->iop_cpu = ARM_CPU(iop);
+    CPU(iop)->tlb_domain = 1;   /* the AP cores' TLB broadcasts don't reach it */
     s->iop_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, a6_iop_timer_expired, s);
     object_property_set_link(iop, "memory", OBJECT(&s->iop_mem), &error_abort);
     object_property_set_bool(iop, "start-powered-off", true, &error_abort);

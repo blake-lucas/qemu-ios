@@ -501,15 +501,19 @@ static uint32_t nand_read_page(S5L8930IOPState *s, int bus, uint32_t ce,
     if (bus >= 0 && bus < NAND_BUSES) {
         len = MAX(len, s->bytes_per_page[bus] + s->bytes_per_spare[bus]);
     }
-    memset(data, 0xff, len);
+    /* The caller's buffer is written only below the I/O, which may run without the BQL (nand_disk_read): until
+     * the BQL is back the controller model can still hand out what the buffer held. */
     memset(meta, 0xff, FMI_META_BYTES);
     if (nand_addr_bad(s, bus, ce, page)) {
+        memset(data, 0xff, len);
         return FMI_STATUS_PARAM;
     }
     blk = nand_backend(s, bus, ce, page, false);
     if (!blk && !s->disk) {
+        memset(data, 0xff, len);
         return FMI_STATUS_BLANK;
     }
+    uint32_t fill = len;
     len = s->page_stride;
     p = g_malloc(len);
     int64_t t0 = ioprof_t0(), stat = nand_stat_begin();
@@ -519,6 +523,7 @@ static uint32_t nand_read_page(S5L8930IOPState *s, int bus, uint32_t ce,
     nand_stat(NAND_STAT_READ, len, stat);
     ioprof_done(IOPROF_PREAD, IOPROF_PREAD_NS, t0);
     s5l8930_ioprof_add(IOPROF_PG_READ, 1);
+    memset(data, 0xff, fill);
     if (result != FMI_STATUS_OK) {
         return result;
     }
