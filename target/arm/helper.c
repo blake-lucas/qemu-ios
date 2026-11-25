@@ -1656,16 +1656,64 @@ static void gt_timer_reset(CPUARMState *env, const ARMCPRegInfo *ri,
     timer_del(cpu->gt_timer[timeridx]);
 }
 
+/*
+ * A counter read that finds this CPU's own EL1 timer past its deadline, before the main loop has run the QEMU timer,
+ * fires the timer now (LT_GT_SYNC_EXPIRY=off leaves it to the main loop). The hardware raises the line when the
+ * counter gets there; waiting for the main loop left iOS 10's idle loop on the iPhone 5 polling, as iOS 6's did on
+ * the PMGR timer (s5l8930_pmgr.c): SetIdlePop sees the deadline already behind it and returns without a WFI, and the
+ * counter was read past a pending deadline thousands of times a second a core, against ~200 WFIs. Only if the BQL is
+ * free: when the main loop holds it, it runs the due timer itself as soon as it lets go.
+ */
+static void gt_expire_due(CPUARMState *env, uint64_t count)
+{
+    static int on = -1;
+    ARMCPU *cpu = env_archcpu(env);
+    bool due[2] = { false, false };
+
+    if (on < 0) {
+        const char *v = getenv("LT_GT_SYNC_EXPIRY");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    if (!on) {
+        return;
+    }
+    for (int i = GTIMER_PHYS; i <= GTIMER_VIRT; i++) {
+        ARMGenericTimer *gt = &env->cp15.c14_timer[i];
+
+        /* Enabled, unmasked, not yet fired, and the counter is past the compare value. */
+        due[i] = (gt->ctl & 7) == 1 && count - gt_indirect_access_timer_offset(env, i) >= gt->cval;
+    }
+    if (!due[0] && !due[1]) {
+        return;
+    }
+    bool locked = bql_locked();
+    if (!locked && !bql_trylock()) {
+        return;
+    }
+    for (int i = GTIMER_PHYS; i <= GTIMER_VIRT; i++) {
+        if (due[i]) {
+            gt_recalc_timer(cpu, i);
+        }
+    }
+    if (!locked) {
+        bql_unlock();
+    }
+}
+
 static uint64_t gt_cnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     uint64_t offset = gt_direct_access_timer_offset(env, GTIMER_PHYS);
-    return gt_get_countervalue(env) - offset;
+    uint64_t raw = gt_get_countervalue(env);
+    gt_expire_due(env, raw);
+    return raw - offset;
 }
 
 static uint64_t gt_virt_cnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     uint64_t offset = gt_direct_access_timer_offset(env, GTIMER_VIRT);
-    return gt_get_countervalue(env) - offset;
+    uint64_t raw = gt_get_countervalue(env);
+    gt_expire_due(env, raw);
+    return raw - offset;
 }
 
 static void gt_cval_write(CPUARMState *env, const ARMCPRegInfo *ri,
