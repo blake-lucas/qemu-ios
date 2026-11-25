@@ -128,8 +128,11 @@ static unsigned cs42l58_sample_rate(uint8_t control)
  * in the jack ("headphones", the Mikey's jack) iOS sets the volume in 0x22:
  * bit 7 mutes (level 0 and an idle output), bits 0-6 are 7-bit two's
  * complement in 0.5 dB steps, levels 1-16 0x44 (-30 dB) to 0x02 (+1 dB), the
- * top played at unity.
- * ponytail: from 17 -> 0 -> 17 volume-button traces with Doodle Jump playing.
+ * top played at unity. While it's muted and the speaker plays (0x63 on the
+ * iPad, 0x67 on the iPhone 4 unmuted: 0x00, 0x3f muted), the speaker's PCM
+ * plays as before.
+ * ponytail: from 17 -> 0 -> 17 volume-button traces with Doodle Jump (n90) and
+ * Jetpack (k48) playing on each route.
  */
 double cs42l58_output_gain(CS42L58State *s)
 {
@@ -169,6 +172,8 @@ double cs42l58_output_gain(CS42L58State *s)
 
             if (!(v & 0x80)) {
                 db = (double)((int8_t)(v << 1) / 2 - 2) / 2;
+            } else if (!s->regs[0x63] || !s->regs[0x67]) {
+                return 1.0;     /* the headphones muted, the speaker playing (iOS's own scale) */
             }
             break;
         }
