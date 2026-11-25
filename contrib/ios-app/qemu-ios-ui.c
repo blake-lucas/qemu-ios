@@ -24,6 +24,7 @@
 #include "qemu/ios-frame-path.h"
 #include "hw/arm/ipod_touch_lis302dl.h"
 #include "hw/arm/nand-image.h"
+#include "hw/arm/it-sampler.h"
 #include "qemu/aio.h"
 #include "system/runstate.h"
 #include "ui/console.h"
@@ -315,6 +316,7 @@ extern bool it_profile_on;
 void it_profile_cb_enable(void);
 static GMutex profile_mutex;
 static FILE *profile_file;
+static char *profile_path;   /* for the sampler's CAPTURE.samples (LT_SAMPLE) */
 static int profile_error;
 #define PROFILE_QUEUE_BYTES (8 * 1024 * 1024)
 static GCond profile_cond;
@@ -497,6 +499,9 @@ int qemu_ios_profile_start(const char *path)
                 "# begin %" PRIu64 "; instruction counters require IT_VCPU_ACCT\n", profile_started);
         it_profile_cb_enable();
         qatomic_set(&it_profile_on, true);
+        g_free(profile_path);
+        profile_path = g_strdup(path);
+        it_sampler_start();
     }
     g_mutex_unlock(&profile_mutex);
     return result;
@@ -511,6 +516,9 @@ int qemu_ios_profile_stop(void)
         return -EBUSY;
     }
     qatomic_set(&it_profile_on, false);
+    if (profile_file && profile_path) {
+        it_sampler_stop(profile_path);
+    }
     if (profile_file) {
         uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         profile_flush_gl_locked(now);
