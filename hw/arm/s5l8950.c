@@ -1913,6 +1913,8 @@ static void a6_init(MachineState *machine)
             /* i2s-version 3: 14G61's driver runs a port with CTRL bit 0 (0x101, stopped 0x134), as the S5L8920's
              * does; iOS plays through i2s0 (the CS42L65) only on the headphone route, the speaker being MCA0's. */
             qdev_prop_set_bit(port, "ctrl-run", true);
+            /* 14G61 plays 24-bit samples through i2s0, the width in TX config bits 5-6. */
+            qdev_prop_set_bit(port, "txcon-width", true);
             qdev_prop_set_uint8(port, "port", i);
             if (i == 0 && codec) {
                 qdev_connect_clock_in(port, "lrclk", qdev_get_clock_out(codec, "lrclk"));

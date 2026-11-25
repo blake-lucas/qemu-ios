@@ -9,10 +9,11 @@
  *
  * PCM arrives in the TX FIFO from CDMA channel 0x1a (i2s0) as 16-bit writes,
  * paced by the CDMA model at this block's frame rate (s5l8930_cdma.c), so the
- * FIFO just appends to a ring the audio backend drains. Stereo S16LE at the
- * port's frame rate (s5l8930_i2s_rate()), as the hardware makes it: the
- * port's own configuration says whether it drives the frame clock
- * (i2s_frame_master()). As the master it divides its MCLK (the A4's PMGR NCO;
+ * FIFO just appends to a ring the audio backend drains. Stereo S16LE (the
+ * iPhone 5's i2s0 takes 24-bit samples in 32-bit words, I2S_TXCON_WIDTH, kept
+ * to their top 16 bits) at the port's frame rate (s5l8930_i2s_rate()), as the
+ * hardware makes it: the port's own configuration says whether it drives the
+ * frame clock (i2s_frame_master()). As the master it divides its MCLK (the A4's PMGR NCO;
  * the S5L8920's audio complex NCO, "nco-base"/"nco-ref-hz") into frames; as
  * the slave it follows the LRCLK of whatever drives the clock, the codec
  * connected to its "lrclk" input (hw/arm/ipod_touch_cs42l58.c). The voice
@@ -76,6 +77,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8930I2SState, S5L8930_I2S)
  * the WM8975's AINTFCE MS, the Nano 3G's WM1870).
  */
 #define I2S_TXCON_EXT_CLK (1u << 20)
+/*
+ * TX config bits 5-6: the sample width, (bits - 16) / 4. 14G61's AppleSamsungI2S builds the word from the stream
+ * format's bit depth (0x811a5116: (depth - 16) / 4 << 5); the A4's config words have it 0 (16-bit). iOS 10 runs the
+ * iPhone 5's i2s0 at 24 bits (0x030000c9), each sample right-justified in a 32-bit FIFO word, the top byte clear, and
+ * the DT's i2s0 lists a 4-byte DMA width beside the 2-byte one for it. ponytail: 20 and 28 bits, which no guest
+ * has been seen to ask for, are taken the same way.
+ */
+#define I2S_TXCON_WIDTH(v) (16 + (((v) >> 5) & 3) * 4)
 #define I2S_MCLK_DIV    0x408   /* S5L8920: bits 8-15, MCLK per BCLK */
 #define I2S_FRAME_BITS  0x410   /* S5L8920: bits 0-7, BCLK per frame */
 /*
@@ -107,6 +116,7 @@ struct S5L8930I2SState {
      * (0x7900101) and stops by clearing it (0x7900000, then 0), leaving +0x08 at its frame
      * format (0x78057805); the A4's starts with TXCOM = 6. */
     bool ctrl_run;
+    bool txcon_width;               /* property: TX config bits 5-6 give the sample width (I2S_TXCON_WIDTH) */
     bool host_mic;                  /* property: the frontend's microphone is this port's input */
     bool mca;                      /* A6 MCA register layout, shared PCM backend */
     uint32_t frame_rate;            /* virtual external frame clock for MCA */
@@ -122,6 +132,8 @@ struct S5L8930I2SState {
 
     uint8_t ring[I2S_RING];
     uint32_t head, tail, level;
+    uint8_t tx_word[4];             /* a wide sample's FIFO word so far (i2s_tx_take) */
+    unsigned tx_word_len;
 
     /* capture: host input voice -> in_ring -> RX FIFO reads */
     uint32_t tone_hz;               /* property, test-only: synthetic input */
@@ -153,9 +165,20 @@ static unsigned i2s_sample_bytes(S5L8930I2SState *s, bool input)
     return s->mca && ((s->regs[8 >> 2] >> (input ? 8 : 0)) & 0xff) < 16 ? 4 : 2;
 }
 
+/* A sample's bits in the TX FIFO, outside the MCA: wider than 16, each takes a 32-bit word. */
+static unsigned i2s_tx_bits(S5L8930I2SState *s)
+{
+    return !s->mca && s->txcon_width ? I2S_TXCON_WIDTH(s->regs[I2S_TXCON >> 2]) : 16;
+}
+
+/* The bytes of one frame in the FIFO: what the CDMA paces at the frame rate. */
 unsigned s5l8930_i2s_frame_bytes(unsigned port, bool input)
 {
     S5L8930I2SState *s = port < ARRAY_SIZE(i2s_ports) ? i2s_ports[port] : NULL;
+
+    if (s && !input && i2s_tx_bits(s) > 16) {
+        return i2s_channels(s, false) * 4;
+    }
     return s ? i2s_channels(s, input) * i2s_sample_bytes(s, input) : 4;
 }
 
@@ -353,15 +376,61 @@ static uint64_t i2s_rx_read(S5L8930I2SState *s, unsigned size)
     return v;
 }
 
+static void i2s_ring_put(S5L8930I2SState *s, const uint8_t *buf, uint32_t len)
+{
+    uint32_t n = MIN(len, I2S_RING - s->level);   /* host stalled: drop the rest, never block the guest */
+
+    for (uint32_t off = 0; off < n;) {
+        uint32_t chunk = MIN(n - off, I2S_RING - s->head);
+
+        memcpy(s->ring + s->head, buf + off, chunk);
+        s->head = (s->head + chunk) % I2S_RING;
+        off += chunk;
+    }
+    s->level += n;
+}
+
+/*
+ * TX FIFO bytes into the ring, which holds S16 samples (the voice's format) whatever the port's width: a wider
+ * sample keeps its top 16 bits. Read as S16 pairs, iOS 10's 24-bit headphone stream played the low halves of its
+ * samples in the left channel (noise near full scale) and their top bytes in the right, at half speed.
+ */
+static void i2s_tx_take(S5L8930I2SState *s, const uint8_t *buf, uint32_t len)
+{
+    unsigned bits = i2s_tx_bits(s);
+    uint8_t out[512];
+    uint32_t n = 0;
+
+    if (bits == 16) {
+        i2s_ring_put(s, buf, len);
+        return;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        s->tx_word[s->tx_word_len++] = buf[i];
+        if (s->tx_word_len == 4) {
+            int32_t v = (int32_t)(ldl_le_p(s->tx_word) << (32 - bits)) >> (32 - bits);
+
+            stw_le_p(out + n, v >> (bits - 16));
+            n += 2;
+            s->tx_word_len = 0;
+            if (n == sizeof(out)) {
+                i2s_ring_put(s, out, n);
+                n = 0;
+            }
+        }
+    }
+    i2s_ring_put(s, out, n);
+}
+
 static void i2s_push(S5L8930I2SState *s, uint64_t value, unsigned size)
 {
-    for (unsigned i = 0; i < size; i++) {
-        if (s->level == I2S_RING) {
-            return;                 /* host stalled: drop, never block the guest */
-        }
-        s->ring[s->head] = value >> (8 * i);
-        s->head = (s->head + 1) % I2S_RING;
-        s->level++;
+    uint8_t buf[8];
+
+    stq_le_p(buf, value);
+    if (s->mca) {
+        i2s_ring_put(s, buf, size);
+    } else {
+        i2s_tx_take(s, buf, size);
     }
 }
 
@@ -459,16 +528,11 @@ uint32_t s5l8930_i2s_tx_bulk(hwaddr fifo, const uint8_t *buf, uint32_t len)
             continue;
         }
         if (s->voice && i2s_tx_running(s)) {
-            uint32_t n = MIN(len, I2S_RING - s->level);   /* host stalled: drop the rest */
-
-            for (uint32_t off = 0; off < n;) {
-                uint32_t chunk = MIN(n - off, I2S_RING - s->head);
-
-                memcpy(s->ring + s->head, buf + off, chunk);
-                s->head = (s->head + chunk) % I2S_RING;
-                off += chunk;
+            if (s->mca) {
+                i2s_ring_put(s, buf, len);
+            } else {
+                i2s_tx_take(s, buf, len);
             }
-            s->level += n;
         }
         return len;
     }
@@ -621,7 +685,7 @@ static void i2s_write(void *opaque, hwaddr offset, uint64_t value,
         }
         return;
     }
-    bool rx_was = i2s_rx_running(s);
+    bool rx_was = i2s_rx_running(s), tx_was = i2s_tx_running(s);
 
     s->regs[offset >> 2] = value;
     if (offset == (s->ctrl_run ? I2S_CTRL : I2S_RXCOM) && (s->audio_out || s->host_mic)) {
@@ -634,6 +698,9 @@ static void i2s_write(void *opaque, hwaddr offset, uint64_t value,
         }
     }
     if (offset == (s->ctrl_run ? I2S_CTRL : I2S_TXCOM) && s->voice) {
+        if (!tx_was && i2s_tx_running(s)) {
+            s->tx_word_len = 0;     /* a stream starts on a sample */
+        }
         if (i2s_tx_running(s)) {
             i2s_set_rate(s, s5l8930_i2s_rate(s->port));
         }
@@ -715,6 +782,7 @@ static void s5l8930_i2s_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     s->head = s->tail = s->level = 0;
+    s->tx_word_len = 0;
     s->in_head = s->in_tail = s->in_level = 0;
     s->tone_frame = 0;
     s->rx_pos = 0;
@@ -766,6 +834,7 @@ static const Property s5l8930_i2s_properties[] = {
     DEFINE_PROP_BOOL("audio-out", S5L8930I2SState, audio_out, false),
     DEFINE_PROP_BOOL("audio-in", S5L8930I2SState, audio_in, false),
     DEFINE_PROP_BOOL("ctrl-run", S5L8930I2SState, ctrl_run, false),
+    DEFINE_PROP_BOOL("txcon-width", S5L8930I2SState, txcon_width, false),
     DEFINE_PROP_BOOL("host-mic", S5L8930I2SState, host_mic, false),
     DEFINE_PROP_BOOL("mca", S5L8930I2SState, mca, false),
     DEFINE_PROP_UINT32("frame-rate", S5L8930I2SState, frame_rate, 48000),
