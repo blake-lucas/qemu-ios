@@ -121,7 +121,8 @@ static unsigned cs42l58_sample_rate(uint8_t control)
  * CS42L61 (n88, 9B206; speaker): 0x21, 8-bit two's complement in 0.5 dB
  * steps, levels 1-16 0xc4 (-30 dB) to 0x18 (+12 dB). Level 0 keeps 0xc4 and
  * mutes: 0x07 bit 0 set and 0x67 0x3f (0x1b bit 5 too), all cleared again for
- * any other level and for a system sound. *
+ * any other level and for a system sound.
+ *
  * CS42L61 on the iPhone 4 (n90, 10B329) and iPad (k48), modelled as this
  * CS42L58: on the speaker iOS scales the PCM itself and only mutes the codec at
  * level 0, which the host doesn't follow (unity, as before). With a headphone
