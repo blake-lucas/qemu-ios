@@ -1760,7 +1760,7 @@ int qemu_ios_portable_board(const char *machine, QemuIosPortableBoard *out)
     if (!strcmp(d->board, "n81ap") || !strcmp(d->board, "n90ap") || !strcmp(d->board, "n42ap"))
         out->capabilities |= QEMU_IOS_CAP_GYRO;
     /* boards whose codec model reports a headphone jack: machine option headphones=on */
-    if (!strcmp(d->board, "n81ap")) out->capabilities |= QEMU_IOS_CAP_HEADPHONES;
+    if (!strcmp(d->board, "n81ap") || !strcmp(d->board, "n42ap")) out->capabilities |= QEMU_IOS_CAP_HEADPHONES;
     return QEMU_IOS_OK;
 }
 int qemu_ios_portable_board_at(int index, QemuIosPortableBoard *out)

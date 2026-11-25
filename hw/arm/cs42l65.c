@@ -7,16 +7,41 @@
  * checks 42 a6 5x. Other registers currently retain writes. Clocking, analog
  * controls and interrupt/status side effects remain to be qualified; this
  * register-port model does not claim a working codec or audio stream.
+ *
+ * Headphone jack (machine option headphones=on, LT_HEADPHONES=0/1): 14G61's AppleCS42L65Mikey is the generic
+ * AppleCSCodecMikey (AppleCSEmbeddedAudio) over a register block at 0x6a (its accessors add 0x6a), the driver the
+ * iPod touch 4G's CS42L59 answers at 0x2c. AppleEmbeddedAudio reads block register 7 (0x71) bit 7 as plugged, but
+ * only when a jack interrupt asks it to look: status 0x75 bits 5-6 (mask 0x73), which the model raises once, when
+ * the driver unmasks bit 5. Headset detection then writes 0x9e to 0x6e (bit 7: running; the iPod's 0x30 <- 0x9e)
+ * and unmasks the type-detect interrupt (mask 0x74 bits 3-4 clear). The handler reads status 0x75 and 0x76 (bits
+ * 3-4: type detect done; both read clear), then 0x71 and 0x72, and a set 0x72 bit 0 (no mic, no button)
+ * classifies a plain headphone before the per-contact results are looked at: iOS routes to Headphones, plays
+ * through i2s0 instead of the speaker amplifier's MCA0, and runs no speaker protection. The interrupt is DT
+ * audio-codec "interrupts" d2/1: GPIO 210, active low. ponytail: read from the driver (AppleCSEmbeddedAudio
+ * 0x80a5cc9c, 0x80a5cd26, 0x80a5d578, 0x80a5bb98 in 14G61's kernelcache), not from a datasheet.
  */
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "hw/ssi/ssi.h"
 #include "migration/vmstate.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/arm/cs42l65.h"
 
-#define TYPE_CS42L65 "cs42l65"
 OBJECT_DECLARE_SIMPLE_TYPE(CS42L65State, CS42L65)
 #define CS42L65_REGS 65536
+
+#define CS42L65_MIKEY_DETECT 0x6e   /* bit 7: headset type detection running (0x9e) */
+#define CS42L65_MIKEY_JACK   0x71   /* bit 7: plugged */
+#define CS42L65_MIKEY_COMP   0x72   /* bit 0: no mic (a plain headphone) */
+#define CS42L65_MIKEY_MASK1  0x73   /* bit 5 clear: jack interrupt unmasked */
+#define CS42L65_MIKEY_MASK2  0x74   /* bits 3-4 clear: type-detect interrupt unmasked */
+#define CS42L65_MIKEY_INT1   0x75   /* bits 5-6: the jack changed (read clears) */
+#define CS42L65_MIKEY_INT2   0x76   /* bits 3-4: type detect done (read clears) */
+#define CS42L65_INT_JACK     0x20
+#define CS42L65_REG_RATE     0x12   /* bits 0-3: the I2S frame rate */
+#define CS42L65_INT_TYPE     0x18
 
 struct CS42L65State {
     SSIPeripheral parent_obj;
@@ -25,7 +50,75 @@ struct CS42L65State {
     bool autoincrement;
     uint16_t address, remaining;
     unsigned bad_commands;
+    bool hp;               /* a plain headphone in the jack (cs42l65_set_headphones) */
+    bool hp_announced;     /* its jack interrupt was raised */
+    uint8_t hp_status1;    /* pending 0x75 status */
+    uint8_t hp_status;     /* pending 0x76 status */
+    qemu_irq irq;          /* the codec's interrupt, 1 = asserted */
+    Clock *lrclk;          /* out: the frame clock of its I2S port (i2s0), which it masters */
 };
+
+/*
+ * 14G61 AppleCS42L65Audio's setSampleRate (0x81040e40) writes these codes to register 0x12 bits 0-3; the codec
+ * masters i2s0's clocks (its DT audio-data TX config), so the port plays at the rate set here: 44.1 kHz in games.
+ */
+static unsigned cs42l65_rate(uint8_t code)
+{
+    static const unsigned rates[16] = { 0, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000 };
+
+    return rates[code & 0xf];
+}
+
+/*
+ * The jack's interrupt once the driver unmasks it (the headphone was there from power-on); then type detection
+ * running with its interrupt unmasked, which a plain headphone answers at once.
+ */
+static void cs42l65_hp_detect(CS42L65State *s)
+{
+    if (!s->hp) {
+        return;
+    }
+    if (!s->hp_announced && !(s->regs[CS42L65_MIKEY_MASK1] & CS42L65_INT_JACK)) {
+        s->hp_announced = true;
+        s->hp_status1 |= CS42L65_INT_JACK;
+    }
+    if ((s->regs[CS42L65_MIKEY_DETECT] & 0x80) && !(s->regs[CS42L65_MIKEY_MASK2] & CS42L65_INT_TYPE)) {
+        s->hp_status |= CS42L65_INT_TYPE;
+    }
+    qemu_set_irq(s->irq, (s->hp_status1 | s->hp_status) != 0);
+}
+
+static uint8_t cs42l65_read(CS42L65State *s, uint16_t reg)
+{
+    uint8_t v = s->regs[reg];
+
+    if (!s->hp) {
+        return v;
+    }
+    switch (reg) {
+    case CS42L65_MIKEY_JACK:
+        return v | 0x80;
+    case CS42L65_MIKEY_COMP:
+        return v | 0x01;
+    case CS42L65_MIKEY_INT1:
+        v = s->hp_status1;
+        s->hp_status1 = 0;
+        qemu_set_irq(s->irq, s->hp_status != 0);
+        return v;
+    case CS42L65_MIKEY_INT2:
+        v = s->hp_status;
+        s->hp_status = 0;
+        qemu_set_irq(s->irq, s->hp_status1 != 0);
+        return v;
+    default:
+        return v;
+    }
+}
+
+void cs42l65_set_headphones(DeviceState *dev, bool on)
+{
+    CS42L65(dev)->hp = on;
+}
 
 static uint32_t cs42l65_transfer(SSIPeripheral *dev, uint32_t value)
 {
@@ -34,9 +127,16 @@ static uint32_t cs42l65_transfer(SSIPeripheral *dev, uint32_t value)
     if (s->remaining) {
         uint8_t result = 0;
         if (s->command == 0x6d) {
-            result = s->regs[s->address];
+            result = cs42l65_read(s, s->address);
         } else if (s->address < 1 || s->address > 3) {
             s->regs[s->address] = byte;
+            if (s->address == CS42L65_REG_RATE && cs42l65_rate(byte)) {
+                clock_update_hz(s->lrclk, cs42l65_rate(byte));
+            }
+            if (s->address == CS42L65_MIKEY_DETECT || s->address == CS42L65_MIKEY_MASK1 ||
+                s->address == CS42L65_MIKEY_MASK2) {
+                cs42l65_hp_detect(s);
+            }
         }
         if (s->autoincrement) {
             s->address = (s->address + 1) & (CS42L65_REGS - 1);
@@ -85,12 +185,39 @@ static void cs42l65_reset(DeviceState *dev)
     s->autoincrement = false;
     s->address = s->remaining = 0;
     s->bad_commands = 0;
+    s->hp_status = s->hp_status1 = 0;
+    s->hp_announced = false;
+}
+
+static bool cs42l65_hp_needed(void *opaque)
+{
+    return CS42L65(opaque)->hp;
+}
+
+static const VMStateDescription vmstate_cs42l65_hp = {
+    .name = "cs42l65/hp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cs42l65_hp_needed,
+    .fields = (const VMStateField[]){VMSTATE_UINT8(hp_status, CS42L65State),
+                                     VMSTATE_UINT8(hp_status1, CS42L65State),
+                                     VMSTATE_BOOL(hp_announced, CS42L65State), VMSTATE_END_OF_LIST()}};
+
+static int cs42l65_post_load(void *opaque, int version_id)
+{
+    CS42L65State *s = opaque;
+
+    if (cs42l65_rate(s->regs[CS42L65_REG_RATE])) {
+        clock_update_hz(s->lrclk, cs42l65_rate(s->regs[CS42L65_REG_RATE]));
+    }
+    return 0;
 }
 
 static const VMStateDescription vmstate_cs42l65 = {
     .name = TYPE_CS42L65,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = cs42l65_post_load,
     .fields = (const VMStateField[]){
         VMSTATE_UINT8_ARRAY(regs, CS42L65State, CS42L65_REGS),
         VMSTATE_UINT8(command, CS42L65State),
@@ -98,11 +225,18 @@ static const VMStateDescription vmstate_cs42l65 = {
         VMSTATE_UINT8(high, CS42L65State),
         VMSTATE_BOOL(autoincrement, CS42L65State),
         VMSTATE_UINT16(address, CS42L65State),
-        VMSTATE_UINT16(remaining, CS42L65State), VMSTATE_END_OF_LIST()}};
+        VMSTATE_UINT16(remaining, CS42L65State), VMSTATE_END_OF_LIST()},
+    .subsections = (const VMStateDescription *const[]){&vmstate_cs42l65_hp, NULL}};
 
 static void cs42l65_realize(SSIPeripheral *dev, Error **errp)
 {
     cs42l65_reset(DEVICE(dev));
+}
+
+static void cs42l65_init(Object *obj)
+{
+    qdev_init_gpio_out(DEVICE(obj), &CS42L65(obj)->irq, 1);
+    CS42L65(obj)->lrclk = qdev_init_clock_out(DEVICE(obj), "lrclk");
 }
 
 static void cs42l65_class_init(ObjectClass *klass, const void *data)
@@ -120,6 +254,7 @@ static const TypeInfo cs42l65_info = {
     .name = TYPE_CS42L65,
     .parent = TYPE_SSI_PERIPHERAL,
     .instance_size = sizeof(CS42L65State),
+    .instance_init = cs42l65_init,
     .class_init = cs42l65_class_init,
 };
 static void cs42l65_register_types(void)
