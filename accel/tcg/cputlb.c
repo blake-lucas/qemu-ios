@@ -545,6 +545,7 @@ typedef struct TLBShootdownOp {
     vaddr addr, len;
     MMUIdxMap idxmap;
     uint8_t kind, bits;
+    void (*fn)(CPUState *cpu, uint64_t arg);    /* TLB_SD_CALL: fn(cpu, addr) */
 } TLBShootdownOp;
 
 struct TLBShootdownQueue {
@@ -642,7 +643,8 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
  */
 #define TLB_SHOOTDOWN_MAX 16
 
-enum { TLB_SD_PAGE, TLB_SD_RANGE, TLB_SD_ALL };
+enum { TLB_SD_PAGE, TLB_SD_RANGE, TLB_SD_ALL, TLB_SD_CALL };
+static bool tlb_shootdown_inline_op(CPUState *src, TLBShootdownOp o);
 static bool tlb_shootdown_inline_run(CPUState *src, int kind, vaddr addr, vaddr len, MMUIdxMap idxmap,
                                      unsigned bits);
 
@@ -1417,6 +1419,9 @@ static void tlb_shootdown_run_op(CPUState *cpu, const TLBShootdownOp *o)
     case TLB_SD_RANGE:
         tlb_flush_range_by_mmuidx_async_0(cpu, (TLBFlushRangeData){ o->addr, o->len, o->idxmap, o->bits });
         break;
+    case TLB_SD_CALL:
+        o->fn(cpu, o->addr);
+        break;
     default:
         tlb_flush_by_mmuidx_async_work(cpu, RUN_ON_CPU_HOST_INT(o->idxmap));
         break;
@@ -1455,7 +1460,23 @@ void tlb_shootdown_service_slow(CPUState *cpu)
 static bool tlb_shootdown_inline_run(CPUState *src, int kind, vaddr addr, vaddr len, MMUIdxMap idxmap,
                                      unsigned bits)
 {
-    TLBShootdownOp o = { .addr = addr, .len = len, .idxmap = idxmap, .kind = kind, .bits = bits };
+    return tlb_shootdown_inline_op(src, (TLBShootdownOp){ .addr = addr, .len = len, .idxmap = idxmap, .kind = kind,
+                                                          .bits = bits });
+}
+
+/*
+ * A target's own flush for a broadcast the TLB code can't express, such as a TLBI by ASID that keeps the other
+ * address spaces' jump caches and parked TLBs (target/arm tlbiasid_is_write): @fn(cpu, @arg) on each CPU the
+ * broadcast reaches, on its own thread, as the inline shootdown runs flushes. False when that path isn't available
+ * (another mode, an issuer holding the BQL): the caller broadcasts a full flush instead.
+ */
+bool tlb_flush_call_all_cpus_synced(CPUState *src, void (*fn)(CPUState *cpu, uint64_t arg), uint64_t arg)
+{
+    return tlb_shootdown_inline_op(src, (TLBShootdownOp){ .addr = arg, .kind = TLB_SD_CALL, .fn = fn });
+}
+
+static bool tlb_shootdown_inline_op(CPUState *src, TLBShootdownOp o)
+{
     CPUState *targets[TLB_SHOOTDOWN_MAX], *cpu;
     uint64_t tickets[TLB_SHOOTDOWN_MAX];
     int n = 0;
