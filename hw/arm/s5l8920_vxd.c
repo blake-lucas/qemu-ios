@@ -70,6 +70,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8920VXDState, S5L8920_VXD)
 #define MSG_RENDER          0x81
 #define   RENDER_NO_RESPONSE 0x0800 /* word 7 flags: no CMD_COMPLETED for this one */
 #define   RENDER_HOST_INT   0x4000  /* word 7 flags: interrupt the host at its end (a picture's last slice) */
+/*
+ * AppleVXD390's compact (DEVA) renders carry their flags in word 1's low half, where the waiver is 0x2000: a 480x272
+ * N.O.V.A. intro picture in two slices sends 0x2011 (first slice, waived) then 0x4004 (last slice, host interrupt).
+ */
+#define   DEVA_RENDER_NO_RESPONSE 0x2000
 #define MSG_CMD_COMPLETED   0xc0
 
 #define MTX_RAM_WORDS       0x10000
@@ -118,6 +123,7 @@ struct S5L8920VXDState {
     int64_t busy_until;               /* when the last of them ends */
     FILE *trace;
     bool a6;                          /* "a6": AppleVXD390's messages, streams and strides (s5l8950.c) */
+    bool deva_waiver;                 /* compact renders waive their reply with 0x2000; LT_VXD_DEVA_WAIVER=off: 0x0800 */
 };
 
 static void vxd_streams_clear(S5L8920VXDState *s)
@@ -621,6 +627,8 @@ static void vxd_message(S5L8920VXDState *s, const uint32_t *msg, unsigned words)
      * ask for the host's interrupt (FW_VA_RENDER_HOST_INT, a picture's last slice) or that doesn't waive the
      * reply (FW_VA_RENDER_NO_RESPONCE_MSG, every other slice) gets a CMD_COMPLETED: a picture completes once, at its
      * end. Completed at each slice, a two-slice picture's fence came back while its second slice was still decoding.
+     * Replying to AppleVXD390's waived slice too gave a two-slice picture two replies; the driver never cleared the
+     * second's interrupt and iOS 10 panicked on the interrupt storm (N.O.V.A.'s intro).
      */
     int64_t cost = VXD_SETUP_NS;
     if (got != -2 && (flags & RENDER_HOST_INT)) {
@@ -631,7 +639,8 @@ static void vxd_message(S5L8920VXDState *s, const uint32_t *msg, unsigned words)
     }
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->busy_until = MAX(now, s->busy_until) + cost;
-    if (id == MSG_RENDER && (flags & (RENDER_HOST_INT | RENDER_NO_RESPONSE)) == RENDER_NO_RESPONSE) {
+    uint32_t waive = compact && s->deva_waiver ? DEVA_RENDER_NO_RESPONSE : RENDER_NO_RESPONSE;
+    if (id == MSG_RENDER && (flags & (RENDER_HOST_INT | waive)) == waive) {
         return;
     }
     if (s->pending == VXD_PENDING) {          /* more outstanding than the driver ever queues: end the oldest now */
@@ -798,6 +807,8 @@ static void vxd_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &vxd_ops, s, TYPE_S5L8920_VXD, 0x100000);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    const char *waiver = getenv("LT_VXD_DEVA_WAIVER");
+    s->deva_waiver = !(waiver && (!strcmp(waiver, "off") || !strcmp(waiver, "0")));
     const char *trace = getenv("IT_VXD_TRACE");
     if (trace && *trace) {
         s->trace = fopen(trace, "a");
