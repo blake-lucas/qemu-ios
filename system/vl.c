@@ -2841,6 +2841,8 @@ void qmp_x_exit_preconfig(Error **errp)
  * A profile-instrumented engine (-fprofile-generate, LT_ENGINE_CFLAGS) has no exit at which to write
  * its profile on Android, where the process is killed: LT_PGO_RESET=S zeroes the counters S seconds
  * after start and LT_PGO_DUMP=S writes them to LT_PGO_FILE then, so the profile covers that window.
+ * The desktop engines are GCC builds: there the window is the same, and the .gcda files go where
+ * GCOV_PREFIX puts them (LT_PGO_FILE is clang's only).
  * Not on macOS: ld64 refuses weak references nothing defines, and only Android builds are profiled.
  */
 #ifdef __APPLE__
@@ -2851,25 +2853,77 @@ static void lt_pgo_start(void)
 extern int __llvm_profile_write_file(void) __attribute__((weak));
 extern void __llvm_profile_set_filename(const char *name) __attribute__((weak));
 extern void __llvm_profile_reset_counters(void) __attribute__((weak));
+extern void __gcov_reset(void) __attribute__((weak));
+extern void __gcov_dump(void) __attribute__((weak));
+
+static void lt_pgo_reset(void)
+{
+    if (__llvm_profile_reset_counters) {
+        __llvm_profile_reset_counters();
+    } else if (__gcov_reset) {
+        __gcov_reset();
+    }
+}
+
+static void lt_pgo_write(void)
+{
+    const char *file = getenv("LT_PGO_FILE");
+
+    if (!__llvm_profile_write_file) {
+        __gcov_dump();      /* exit won't write them again */
+        return;
+    }
+    if (file && __llvm_profile_set_filename) {
+        __llvm_profile_set_filename(file);
+    }
+    __llvm_profile_write_file();
+}
+
+/*
+ * LT_PGO_TRIGGER=FILE: the window follows a driver instead of the clock. The driver writes "reset" into FILE when the
+ * workload starts and "dump" when it ends (a boot's length varies too much from board to board for fixed times).
+ */
+static void *lt_pgo_trigger_thread(void *opaque)
+{
+    const char *path = opaque;
+    bool reset = false;
+
+    for (;;) {
+        g_autofree char *text = NULL;
+
+        g_usleep(G_USEC_PER_SEC / 2);
+        if (!g_file_get_contents(path, &text, NULL, NULL)) {
+            continue;
+        }
+        if (!reset && strstr(text, "reset")) {
+            lt_pgo_reset();
+            reset = true;
+            fprintf(stderr, "[pgo] counters reset\n");
+        }
+        if (strstr(text, "dump")) {
+            lt_pgo_write();
+            fprintf(stderr, "[pgo] profile written\n");
+            return NULL;
+        }
+    }
+}
 
 static void *lt_pgo_thread(void *opaque)
 {
-    const char *reset = getenv("LT_PGO_RESET"), *file = getenv("LT_PGO_FILE");
+    const char *reset = getenv("LT_PGO_RESET");
     unsigned dump = atoi(getenv("LT_PGO_DUMP")), at = 0;
 
-    if (reset && __llvm_profile_reset_counters) {
+    if (reset) {
         at = atoi(reset);
         g_usleep((gulong)at * G_USEC_PER_SEC);
-        __llvm_profile_reset_counters();
+        lt_pgo_reset();
         fprintf(stderr, "[pgo] counters reset at %u s\n", at);
     }
     if (dump > at) {
         g_usleep((gulong)(dump - at) * G_USEC_PER_SEC);
     }
-    if (file && __llvm_profile_set_filename) {
-        __llvm_profile_set_filename(file);
-    }
-    fprintf(stderr, "[pgo] profile written at %u s: %d\n", dump, __llvm_profile_write_file());
+    lt_pgo_write();
+    fprintf(stderr, "[pgo] profile written at %u s\n", dump);
     return NULL;
 }
 
@@ -2877,7 +2931,10 @@ static void lt_pgo_start(void)
 {
     static QemuThread thread;
 
-    if (__llvm_profile_write_file && getenv("LT_PGO_DUMP")) {
+    if ((__llvm_profile_write_file || __gcov_dump) && getenv("LT_PGO_TRIGGER")) {
+        qemu_thread_create(&thread, "pgo", lt_pgo_trigger_thread, g_strdup(getenv("LT_PGO_TRIGGER")),
+                           QEMU_THREAD_DETACHED);
+    } else if ((__llvm_profile_write_file || __gcov_dump) && getenv("LT_PGO_DUMP")) {
         qemu_thread_create(&thread, "pgo", lt_pgo_thread, NULL, QEMU_THREAD_DETACHED);
     }
 }
