@@ -121,7 +121,15 @@ static unsigned cs42l58_sample_rate(uint8_t control)
  * CS42L61 (n88, 9B206; speaker): 0x21, 8-bit two's complement in 0.5 dB
  * steps, levels 1-16 0xc4 (-30 dB) to 0x18 (+12 dB). Level 0 keeps 0xc4 and
  * mutes: 0x07 bit 0 set and 0x67 0x3f (0x1b bit 5 too), all cleared again for
- * any other level and for a system sound.
+ * any other level and for a system sound. *
+ * CS42L61 on the iPhone 4 (n90, 10B329) and iPad (k48), modelled as this
+ * CS42L58: on the speaker iOS scales the PCM itself and only mutes the codec at
+ * level 0, which the host doesn't follow (unity, as before). With a headphone
+ * in the jack ("headphones", the Mikey's jack) iOS sets the volume in 0x22:
+ * bit 7 mutes (level 0 and an idle output), bits 0-6 are 7-bit two's
+ * complement in 0.5 dB steps, levels 1-16 0x44 (-30 dB) to 0x02 (+1 dB), the
+ * top played at unity.
+ * ponytail: from 17 -> 0 -> 17 volume-button traces with Doodle Jump playing.
  */
 double cs42l58_output_gain(CS42L58State *s)
 {
@@ -155,6 +163,15 @@ double cs42l58_output_gain(CS42L58State *s)
         }
         break;
     default:
+        if (s->hp) {
+            /* the iPhone 4's and iPad's CS42L61 with a headphone in the jack (see below) */
+            uint8_t v = s->regs[0x22];
+
+            if (!(v & 0x80)) {
+                db = (double)((int8_t)(v << 1) / 2 - 2) / 2;
+            }
+            break;
+        }
         return 1.0;
     }
     return db == -INFINITY ? 0.0 : pow(10.0, db / 20.0);
