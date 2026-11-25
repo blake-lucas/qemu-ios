@@ -1,7 +1,7 @@
 /* Initialization has no decode fence: only submitted pictures complete.
  * SLICE hw/arm/s5l8920_vxd.c define VXD_BS_SEGS
  * SLICE hw/arm/s5l8920_vxd.c typedef VXDRender
- * SLICE hw/arm/s5l8920_vxd.c define MSG_|RENDER_|VXD_SETUP_NS|VXD_MB_NS|VXD_PENDING
+ * SLICE hw/arm/s5l8920_vxd.c define MSG_|RENDER_|DEVA_RENDER_|VXD_SETUP_NS|VXD_MB_NS|VXD_PENDING
  * SLICE hw/arm/s5l8920_vxd.c fn vxd_message
  * PKG glib-2.0
  */
@@ -21,7 +21,7 @@ typedef struct {
     bool compact[16];
     int64_t due[16], busy_until;
     void *done;
-    bool a6;
+    bool a6, deva_waiver;
 } S5L8920VXDState;
 static bool armed;
 static int64_t deadline;
@@ -69,7 +69,7 @@ int main(void)
     vxd_message(&old, init, G_N_ELEMENTS(init));
     assert(old.pending == 1 && old.fence[0] == 0x12340000 && !old.compact[0]);
     armed = false;
-    S5L8920VXDState s = {.a6 = true};
+    S5L8920VXDState s = {.a6 = true, .deva_waiver = true};
     vxd_message(&s, init, G_N_ELEMENTS(init));
     assert(!s.pending && !armed && !s.busy_until);
     uint32_t legacy_init[8] = {0x8020};
@@ -85,10 +85,24 @@ int main(void)
     vxd_message(&s, padding, G_N_ELEMENTS(padding));
     assert(s.pending == 1 && s.fence[0] == 1 && s.compact[0]);
     assert(s.due[0] == due && s.busy_until == busy_until && deadline == due);
-    /* A nonfinal slice explicitly waives completion. */
-    picture[0] = 0x28114;
-    picture[1] = 0x840815;
-    vxd_message(&s, picture, G_N_ELEMENTS(picture));
-    assert(s.pending == 1 && s.fence[0] == 1);
+    /* N.O.V.A.'s two-slice 480x272 picture as AppleVXD390 sends it: the first slice waives its reply (0x2000), the
+     * last asks for the host interrupt (0x4000). One completion, or the driver leaves the second one unclaimed. */
+    S5L8920VXDState two = {.a6 = true, .deva_waiver = true};
+    uint32_t first[] = {0x18114, 0x842011, 0x2cd000, 0xbf36e000, 0x10211000};
+    uint32_t last[] = {0x18114, 0x844004, 0x2cd210, 0xbf36e000, 0x10211000};
+    vxd_message(&two, first, G_N_ELEMENTS(first));
+    assert(!two.pending);
+    vxd_message(&two, last, G_N_ELEMENTS(last));
+    assert(two.pending == 1 && two.fence[0] == 1 && two.compact[0]);
+    /* LT_VXD_DEVA_WAIVER=off: the old rule, a reply for each (the panic). */
+    S5L8920VXDState old_rule = {.a6 = true};
+    vxd_message(&old_rule, first, G_N_ELEMENTS(first));
+    vxd_message(&old_rule, last, G_N_ELEMENTS(last));
+    assert(old_rule.pending == 2);
+    /* AppleVXD375's renders (word 7 flags) still waive with 0x0800. */
+    S5L8920VXDState legacy = {.a6 = true, .deva_waiver = true};
+    uint32_t slice[8] = {0x18120, 0x1234000, 0x470000, 0, 7, 0, 0, 0x0801};
+    vxd_message(&legacy, slice, G_N_ELEMENTS(slice));
+    assert(!legacy.pending);
     puts("ok");
 }
