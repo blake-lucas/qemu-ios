@@ -326,6 +326,8 @@ unsigned s5l8930_i2s_rate(unsigned port);
 unsigned s5l8930_i2s_sync_rate(unsigned port);
 /* A paced CDMA chain's bytes for a TX FIFO in one go; 0 if fifo is no port's TX FIFO. */
 uint32_t s5l8930_i2s_tx_bulk(hwaddr fifo, const uint8_t *buf, uint32_t len);
+/* A codec outside the CS42L58 family whose output volume the host hears on this port (the iPhone 5's CS42L65). */
+void s5l8930_i2s_set_gain_source(DeviceState *port, double (*gain)(void *opaque), void *opaque);
 unsigned s5l8930_i2s_frame_bytes(unsigned port, bool input);
 #define S5L8930_CDMA_CHANNELS    0x26
 

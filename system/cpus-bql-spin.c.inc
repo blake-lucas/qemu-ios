@@ -20,7 +20,7 @@ static void bql_spin_lock(QemuMutex *mutex, const char *file, int line)
 {
     CPUState *cpu = current_cpu;
 
-    if (!cpu || cpu->cpu_index != 0) {
+    if (!cpu || (cpu->cpu_index != 0 && !cpu->bql_spin)) {
         qemu_mutex_lock_impl(mutex, file, line);
         return;
     }

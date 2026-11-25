@@ -500,13 +500,40 @@ void tcg_indirect_l2_init(bool enabled, bool profile)
  * code (which is where these helpers are called from), so a plain store
  * faults there. The toggles are no-ops elsewhere.
  */
+/*
+ * Several vCPUs may run (and fill) one TB's slots (tcg_indirect_cache_parallel): fills of a slot are serialized,
+ * and each entry is written key 0, host code, key, in that order, which the generated hit path's second look at the
+ * key relies on (tcg-op.c gen_indirect_recheck).
+ */
+static QemuSpin indirect_fill_lock[64];
+
+static inline QemuSpin *indirect_lock(const void *slot)
+{
+    return &indirect_fill_lock[((uintptr_t)slot >> 5) & 63];
+}
+
+static inline void indirect_entry_set(TCGIndirectEntry *e, uint64_t key, const void *host)
+{
+    qatomic_set(&e->key, 0);
+    smp_wmb();
+    qatomic_set(&e->host, host);
+    smp_wmb();
+    qatomic_set(&e->key, key);
+}
+
 static inline void indirect_site_fill(TCGIndirectSlot *site, uint64_t key,
                                       const void *host)
 {
+    QemuSpin *lock = indirect_lock(site);
+    TCGIndirectEntry old;
+
     qemu_thread_jit_write();
-    site->e[1] = site->e[0];
-    site->e[0].host = host;
-    site->e[0].key = key;
+    qemu_spin_lock(lock);
+    old = site->e[0];
+    indirect_entry_set(&site->e[1], old.key, old.host);
+    smp_wmb();
+    indirect_entry_set(&site->e[0], key, host);
+    qemu_spin_unlock(lock);
     qemu_thread_jit_execute();
 }
 
@@ -564,8 +591,7 @@ const void *lookup_tb_ptr_cached(CPUState *cpu, TCGIndirectSlot *site,
     /*
      * The key names the context it was computed in (cpu->neg.ibtc_ctx at
      * the jump); store it only if that is still current, and never with
-     * breakpoints, which the cached path would skip. Only this vCPU reads
-     * the slot (single-vCPU guests only), so plain stores do.
+     * breakpoints, which the cached path would skip.
      */
     if ((uint32_t)(key >> 32) == qatomic_read(&cpu->neg.ibtc_ctx) &&
         (uint32_t)(key >> 32) != 0 &&
@@ -673,10 +699,17 @@ const void *HELPER(lookup_tb_ptr_ras)(CPUArchState *env, void *site, uint64_t ke
     if (slot != &tcg_ras_dummy && host != tcg_code_gen_epilogue &&
         (uint32_t)(key >> 32) == qatomic_read(&cpu->neg.ibtc_ctx) && (uint32_t)(key >> 32) != 0 &&
         QTAILQ_EMPTY(&cpu->breakpoints)) {
+        QemuSpin *lock = indirect_lock(slot);
+
         qemu_thread_jit_write();
-        slot->key = key;
-        slot->sig = sig;
-        slot->host = host;
+        qemu_spin_lock(lock);
+        qatomic_set(&slot->key, 0);
+        smp_wmb();
+        qatomic_set(&slot->sig, sig);
+        qatomic_set(&slot->host, host);
+        smp_wmb();
+        qatomic_set(&slot->key, key);
+        qemu_spin_unlock(lock);
         qemu_thread_jit_execute();
     }
     return host;

@@ -175,6 +175,8 @@ void tlb_flush_by_mmuidx_keep_jmp_cache(CPUState *cpu, MMUIdxMap idxmap);
  * emptied, keeping the other address spaces' and the global (kernel) entries.
  */
 void tlb_flush_context(CPUState *cpu, uint64_t key);
+/* Run @fn(cpu, @arg) on every CPU a broadcast from @src reaches, each on its own thread; false if unavailable. */
+bool tlb_flush_call_all_cpus_synced(CPUState *src, void (*fn)(CPUState *cpu, uint64_t arg), uint64_t arg);
 
 /*
  * Park @mmu_idx's table under @old_key and bring back @new_key's if it is still held, else start

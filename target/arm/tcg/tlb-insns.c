@@ -46,13 +46,43 @@ static CPAccessResult access_ttlbos(CPUARMState *env, const ARMCPRegInfo *ri,
     return CP_ACCESS_OK;
 }
 
+uint64_t it_acct_tlbi_is[4];    /* TLBIALLIS, TLBIASIDIS, TLBIMVAIS, TLBIMVAAIS issued (LT_BQL_PROF dumps) */
+
 /* IS variants of TLB operations must affect all cores */
 static void tlbiall_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
                              uint64_t value)
 {
     CPUState *cs = env_cpu(env);
 
+    qatomic_set(&it_acct_tlbi_is[0], it_acct_tlbi_is[0] + 1);
     tlb_flush_all_cpus_synced(cs);
+}
+
+/*
+ * TLBIASIDIS on one CPU it reaches, on that CPU's thread: what TLBIASID does locally (tlbiasid_write), so the other
+ * address spaces keep their jump caches, parked user TLBs and indirect-branch caches. iOS 10 on the iPhone 5 issues
+ * only the broadcast form, and each one used to flush everything on both AP cores.
+ */
+static void tlbiasid_is_local(CPUState *cs, uint64_t asid)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+
+    if (cpu->el0_tlb_stale && cpu->el0_tlb_asid == asid) {
+        arm_el0_tlb_sync(&cpu->env);
+    }
+    tlb_flush_context(cs, asid);
+}
+
+static bool tlbiasid_is_by_asid(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_TLBIASID_IS");
+
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    return on;
 }
 
 static void tlbiasid_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
@@ -60,6 +90,11 @@ static void tlbiasid_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     CPUState *cs = env_cpu(env);
 
+    qatomic_set(&it_acct_tlbi_is[1], it_acct_tlbi_is[1] + 1);
+    if (tlbiasid_is_by_asid() &&
+        tlb_flush_call_all_cpus_synced(cs, tlbiasid_is_local, extract64(value, 0, 8))) {
+        return;
+    }
     tlb_flush_all_cpus_synced(cs);
 }
 
@@ -68,6 +103,7 @@ static void tlbimva_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     CPUState *cs = env_cpu(env);
 
+    qatomic_set(&it_acct_tlbi_is[2], it_acct_tlbi_is[2] + 1);
     tlb_flush_page_all_cpus_synced(cs, value & TARGET_PAGE_MASK);
 }
 
@@ -76,6 +112,7 @@ static void tlbimvaa_is_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     CPUState *cs = env_cpu(env);
 
+    qatomic_set(&it_acct_tlbi_is[3], it_acct_tlbi_is[3] + 1);
     tlb_flush_page_all_cpus_synced(cs, value & TARGET_PAGE_MASK);
 }
 

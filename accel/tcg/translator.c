@@ -139,7 +139,8 @@ bool translator_use_indirect_cache(DisasContextBase *db)
     static int ir_cache = -1;
 
     if (!qatomic_read(&tcg_indirect_cache) ||
-        (tb_cflags(db->tb) & (CF_NO_GOTO_PTR | CF_USE_ICOUNT | CF_PARALLEL))) {
+        (tb_cflags(db->tb) & (CF_NO_GOTO_PTR | CF_USE_ICOUNT)) ||
+        ((tb_cflags(db->tb) & CF_PARALLEL) && !tcg_indirect_cache_parallel)) {
         return false;
     }
     /* The experimental IR cache would replay the slot's address. */

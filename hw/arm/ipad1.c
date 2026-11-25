@@ -84,6 +84,7 @@ typedef struct A4I2CDevice {
     const char *type;
     int16_t irq_pin;                     /* GPIO pin its gpio-out 0 drives, active low; 0 = none */
     int16_t irq2_pin;                    /* the gyro's INT2 (its outs are pin levels, not inverted) */
+    uint8_t pmu_irq;                     /* PMU interrupt vector its gpio-out 0 raises (DT interrupt-parent pmu) */
 } A4I2CDevice;
 
 typedef struct A4PowerKnob {
@@ -200,9 +201,10 @@ static const A4Board a4_k48 = {
          * it, so without this slave the codec never registers its "Codec"
          * IOAudio2 device and mediaserverd fails every sound with '!dev'.
          * The iPod's CD3272 model (all registers read 0: nothing plugged in)
-         * is enough for the driver to start.
+         * is enough for the driver to start. Its interrupt is the PMU's vector
+         * 0x29 (DT interrupts, event_name-gpio10 'mikey'): the headphone jack.
          */
-        { 0, 0x39, TYPE_CD3272MIKEY },
+        { 0, 0x39, TYPE_CD3272MIKEY, .pmu_irq = 0x29 },
         /* I2C2: LIS331DLH accelerometer and TSL2581 light sensor. */
         { 2, 0x19, TYPE_LIS302DL },
         { 2, 0x39, TYPE_S5L8930_TSL2581, 0x25 },     /* DT als interrupt */
@@ -306,7 +308,8 @@ static const A4Board a4_n90 = {
         /* compass1 (akm8975b, 0x0c, identity orientation): the unit's AK8975B.
          * The DT's akm8973s (0x1e) and compass2 (0x0d) nodes find nothing. */
         { 0, 0x0c, TYPE_S5L8930_AK8975 },
-        { 0, 0x39, TYPE_CD3272MIKEY },           /* the codec waits for 'mikey' */
+        /* the codec waits for 'mikey'; its interrupt is the PMU's vector 0x17 (gpio8 'mikey') */
+        { 0, 0x39, TYPE_CD3272MIKEY, .pmu_irq = 0x17 },
         { 2, 0x19, TYPE_LIS302DL },
         { 2, 0x68, TYPE_S5L8930_L3G4200D, 0x21, 0x05 },   /* gyro,ap3gdl: INT1, INT2 */
     },
@@ -369,7 +372,7 @@ struct IPad1MachineState {
     char *usb_tcp_addr;                  /* host bridge, empty = no link */
     bool usb_cable;                      /* cable present; runtime qom-set */
     bool wifi;                           /* BCM4329 behind the IOP's SDIO ring */
-    bool headphones;                     /* a plain headphone in the jack (boards whose codec models it) */
+    bool headphones;                     /* a plain headphone in the jack (boards that model its detect) */
     uint64_t rtc_epoch;                  /* rtc-epoch: the PMU clock at power-on (Unix seconds), 0 = the host's */
     bool quiet_boot;                    /* omit -v in the RAM boot handoff */
     bool baseband;                       /* leave the kboot DT's baseband node matchable (default off) */
@@ -1183,6 +1186,17 @@ static const QemuInputHandler ipad1_kbd_handler = {
 
 static void ipad1_battery_update(IPad1MachineState *s);
 
+/* Whether the board's Mikey reports the headphone jack (its interrupt reaches the PMU). */
+static bool ipad1_mikey_jack(const A4Board *board)
+{
+    for (const A4I2CDevice *d = board->i2c; d->type; d++) {
+        if (!strcmp(d->type, TYPE_CD3272MIKEY) && d->pmu_irq) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* An I2C controller and the board's slaves on it, wired by type. */
 static void ipad1_i2c_create(IPad1MachineState *s, int n)
 {
@@ -1231,8 +1245,10 @@ static void ipad1_i2c_create(IPad1MachineState *s, int n)
                 s->accel->motion = true;
             }
         }
-        if (!strcmp(d->type, TYPE_CS42L59)) {
-            /* LT_HEADPHONES=1/0 overrides the machine option, for A/B runs */
+        if (!strcmp(d->type, TYPE_CS42L59) || (!strcmp(d->type, TYPE_CD3272MIKEY) && d->pmu_irq) ||
+            (!strcmp(d->type, TYPE_CS42L58) && ipad1_mikey_jack(s->board))) {
+            /* the jack's detect: the n81's codec, the n90's and k48's Mikey (their codec then plays the
+             * headphones' volume). LT_HEADPHONES=1/0 overrides the machine option, for A/B runs */
             const char *e = getenv("LT_HEADPHONES");
 
             qdev_prop_set_bit(dev, "headphones", e ? strcmp(e, "0") != 0 : s->headphones);
@@ -1243,7 +1259,9 @@ static void ipad1_i2c_create(IPad1MachineState *s, int n)
             ipod_agent_set_clock_offset(s->agent, s->rtc_epoch ? (int64_t)s->rtc_epoch - ipod_agent_rtc_now() : 0);
         }
         i2c_slave_realize_and_unref(slave, bus, &error_fatal);
-        if (d->irq2_pin) {
+        if (d->pmu_irq) {
+            qdev_connect_gpio_out(dev, 0, qdev_get_gpio_in_named(s->pmu, "event", d->pmu_irq));
+        } else if (d->irq2_pin) {
             qdev_connect_gpio_out(dev, 0, qdev_get_gpio_in(s->gpio, d->irq_pin));
             qdev_connect_gpio_out(dev, 1, qdev_get_gpio_in(s->gpio, d->irq2_pin));
         } else if (d->irq_pin) {
@@ -2628,7 +2646,7 @@ static void ipad1_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "headphones", ipad1_get_headphones, ipad1_set_headphones);
     object_class_property_set_description(klass, "headphones",
         "Report a plain headphone plugged in, so iOS routes audio to Headphones and skips the speaker "
-        "protection DSP (default off; the n81ap only, other boards ignore it)");
+        "protection DSP (default off; the n81ap, n90ap and k48ap, other boards ignore it)");
     object_class_property_add_bool(klass, "gles-debug", ipad1_get_gles_debug, ipad1_set_gles_debug);
     object_class_property_set_description(klass, "gles-debug",
         "Paint what the GL bridge refuses magenta instead of black (default off; tests turn it on)");

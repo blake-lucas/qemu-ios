@@ -529,6 +529,24 @@ void s5l8930_d1815_usb_cable_event(DeviceState *dev)
     d1815_update_irq(s);
 }
 
+/*
+ * The "event" inputs: interrupt lines of the PMU's DT children (their
+ * interrupt-parent is the PMU), by vector as above. A rising line latches its
+ * event bit; the child's handler clears its own source. The iPhone 4's and the
+ * iPad's CD3282 Mikey (0x17, 0x29) uses one for its headphone jack.
+ */
+#define PMU_CHILD_VECTORS   (PMU_EVENT_COUNT * 8)
+
+static void d1815_child_irq(void *opaque, int vector, int level)
+{
+    S5L8930D1815State *s = opaque;
+
+    if (level) {
+        s->regs[PMU_EVENT + (vector >> 3)] |= 1u << (vector & 7);
+        d1815_update_irq(s);
+    }
+}
+
 /* QEMU's RTC (-rtc base=, clock=), in Unix seconds: the host's UTC by default. */
 static int64_t d1815_rtc_clock(void)
 {
@@ -688,6 +706,7 @@ static void d1815_init(Object *obj)
     I2C_SLAVE(obj)->address = D1815_ADDR;
     qdev_init_gpio_out(DEVICE(obj), &s->irq, 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->ap_power, "ap-power", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), d1815_child_irq, "event", PMU_CHILD_VECTORS);
     s->adc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, d1815_adc_done, s);
 }
 

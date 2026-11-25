@@ -136,6 +136,7 @@ extern uint64_t it_acct_vcpu_bql_n, it_acct_vcpu_bql_ns, it_acct_vcpu_bql_slow;
 extern struct it_acct_mr { void *mr; uint64_t n, ns; char *name; uint64_t hold_n, hold_ns, hold_long_n, hold_max; } it_acct_mrs[256];
 extern uint64_t it_acct_wait_hist[5][2], it_acct_hold_hist[5][2];
 extern uint64_t it_acct_ctxsw, it_acct_fills[32][2];
+extern uint64_t it_acct_tlbi_is[4];
 extern uint64_t it_acct_el0_sync, it_acct_el0_used, it_acct_tlbiasid, it_acct_pflush, it_acct_rflush,
     it_acct_reset_dirty;
 extern struct it_acct_holder { const char *file; int line; uint64_t n, ns, long_n, long_ns; } it_acct_holders[64];
@@ -357,6 +358,8 @@ static void mttcg_acct_dump(int64_t now)
                 e->work_ns, e->max_wait);
 #endif
     }
+    fprintf(stderr, "[acct]   tlbi-is all %" PRIu64 " asid %" PRIu64 " mva %" PRIu64 " mvaa %" PRIu64 "\n",
+            it_acct_tlbi_is[0], it_acct_tlbi_is[1], it_acct_tlbi_is[2], it_acct_tlbi_is[3]);
     fprintf(stderr, "[acct]   ctxsw %" PRIu64 " el0-sync %" PRIu64 " el0-used %" PRIu64 " tlbiasid %" PRIu64
             " pflush %" PRIu64 " rflush %" PRIu64 " reset-dirty %" PRIu64 " tlb-fills", it_acct_ctxsw, it_acct_el0_sync,
             it_acct_el0_used, it_acct_tlbiasid, it_acct_pflush, it_acct_rflush, it_acct_reset_dirty);

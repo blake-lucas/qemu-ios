@@ -28,6 +28,8 @@
 #include "qapi/visitor.h"
 #include "hw/arm/ipod_touch_mipi_dsi.h"
 #include "hw/arm/ipod_touch_spi.h"
+#include "hw/arm/cs42l65.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/arm/ipod_touch_usb_otg.h"
 #include "hw/arm/ipod_touch_usb_phys.h"
 #include "hw/i2c/i2c.h"
@@ -249,6 +251,7 @@ struct S5L8950State {
     bool ppn, display_probe, ae2_probe, pmu_adc_probe, tristar_probe,
         usb_host_probe;
     bool audio_ports_probe;
+    bool headphones;                /* a plain headphone in the CS42L65's jack */
     bool camera;
     bool quiet_boot; /* omit -v in the RAM boot handoff */
     bool battery_probe;
@@ -1761,6 +1764,12 @@ static void a6_init(MachineState *machine)
      * file I/O without the BQL for the IOP. */
     tlb_shootdown_board = true;
     nand_disk_unlocked_io = true;
+    {
+        /* The indirect-branch caches in the two AP cores' shared TBs (with indirect-cache=on); LT_IBTC_PARALLEL=off. */
+        const char *v = getenv("LT_IBTC_PARALLEL");
+
+        tcg_indirect_cache_parallel = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
     if (s->restore_image) {
         struct stat st;
         s->restore_fd = qemu_open_old(s->restore_image, O_RDONLY | O_BINARY);
@@ -1816,6 +1825,11 @@ static void a6_init(MachineState *machine)
         } else {
             define_arm_cp_regs(s->cpu[i], a6_guest_cpregs);
         }
+        if (i == 1) {
+            /* The second AP core spins on a contended BQL like the first (Android's default; LT_BQL_SPIN_CPU1=off). */
+            const char *v = getenv("LT_BQL_SPIN_CPU1");
+            CPU(s->cpu[i])->bql_spin = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+        }
         object_unref(cpu);
     }
     memory_region_init_io(&s->aic, OBJECT(s), &a6_aic_ops, s, "a6.aic-v1",
@@ -1869,7 +1883,7 @@ static void a6_init(MachineState *machine)
         /* Original N42 DT: SPI3 uses the same spi-1,samsung controller
          * already used for touch. Its codec register-port protocol is
          * qualified separately in the CS42L65 model. */
-        DeviceState *spi = qdev_new(TYPE_IPOD_TOUCH_SPI);
+        DeviceState *spi = qdev_new(TYPE_IPOD_TOUCH_SPI), *codec = NULL;
         qdev_prop_set_uint8(spi, "index", 3);
         qdev_prop_set_string(spi, "peripheral", "cs42l65");
         qdev_prop_set_uint32(spi, "trace-transfer-limit", 512);
@@ -1877,12 +1891,33 @@ static void a6_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(spi), 0, 0x32300000);
         sysbus_connect_irq(SYS_BUS_DEVICE(spi), 0,
                            qemu_allocate_irq(a6_irq, s, 31));
+        {
+            /* The codec's interrupt is DT audio-codec "interrupts" d2/1: GPIO 210, active low. The jack reads
+             * empty unless headphones=on (LT_HEADPHONES=1/0 overrides it, for A/B runs). */
+            const char *e = getenv("LT_HEADPHONES");
+            BusChild *kid;
+
+            QTAILQ_FOREACH(kid, &BUS(IPOD_TOUCH_SPI(spi)->spi)->children, sibling) {
+                if (object_dynamic_cast(OBJECT(kid->child), TYPE_CS42L65)) {
+                    codec = kid->child;
+                    cs42l65_set_headphones(kid->child, e ? strcmp(e, "0") != 0 : s->headphones);
+                    qdev_connect_gpio_out(kid->child, 0, qemu_irq_invert(qdev_get_gpio_in(gpio, 210)));
+                }
+            }
+        }
         /* Native i2s-1,samsung ports. Reuse the existing PCM/rate model;
          * codec LRCLK and A6 clock-source routing need qualification. */
         for (int i = 0; i < 3; i++) {
             DeviceState *port = qdev_new(TYPE_S5L8930_I2S);
             qdev_prop_set_bit(port, "audio-out", i == 0);
+            /* i2s-version 3: 14G61's driver runs a port with CTRL bit 0 (0x101, stopped 0x134), as the S5L8920's
+             * does; iOS plays through i2s0 (the CS42L65) only on the headphone route, the speaker being MCA0's. */
+            qdev_prop_set_bit(port, "ctrl-run", true);
             qdev_prop_set_uint8(port, "port", i);
+            if (i == 0 && codec) {
+                qdev_connect_clock_in(port, "lrclk", qdev_get_clock_out(codec, "lrclk"));
+                s5l8930_i2s_set_gain_source(port, cs42l65_output_gain, codec);
+            }
             sysbus_realize_and_unref(SYS_BUS_DEVICE(port), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(port), 0, 0x34190000 + i * 0x1000);
         }
@@ -2405,6 +2440,18 @@ static void a6_set_audio_ports_probe(Object *obj, bool value, Error **errp)
     }
     S5L8950_MACHINE(obj)->audio_ports_probe = value;
 }
+static bool a6_get_headphones(Object *obj, Error **errp)
+{
+    return S5L8950_MACHINE(obj)->headphones;
+}
+static void a6_set_headphones(Object *obj, bool value, Error **errp)
+{
+    if (S5L8950_MACHINE(obj)->cpu[0]) {
+        error_setg(errp, "headphones must be set before machine initialization");
+        return;
+    }
+    S5L8950_MACHINE(obj)->headphones = value;
+}
 static char *a6_get_timer_status(Object *obj, Error **errp)
 {
     S5L8950State *s = S5L8950_MACHINE(obj);
@@ -2536,6 +2583,10 @@ static void a6_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "audio-ports-probe",
                                    a6_get_audio_ports_probe,
                                    a6_set_audio_ports_probe);
+    object_class_property_add_bool(klass, "headphones", a6_get_headphones, a6_set_headphones);
+    object_class_property_set_description(klass, "headphones",
+        "Report a plain headphone plugged in, so iOS routes audio to Headphones and skips the speaker "
+        "protection DSP (default off)");
     object_class_property_add_bool(klass, "backlight-probe",
                                    a6_get_backlight_probe,
                                    a6_set_backlight_probe);

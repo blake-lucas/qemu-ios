@@ -595,6 +595,8 @@ struct CPUState {
      * firmware on their own memory maps beside the two AP cores. 0 for every CPU unless the board sets it.
      */
     int tlb_domain;
+    /* Spin briefly on a contended BQL as vCPU 0 does (cpus-bql-spin.c.inc): a board's other application core. */
+    bool bql_spin;
     /* Broadcast TLB flushes queued for this CPU, run at its next TB boundary (cputlb.c, tlb_shootdown_service). */
     struct TLBShootdownQueue *tlb_sd;
     uint32_t tcg_cflags;
@@ -1126,6 +1128,11 @@ void it_acct_excl_note(void *fn, int64_t wait, int64_t work);
 void tlb_shootdown_service_slow(CPUState *cpu);
 extern bool tlb_shootdown_inline;
 extern bool tlb_shootdown_board;
+/*
+ * The indirect-branch caches (indirect-cache=on) also in TBs that several vCPUs run (CF_PARALLEL): a board opt-in,
+ * as they rest on the guest never remapping code in place (accel/tcg/translator.c, cross-page-chain).
+ */
+extern bool tcg_indirect_cache_parallel;
 static inline void tlb_shootdown_service(CPUState *cpu)
 {
     if (unlikely(tlb_shootdown_inline) && cpu->tlb_sd) {
