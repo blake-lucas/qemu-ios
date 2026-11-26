@@ -550,6 +550,7 @@ typedef struct {
     GLuint drawable_renderbuffer, resolve_fbo; /* shared CA color RBO and local resolve FBO */
     GLuint fbo, tex, depth, sync_fbo;   /* sync_fbo: gles_surface_writeback's scratch */
     GLuint fbo_color;                   /* gh.tex alone, for a drawable with no guest depth or stencil */
+    bool depthless_said;                /* this context has logged drawing into gh.fbo_color */
     GLuint copy_fbo;                    /* gles_surface_copy's draw side */
     GLuint fb_next, rb_next;            /* gles_guest_gen_low's count, from 1 as on the device */
     GLuint feedback_tex;              /* pre-draw color for SGX feedback blends */
@@ -3687,16 +3688,12 @@ static void gles_frame_end(void)
     }
     gh.depth_cleared_this_frame = false;
 
-    /* Once, at a frame boundary: an app attaches color first and depth next, so between the two calls every drawable
-     * looks depthless. */
-    {
-        static bool said;
-
-        if (!said && gh.fbo_color && gles_host_fbo(gh.bound_framebuffer) == gh.fbo_color) {
-            said = true;
-            fprintf(stderr, "[gles] drawable framebuffer %u has no depth or stencil attachment: drawn without them, "
-                    "as on the device (LT_GLES_DEPTHLESS_DRAWABLE=off keeps them)\n", gh.bound_framebuffer);
-        }
+    /* Once per context, at a frame boundary: an app attaches color first and depth next, so between the two calls
+     * every drawable looks depthless. */
+    if (!gh.depthless_said && gh.fbo_color && gles_host_fbo(gh.bound_framebuffer) == gh.fbo_color) {
+        gh.depthless_said = true;
+        fprintf(stderr, "[gles] drawable framebuffer %u has no depth or stencil attachment: drawn without them, "
+                "as on the device (LT_GLES_DEPTHLESS_DRAWABLE=off keeps them)\n", gh.bound_framebuffer);
     }
 }
 
