@@ -501,6 +501,7 @@ typedef struct {
     GHashTable *buffers, *surfaces, *rb_sized, *pvrtc;
     GHashTable *charged;        /* gles_charge_key -> bytes, the group's named objects */
     uint32_t next_buffer_name;
+    GLuint rb_next, tex_next;   /* gles_guest_gen_low's count for the group's shared renderbuffers and textures */
     GHashTable *glsl;           /* guest shader/program id -> host id */
     uint32_t glsl_next;
     GHashTable *glsl_source;    /* guest shader id -> the source the guest gave (glGetShaderSource) */
@@ -552,7 +553,7 @@ typedef struct {
     GLuint fbo_color;                   /* gh.tex alone, for a drawable with no guest depth or stencil */
     bool depthless_said;                /* this context has logged drawing into gh.fbo_color */
     GLuint copy_fbo;                    /* gles_surface_copy's draw side */
-    GLuint fb_next, rb_next;            /* gles_guest_gen_low's count, from 1 as on the device */
+    GLuint fb_next, rb_next, tex_next;  /* gles_guest_gen_low's count, from 1 as on the device */
     GLuint feedback_tex;              /* pre-draw color for SGX feedback blends */
     GLuint fetch_barrier_fbo;         /* scratch source for barrier-path resolve */
     GLuint fetch_position_buffer;     /* private transform-feedback scratch */
@@ -1379,18 +1380,48 @@ static bool gles_guest_names(GLuint *ids, uint32_t n)
     return ok;
 }
 
-/*
- * A driver may number a new framebuffer or renderbuffer past the highest name
- * in use. With the drawable's FBO at GLES_PRIVATE_NAME, such a driver hands
- * the guest names in the private range, and every bind of them is refused, so
- * CoreAnimation never reaches its display surfaces. Each such name is given
- * back and replaced by the next free one from this context's own count;
- * binding it creates it, as for the private names themselves.
- */
-static void gles_guest_gen_low(GLuint *ids, uint32_t n, bool renderbuffer)
+/* What gles_guest_gen_low renames. */
+typedef enum GLESGenKind {
+    GLES_GEN_FRAMEBUFFER, GLES_GEN_RENDERBUFFER, GLES_GEN_TEXTURE
+} GLESGenKind;
+
+/* LT_GLES_SHARED_LOW_NAMES=off: texture names stay the driver's and renderbuffers count per context, as before. */
+static bool gles_shared_low_names_on(void)
 {
-    static unsigned logged[2];
-    GLuint *next = renderbuffer ? &gh.rb_next : &gh.fb_next;
+    static int on = -1;
+
+    if (on < 0) on = g_strcmp0(getenv("LT_GLES_SHARED_LOW_NAMES"), "off") != 0;
+    return on;
+}
+
+/* The count a kind's low names come from. Renderbuffers and textures belong to the sharegroup on the host as on the
+ * device, and glIs* answers false for a name generated but not yet bound, so a context's own count from 1 could
+ * hand out a name a sibling context had just been given: theirs is the group's. Framebuffers are per context. */
+static GLuint *gles_gen_low_next(GLESGenKind kind)
+{
+    bool shared = gh.group && gles_shared_low_names_on();
+
+    switch (kind) {
+    case GLES_GEN_RENDERBUFFER: return shared ? &gh.group->rb_next : &gh.rb_next;
+    case GLES_GEN_TEXTURE: return shared ? &gh.group->tex_next : &gh.tex_next;
+    default: return &gh.fb_next;
+    }
+}
+
+/*
+ * A driver may number a new object past the highest name in use. With the drawable's FBO and color texture at
+ * GLES_PRIVATE_NAME, such a driver hands the guest names in the private range, and every bind of them is refused:
+ * CoreAnimation never reaches its display surfaces and the screen stays on the boot logo. Mali does it for
+ * framebuffers and renderbuffers (issue 6); Mesa 20.3 (Debian 11's) for those and for textures, which only Android
+ * virtualizes (gles-host-native.c.inc), so a desktop host hands the guest the driver's own texture names. Each such
+ * name is given back and replaced by the next free one from the count (gles_gen_low_next); binding it creates it, as
+ * for the private names themselves.
+ */
+static void gles_guest_gen_low(GLuint *ids, uint32_t n, GLESGenKind kind)
+{
+    static const char *const what[] = { "framebuffer", "renderbuffer", "texture" };
+    static unsigned logged[3];
+    GLuint *next = gles_gen_low_next(kind);
 
     for (uint32_t i = 0; i < n; i++) {
         GLuint high = ids[i];
@@ -1398,20 +1429,25 @@ static void gles_guest_gen_low(GLuint *ids, uint32_t n, bool renderbuffer)
         if (gles_guest_name_ok(high)) {
             continue;
         }
-        if (renderbuffer) {
-            glDeleteRenderbuffersEXT(1, &high);
-        } else {
-            glDeleteFramebuffersEXT(1, &high);
+        switch (kind) {
+        case GLES_GEN_RENDERBUFFER: glDeleteRenderbuffersEXT(1, &high); break;
+        case GLES_GEN_TEXTURE: glDeleteTextures(1, &high); break;
+        default: glDeleteFramebuffersEXT(1, &high); break;
         }
-        do {
+        for (;;) {
             if (++*next >= GLES_PRIVATE_NAME) {
                 *next = 1;
             }
-        } while (renderbuffer ? glIsRenderbufferEXT(*next) : glIsFramebufferEXT(*next));
+            if (!(kind == GLES_GEN_RENDERBUFFER ? glIsRenderbufferEXT(*next)
+                  : kind == GLES_GEN_TEXTURE   ? glIsTexture(*next)
+                                               : glIsFramebufferEXT(*next))) {
+                break;
+            }
+        }
         ids[i] = *next;
-        if (logged[renderbuffer]++ < 8) {
-            fprintf(stderr, "[gles] driver named a %s %#x, in the private range: the guest gets %u\n",
-                    renderbuffer ? "renderbuffer" : "framebuffer", high, ids[i]);
+        if (logged[kind]++ < 8) {
+            fprintf(stderr, "[gles] driver named a %s %#x, in the private range: the guest gets %u\n", what[kind],
+                    high, ids[i]);
         }
     }
 }
@@ -9555,6 +9591,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         }
         ids = g_new0(GLuint, n ? n : 1);
         glGenTextures(n, ids);
+        if (gles_shared_low_names_on()) {
+            gles_guest_gen_low(ids, n, GLES_GEN_TEXTURE);
+        }
         gles_guest_rw(cpu, a[1], (uint8_t *)ids, n * sizeof(GLuint), 1);
         return 0;
     }
@@ -11249,7 +11288,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         } else {
             glGenFramebuffersEXT(n, ids);
         }
-        gles_guest_gen_low(ids, n, slot == GLES_SLOT_GEN_RENDERBUFFERS);
+        gles_guest_gen_low(ids, n, slot == GLES_SLOT_GEN_RENDERBUFFERS ? GLES_GEN_RENDERBUFFER : GLES_GEN_FRAMEBUFFER);
         if (a[1] && n && gles_guest_rw(cpu, a[1], (uint8_t *)ids, n * sizeof(GLuint), 1) != 0) {
             gles_refuse("gen-write:%u", slot);
         }
