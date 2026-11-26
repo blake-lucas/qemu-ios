@@ -3125,6 +3125,7 @@ static unsigned gles_query_count(uint32_t pname)
     case GL_TEXTURE_COORD_ARRAY_TYPE:
     case GL_TEXTURE_STACK_DEPTH:
     case GL_UNPACK_ALIGNMENT:
+    case 0x8A16:                        /* UNPACK_ROW_BYTES_APPLE */
     case GL_VERTEX_ARRAY:
     case GL_VERTEX_ARRAY_SIZE:
     case GL_VERTEX_ARRAY_STRIDE:
@@ -10513,6 +10514,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             break;
         case GL_UNPACK_ALIGNMENT:
             v.i[0] = gles_unpack();
+            break;
+        case 0x8A16:    /* UNPACK_ROW_BYTES_APPLE: recorded at glPixelStorei, never forwarded */
+            v.i[0] = gh.unpack_row_bytes;
             break;
         case GL_ARRAY_BUFFER_BINDING:
             v.i[0] = gh.array_buffer ? gh.array_buffer->name : 0;
