@@ -502,6 +502,7 @@ typedef struct {
     GHashTable *charged;        /* gles_charge_key -> bytes, the group's named objects */
     uint32_t next_buffer_name;
     GLuint rb_next, tex_next;   /* gles_guest_gen_low's count for the group's shared renderbuffers and textures */
+    GHashTable *anisotropy;     /* texture -> TEXTURE_MAX_ANISOTROPY the bridge keeps (gles_anisotropy_kept) */
     GHashTable *glsl;           /* guest shader/program id -> host id */
     uint32_t glsl_next;
     GHashTable *glsl_source;    /* guest shader id -> the source the guest gave (glGetShaderSource) */
@@ -554,6 +555,7 @@ typedef struct {
     bool depthless_said;                /* this context has logged drawing into gh.fbo_color */
     GLuint copy_fbo;                    /* gles_surface_copy's draw side */
     GLuint fb_next, rb_next, tex_next;  /* gles_guest_gen_low's count, from 1 as on the device */
+    GHashTable *anisotropy;             /* as GLESGroup's, for a context without a group */
     GLuint feedback_tex;              /* pre-draw color for SGX feedback blends */
     GLuint fetch_barrier_fbo;         /* scratch source for barrier-path resolve */
     GLuint fetch_position_buffer;     /* private transform-feedback scratch */
@@ -4101,6 +4103,121 @@ static GLenum gles_texture_object(uint32_t target)
 {
     return target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
            target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? GL_TEXTURE_CUBE_MAP : target;
+}
+
+/*
+ * EXT_texture_filter_anisotropic on a desktop host without it. The front end lists the extension for every guest GPU,
+ * and iOS 10's CoreAnimation sets 8 on its layer textures, but a host without it (Mesa 20.3's llvmpipe, Debian 11's)
+ * refuses TEXTURE_MAX_ANISOTROPY with INVALID_ENUM, which reached the guest's glGetError: Zombie Crisis 3D took such
+ * an error for a failed upload (issue 18, there on Adreno's ES1, which gles-host-rectangle.c.inc covers on Android).
+ * Such a host keeps the value here, per texture, and textures filter without anisotropy. GL 4.6 has it in core.
+ * LT_GLES_ANISOTROPY_KEPT=off sends it to the host as before (and on Android, keeps it for ES 1 contexts only).
+ */
+#ifndef GLES_HOST_EAGL
+static bool gles_anisotropy_kept_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) on = g_strcmp0(getenv("LT_GLES_ANISOTROPY_KEPT"), "off") != 0;
+    return on;
+}
+
+static bool gles_anisotropy_kept(void)
+{
+    static int kept = -1;     /* one host per worker process */
+
+    if (kept < 0) {
+        const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+        const char *version = (const char *)glGetString(GL_VERSION);
+        int major = 0, minor = 0;
+
+        if (version) sscanf(version, "%d.%d", &major, &minor);
+        kept = gles_anisotropy_kept_on() && ext && !strstr(ext, "GL_EXT_texture_filter_anisotropic") &&
+               !strstr(ext, "GL_ARB_texture_filter_anisotropic") && major * 10 + minor < 46;
+        fprintf(stderr, "[gles] GL_EXT_texture_filter_anisotropic: %s\n",
+                kept ? "not on this host, kept by the bridge and not applied"
+                     : gles_anisotropy_kept_on() ? "host" : "host (LT_GLES_ANISOTROPY_KEPT=off)");
+    }
+    return kept;
+}
+
+static GHashTable **gles_anisotropy_table(void)
+{
+    return gh.group ? &gh.group->anisotropy : &gh.anisotropy;
+}
+
+/* The texture bound to TARGET (2D or cube map; anything else goes to the host), or -1. */
+static GLint gles_anisotropy_texture(uint32_t target, uint32_t pname)
+{
+    GLint bound = 0;
+
+    if (pname != 0x84FE || (target != GL_TEXTURE_2D && target != GL_TEXTURE_CUBE_MAP) || !gles_anisotropy_kept()) {
+        return -1;
+    }
+    glGetIntegerv(target == GL_TEXTURE_2D ? GL_TEXTURE_BINDING_2D : GL_TEXTURE_BINDING_CUBE_MAP, &bound);
+    return bound;
+}
+
+/* glTexParameter: true when the bridge took it. */
+static bool gles_anisotropy_set(uint32_t target, uint32_t pname, GLfloat value)
+{
+    GLint texture = gles_anisotropy_texture(target, pname);
+    GHashTable **table = gles_anisotropy_table();
+    GLfloat *kept;
+
+    if (texture < 0) return false;
+    if (!(value >= 1)) {
+        gles_reject(GL_INVALID_VALUE);
+        return true;
+    }
+    if (!*table) *table = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    kept = g_new(GLfloat, 1);
+    *kept = value;
+    g_hash_table_insert(*table, GUINT_TO_POINTER((guint)texture), kept);
+    return true;
+}
+
+/* glGetTexParameter: true when the bridge answered (1 until set). */
+static bool gles_anisotropy_get(uint32_t target, uint32_t pname, GLfloat *value)
+{
+    GLint texture = gles_anisotropy_texture(target, pname);
+    GHashTable *table = *gles_anisotropy_table();
+    GLfloat *kept;
+
+    if (texture < 0) return false;
+    kept = table ? g_hash_table_lookup(table, GUINT_TO_POINTER((guint)texture)) : NULL;
+    *value = kept ? *kept : 1;
+    return true;
+}
+
+static void gles_anisotropy_forget(const GLuint *ids, uint32_t n)
+{
+    GHashTable *table = *gles_anisotropy_table();
+
+    for (uint32_t i = 0; table && i < n; i++) {
+        g_hash_table_remove(table, GUINT_TO_POINTER(ids[i]));
+    }
+}
+#else
+/* Android's wrappers (gles-host-rectangle.c.inc) keep it there. */
+static bool gles_anisotropy_set(uint32_t target, uint32_t pname, GLfloat value) { return false; }
+static bool gles_anisotropy_get(uint32_t target, uint32_t pname, GLfloat *value) { return false; }
+static void gles_anisotropy_forget(const GLuint *ids, uint32_t n) { }
+#endif
+
+/* MAX_TEXTURE_MAX_ANISOTROPY where the bridge keeps the setting (a host without the extension refuses the query too):
+ * the guest GPUs' own, 2 on every board (gles_gpus.h), which the front end would have clamped the host's answer to. */
+static bool gles_anisotropy_max(GLint *v)
+{
+#if defined(GLES_HOST_EGL_ES)
+    if (!g_strcmp0(getenv("LT_GLES_ANISOTROPY_KEPT"), "off") || !gles_native_anisotropy_kept()) return false;
+#elif !defined(GLES_HOST_EAGL)
+    if (!gles_anisotropy_kept()) return false;
+#else
+    return false;
+#endif
+    *v = 2;
+    return true;
 }
 
 static unsigned gles_texparam_nparams(uint32_t target, uint32_t pname)
@@ -9635,8 +9752,13 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         case GLES_SLOT_GET_MATERIALFV: glGetMaterialfv(a[0], a[1], p.f); break;
         case GLES_SLOT_GET_TEX_ENVFV: glGetTexEnvfv(a[0], a[1], p.f); break;
         case GLES_SLOT_GET_TEX_ENVIV: glGetTexEnviv(a[0], a[1], p.i); break;
-        case GLES_SLOT_GET_TEX_PARAMETERFV: glGetTexParameterfv(a[0], a[1], p.f); break;
-        case GLES_SLOT_GET_TEX_PARAMETERIV: glGetTexParameteriv(a[0], a[1], p.i); break;
+        case GLES_SLOT_GET_TEX_PARAMETERFV:
+            if (!gles_anisotropy_get(a[0], a[1], p.f)) glGetTexParameterfv(a[0], a[1], p.f);
+            break;
+        case GLES_SLOT_GET_TEX_PARAMETERIV:
+            if (gles_anisotropy_get(a[0], a[1], p.f)) p.i[0] = (GLint)lrintf(p.f[0]);
+            else glGetTexParameteriv(a[0], a[1], p.i);
+            break;
         }
         return gles_guest_rw(cpu, a[2], (uint8_t *)&p, n * 4, 1) ? -1 : 0;
     }
@@ -9646,6 +9768,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             gles_refuse("texparam:0x%x/0x%x", a[0], a[1]);
             return gles_reject(GL_INVALID_ENUM);
         }
+        if (gles_anisotropy_set(a[0], a[1], gles_f(a[2]))) return 0;
         glTexParameterf(a[0], a[1], gles_f(a[2]));
         return 0;
 
@@ -9674,6 +9797,10 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             return gles_reject(GL_INVALID_ENUM);
         }
         if (!gles_fetch_params(cpu, a[2], n, &p)) return -1;
+        if (slot != GLES_SLOT_TEX_ENVIV &&
+            gles_anisotropy_set(a[0], a[1], slot == GLES_SLOT_TEX_PARAMETERFV ? p.f[0] : (GLfloat)p.i[0])) {
+            return 0;
+        }
         if (slot == GLES_SLOT_TEX_PARAMETERFV) glTexParameterfv(a[0], a[1], p.f);
         else if (slot == GLES_SLOT_TEX_PARAMETERIV) glTexParameteriv(a[0], a[1], p.i);
         else glTexEnviv(a[0], a[1], p.i);
@@ -9686,6 +9813,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
          * reads it back to the GPU); CoreAnimation sets it on its layer
          * textures. Desktop GL has no such name: take it as the engine does. */
         if (a[1] == 0x28FF) return 0;
+        if (gles_anisotropy_set(a[0], a[1], (GLfloat)(GLint)a[2])) return 0;
         glTexParameteri(a[0], a[1], a[2]);
         return 0;
 
@@ -10001,6 +10129,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         if (!gles_guest_names(ids, n)) {
             gles_refuse("name:private:%u", slot);
         }
+        gles_anisotropy_forget(ids, n);
         if (gh.surfaces) {
             for (unsigned i = 0; i < n; i++) {
                 g_hash_table_remove(gh.surfaces, GUINT_TO_POINTER(ids[i]));
@@ -10354,6 +10483,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
             return gles_reject(GL_INVALID_ENUM);
         }
         switch (pname) {
+        case 0x84FF:    /* MAX_TEXTURE_MAX_ANISOTROPY */
+            if (gles_anisotropy_max(v.i)) break;
+            goto forward;
 #if !defined(GLES_HOST_EAGL) && !defined(GLES_HOST_ANGLE)
         case 0x3000 ... 0x3007:
             if (gh.api_version == 2) v.i[0] = !!(gh.clip_enabled & (1u << (pname - 0x3000)));
@@ -11643,6 +11775,7 @@ static void gles_group_unref(GLESGroup *group)
     if (group->glsl_source) g_hash_table_destroy(group->glsl_source);
     if (group->uloc) g_hash_table_destroy(group->uloc);
     if (group->fetch_programs) g_hash_table_destroy(group->fetch_programs);
+    if (group->anisotropy) g_hash_table_destroy(group->anisotropy);
     g_free(group);
 }
 
@@ -11676,6 +11809,7 @@ static void gles_context_free(GLESHost *state)
     if (state->glsl_source) g_hash_table_destroy(state->glsl_source);
     if (state->uloc) g_hash_table_destroy(state->uloc);
     if (state->fetch_programs) g_hash_table_destroy(state->fetch_programs);
+    if (state->anisotropy) g_hash_table_destroy(state->anisotropy);
     if (state->cgl) {
         gles_context_delete_objects(state);
 #ifdef GLES_HOST_AHB

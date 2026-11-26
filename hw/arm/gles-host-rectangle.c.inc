@@ -192,26 +192,33 @@ static void gles_native_disable(GLenum cap) { gles_native_texture_enable(cap,fal
  * after its first PVRTC upload for an upload failure, then used the texture
  * object its failed init had freed (issue 18). Where the host refuses it, the
  * value is kept on the texture here and not applied: textures filter without
- * anisotropy, as the MBX does at 1.0.
+ * anisotropy, as the MBX does at 1.0. ES 2 contexts are probed too: the front
+ * end lists the extension for the SGX's ES 2 as well, iOS 10's CoreAnimation
+ * sets 8 on its layer textures, and an ES 3 driver without the extension
+ * refuses it the same way (LT_GLES_ANISOTROPY_KEPT=off: ES 1 contexts only, as
+ * before; the desktop hosts' side is gles_anisotropy_kept in gles-host.c).
  */
 static bool gles_native_anisotropy_kept(void)
 {
-    static int kept=-1;   /* one driver per worker process: its ES1 answer is the same for every context */
-    if (gles_egl_current->api!=1) return false;
-    if (kept<0) {
+    static int kept[3]={-1,-1,-1};   /* one driver per worker process: its answer per API is the same for every context */
+    static int es2=-1;
+    int api=gles_egl_current->api;
+    if (es2<0) es2=!getenv("LT_GLES_ANISOTROPY_KEPT") || strcmp(getenv("LT_GLES_ANISOTROPY_KEPT"),"off");
+    if (api!=1 && (api!=2 || !es2)) return false;
+    if (kept[api]<0) {
         GLfloat value=1;
         gles_native_save_errors();
         glGetTexParameterfv(GL_TEXTURE_2D,GL_TEXTURE_MAX_ANISOTROPY_EXT,&value);
-        kept=glGetError()!=GL_NO_ERROR;
-        if (!kept) {
+        kept[api]=glGetError()!=GL_NO_ERROR;
+        if (!kept[api]) {
             glTexParameterf(GL_TEXTURE_2D,GL_TEXTURE_MAX_ANISOTROPY_EXT,value);
-            kept=glGetError()!=GL_NO_ERROR;
+            kept[api]=glGetError()!=GL_NO_ERROR;
         }
         for (unsigned i=0;i<8 && glGetError()!=GL_NO_ERROR;i++) {}
-        fprintf(stderr,"[gles-egl] GLES1 GL_EXT_texture_filter_anisotropic: %s\n",
-                kept ? "texture setting not on this host, kept by the bridge and not applied" : "host");
+        fprintf(stderr,"[gles-egl] GLES%d GL_EXT_texture_filter_anisotropic: %s\n",api,
+                kept[api] ? "texture setting not on this host, kept by the bridge and not applied" : "host");
     }
-    return kept;
+    return kept[api];
 }
 static bool gles_native_anisotropy_set(GLenum target, GLenum pname, GLfloat value)
 {
