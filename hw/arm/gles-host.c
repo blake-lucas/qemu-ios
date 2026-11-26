@@ -5152,32 +5152,16 @@ static void gles_trace_surface_mapping(CPUState *cpu, uint32_t ctx,
     ios_frame_path(IOS_FP_SURFACE_MAP_END, ctx, base, physical);
 }
 
+/* Android's AHardwareBuffer present, or every desktop's queued readback (Linux, Windows, macOS). */
 #ifdef GLES_HOST_AHB
 #include "gles-host-present-async.c.inc"
-#elif !defined(__APPLE__) && !defined(_WIN32)
-#include "gles-host-present-queue.c.inc"
-#else
-static inline bool gles_present_async_submit(CPUState *cpu, uint32_t base, uint32_t stride,
-                                             uint32_t rw, uint32_t rh)
-{
-    return false;
-}
-static inline void gles_present_async_before_call(uint32_t ctx) {}
-typedef struct GlesPresentPrep GlesPresentPrep;
-static inline GlesPresentPrep *gles_present_async_prepare(CPUState *cpu, uint32_t ctx,
-                                                          const uint32_t *a)
-{
-    return NULL;
-}
-static inline void gles_present_async_run(GlesPresentPrep *prep, bool begin) {}
-static inline void gles_present_async_no_queue(void) {}
-#endif
-#if defined(GLES_HOST_AHB) || defined(__APPLE__) || defined(_WIN32)
 static inline int gles_present_write_row(CPUState *cpu, uint32_t base, uint32_t y, uint32_t stride,
                                          const uint8_t *src, size_t len)
 {
     return gles_guest_rw(cpu, base + (hwaddr)y * stride, (void *)src, len, 1);
 }
+#else
+#include "gles-host-present-queue.c.inc"
 #endif
 
 static int gles_present_to_surface_impl(CPUState *cpu, uint32_t base, uint32_t stride,
