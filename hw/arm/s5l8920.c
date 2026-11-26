@@ -453,6 +453,14 @@ static void s5l8920_cpu_reset(void *opaque)
         a4_dt_edit((uint8_t *)data, image_len, load_pa, bootargs_pa,
                    &(A4DTEdit){ "isp", "compatible", "none", 5 });
     }
+    /*
+     * No video encoder model either (DT venc, 0x88000000, unimplemented): its
+     * driver waits in the kernel for the firmware's interrupt, and an app's
+     * compressor query held mediaserverd until a fig RPC timeout killed it
+     * (ipad1.c, issue 23). Unmatched, the board has no hardware encoder.
+     */
+    a4_dt_edit((uint8_t *)data, image_len, load_pa, bootargs_pa,
+               &(A4DTEdit){ "venc", "compatible", "none", 5 });
     address_space_write(&address_space_memory, load_pa, MEMTXATTRS_UNSPECIFIED,
                         data, image_len);
     for (gsize off = image_len; off + KBOOT_SEGMENT_LEN <= size - KBOOT_TRAILER_LEN;) {
