@@ -1,5 +1,6 @@
 /*
- * The present queued on the GL thread where the frame is read back (desktop Linux; LT_PRESENT_ASYNC=off for A/B).
+ * The present queued on the GL thread where the frame is read back (the desktop: Linux, Windows and macOS;
+ * LT_PRESENT_ASYNC=off for A/B).
  *
  * Without an AHardwareBuffer (gles-host-present-async.c.inc) a present is glFinish, glReadPixels and a copy of the
  * frame into the guest's surface, and the vCPU waited for all of it inside the GL thread's sync call: in Epic Citadel
