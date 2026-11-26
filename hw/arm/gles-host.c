@@ -549,6 +549,7 @@ typedef struct {
     GLenum drawable_depth_format;      /* native capability-selected private storage */
     GLuint drawable_renderbuffer, resolve_fbo; /* shared CA color RBO and local resolve FBO */
     GLuint fbo, tex, depth, sync_fbo;   /* sync_fbo: gles_surface_writeback's scratch */
+    GLuint fbo_color;                   /* gh.tex alone, for a drawable with no guest depth or stencil */
     GLuint copy_fbo;                    /* gles_surface_copy's draw side */
     GLuint fb_next, rb_next;            /* gles_guest_gen_low's count, from 1 as on the device */
     GLuint feedback_tex;              /* pre-draw color for SGX feedback blends */
@@ -1414,15 +1415,75 @@ static void gles_guest_gen_low(GLuint *ids, uint32_t n, bool renderbuffer)
     }
 }
 
+/* A framebuffer's attachments as the guest made them: color 0, depth, stencil; each its type (GL_TEXTURE or
+ * GL_RENDERBUFFER, 0 for none), object, mip level and texture target. */
+typedef struct {
+    struct { uint32_t type, name, level, target; } at[3];
+} GLESFbAttach;
+
+static int gles_attach_index(uint32_t attach)
+{
+    switch (attach) {
+    case 0x8CE0: return 0;      /* COLOR_ATTACHMENT0 */
+    case 0x8D00: return 1;      /* DEPTH_ATTACHMENT */
+    case 0x8D20: return 2;      /* STENCIL_ATTACHMENT */
+    default: return -1;
+    }
+}
+
 static bool gles_is_drawable(uint32_t name)
 {
     return !name || g_hash_table_contains(gh.fbo_drawable,
                                           GUINT_TO_POINTER(name));
 }
 
+/*
+ * A drawable framebuffer the guest gave no depth or stencil attachment has neither on the device, so its depth and
+ * stencil tests always pass and write nothing. gh.fbo carries private depth/stencil for the guests that do attach
+ * them, and a draw into it really is depth-tested: Toy Shot (GitHub issue 21) enables GL_DEPTH_TEST under cocos2d's
+ * 3D projection with a color-only framebuffer, draws its backdrop first, nearest the camera, and the level's blocks
+ * and toys after it, farther away: against a real depth buffer they all failed the test. Such a framebuffer
+ * resolves to gh.fbo_color, the same color texture with nothing else. Only a recorded attachment set picks it: a
+ * framebuffer with no record (the default one, or one restored from a snapshot) keeps gh.fbo as before.
+ */
+static bool gles_drawable_depthless(uint32_t name)
+{
+    GLESFbAttach *f = name && gh.fb_attach ? g_hash_table_lookup(gh.fb_attach, GUINT_TO_POINTER(name)) : NULL;
+
+    return f && f->at[0].type && !f->at[1].type && !f->at[2].type;
+}
+
 static GLuint gles_host_fbo(uint32_t name)
 {
-    return gles_is_drawable(name) ? gh.fbo : name;
+    if (!gles_is_drawable(name)) return name;
+    return gh.fbo_color && gles_drawable_depthless(name) ? gh.fbo_color : gh.fbo;
+}
+
+/* LT_GLES_DEPTHLESS_DRAWABLE=off: every drawable framebuffer keeps the private depth/stencil, as before. */
+static bool gles_depthless_drawable_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) on = g_strcmp0(getenv("LT_GLES_DEPTHLESS_DRAWABLE"), "off") != 0;
+    return on;
+}
+
+/* gh.fbo_color for the color texture COLOR, or 0 (switched off, or the host refuses it: gh.fbo stands in). Leaves
+ * the new framebuffer bound; the caller restores its binding. */
+static GLuint gles_drawable_color_fbo(GLuint color)
+{
+    GLuint fbo;
+
+    if (!gles_depthless_drawable_on()) return 0;
+    fbo = gles_private_name(glIsFramebufferEXT);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, color, 0);
+    if (glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) != GL_FRAMEBUFFER_COMPLETE_EXT) {
+        fprintf(stderr, "[gles] color-only drawable framebuffer incomplete; drawables keep depth\n");
+        glDeleteFramebuffersEXT(1, &fbo);
+        return 0;
+    }
+    return fbo;
 }
 
 /*
@@ -1448,22 +1509,6 @@ static void gles_set_drawable(uint32_t name, uint32_t renderbuffer)
     }
     if (was_drawable != !!renderbuffer && gh.bound_framebuffer == name) {
         glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gles_host_fbo(name));
-    }
-}
-
-/* A framebuffer's attachments as the guest made them: color 0, depth, stencil; each its type (GL_TEXTURE or
- * GL_RENDERBUFFER, 0 for none), object, mip level and texture target. */
-typedef struct {
-    struct { uint32_t type, name, level, target; } at[3];
-} GLESFbAttach;
-
-static int gles_attach_index(uint32_t attach)
-{
-    switch (attach) {
-    case 0x8CE0: return 0;      /* COLOR_ATTACHMENT0 */
-    case 0x8D00: return 1;      /* DEPTH_ATTACHMENT */
-    case 0x8D20: return 2;      /* STENCIL_ATTACHMENT */
-    default: return -1;
     }
 }
 
@@ -1684,6 +1729,8 @@ static bool gles_host_init(void)
         gh.failed = true;
         return false;
     }
+    gh.fbo_color = gles_drawable_color_fbo(gh.tex);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gh.fbo);
 
     /*
      * Both matrices start as IDENTITY, because that is what ES 1.1 specifies
@@ -3639,6 +3686,18 @@ static void gles_frame_end(void)
         }
     }
     gh.depth_cleared_this_frame = false;
+
+    /* Once, at a frame boundary: an app attaches color first and depth next, so between the two calls every drawable
+     * looks depthless. */
+    {
+        static bool said;
+
+        if (!said && gh.fbo_color && gles_host_fbo(gh.bound_framebuffer) == gh.fbo_color) {
+            said = true;
+            fprintf(stderr, "[gles] drawable framebuffer %u has no depth or stencil attachment: drawn without them, "
+                    "as on the device (LT_GLES_DEPTHLESS_DRAWABLE=off keeps them)\n", gh.bound_framebuffer);
+        }
+    }
 }
 
 static void gles_check_draw(const char *what, uint32_t mode, uint32_t count)
@@ -6179,6 +6238,23 @@ static int64_t gles_resolve_multisample(void)
     return 0;
 }
 #endif
+
+/* gles_note_attach, and when that adds or removes the bound drawable's depth or stencil, the host binding follows:
+ * gles_host_fbo's answer changed (gh.fbo or gh.fbo_color). */
+static void gles_note_attach_rebind(uint32_t attach, uint32_t type, uint32_t name, uint32_t level, uint32_t target)
+{
+    GLuint before = gles_host_fbo(gh.bound_framebuffer);
+
+    gles_note_attach(attach, type, name, level, target);
+    if (gles_host_fbo(gh.bound_framebuffer) != before) {
+        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gles_host_fbo(gh.bound_framebuffer));
+#ifdef GLES_HOST_MULTISAMPLE
+        if (gh.read_framebuffer != gh.bound_framebuffer && gles_multisample_on()) {
+            glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, gles_host_fbo(gh.read_framebuffer));
+        }
+#endif
+    }
+}
 
 static bool gles_surface_range(uint32_t base, uint32_t stride, unsigned rows,
                                unsigned rowbytes)

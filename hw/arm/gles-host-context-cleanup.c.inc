@@ -19,6 +19,7 @@ static void gles_context_delete_objects(GLESHost *state)
     gles_queries_free(state);
 #endif
     glDeleteFramebuffersEXT(1, &state->fbo);
+    if (state->fbo_color) glDeleteFramebuffersEXT(1, &state->fbo_color);
     if (state->sync_fbo) glDeleteFramebuffersEXT(1, &state->sync_fbo);
     if (state->copy_fbo) glDeleteFramebuffersEXT(1, &state->copy_fbo);
     /* The A6's renderer scratch (gles_a6): its resolve and fetch objects. */

@@ -72,13 +72,19 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
         error = GL_OUT_OF_MEMORY;
     if (error != GL_NO_ERROR) gles_refuse("drawable:storage:0x%x", error);
     if (error == GL_NO_ERROR) {
+        GLuint fbo_color = gles_drawable_color_fbo(color);
+
         if ((GLuint)texture == gh.tex) texture = color;
         renderbuffer = gles_drawable_depth_remap(renderbuffer, gh.depth, gh.stencil,
                                                  depth, stencil);
         if ((GLuint)framebuffer == gh.fbo) framebuffer = fbo;
+        /* No color-only one (switched off or refused): its guests fall back to fbo. */
+        if (gh.fbo_color && (GLuint)framebuffer == gh.fbo_color) framebuffer = fbo_color ? fbo_color : fbo;
         glDeleteTextures(1, &gh.tex);
         gles_drawable_depth_delete(gh.depth, gh.stencil);
         glDeleteFramebuffersEXT(1, &gh.fbo);
+        if (gh.fbo_color) glDeleteFramebuffersEXT(1, &gh.fbo_color);
+        gh.fbo_color = fbo_color;
         g_free(gh.readback);
         gh.tex = color; gh.depth = depth; gh.stencil = stencil; gh.fbo = fbo;
         gh.readback = readback;
