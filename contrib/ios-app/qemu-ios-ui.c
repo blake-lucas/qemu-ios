@@ -104,6 +104,11 @@ static void ios_sequence_reset(void *opaque)
 #include "qapi/qapi-commands-misc.h"
 #include "migration/misc.h"
 #include "migration/migration.h"      /* migrate_get_current, MigrationState.state */
+#include "migration/ram.h"
+#include "migration/snapshot.h"
+#include "migration/global_state.h"
+#include "io/channel-callback.h"
+#include "exec/tb-flush.h"
 #include "system/runstate.h"
 #include "system/reset.h"
 
@@ -1027,6 +1032,8 @@ void qemu_ios_ui_vm_stopped(void)
     ios.attached = false;
 }
 
+static uint64_t ios_state_ram_total;     /* the machine's RAM, for a save's progress estimate */
+
 void qemu_ios_ui_vm_started(void)
 {
     int i;
@@ -1034,6 +1041,7 @@ void qemu_ios_ui_vm_started(void)
     if (ios.attached) {
         return;
     }
+    ios_state_ram_total = ram_bytes_total();
     ios.con = qemu_console_lookup_by_index(0);
     qatomic_set(&ios_is_ipad1, object_dynamic_cast(qdev_get_machine(),
                                                    MACHINE_TYPE_NAME("ipad1")) != NULL);
@@ -1706,6 +1714,127 @@ void qemu_ios_snapshot_resume(void)
                    * here that was missing this check. */
     }
     aio_bh_schedule_oneshot(qemu_get_aio_context(), ios_snapshot_resume_bh, NULL);
+}
+
+/* --- save states ------------------------------------------------------- */
+
+/*
+ * LightTouch's save states: the whole machine as one stream the host takes straight into its own writer (and
+ * compresses as it arrives), or feeds back from its reader, through a callback channel (io/channel-callback.h) rather
+ * than a migration URI. QEMU's file channel has no blocking mode on Windows, and a save needs neither the migration
+ * thread nor a temporary file.
+ *
+ * A save stops the guest (which syncs the NAND and the NOR: their VM change handlers), writes RAM and every device
+ * and leaves the guest stopped, so the host copies the device's storage while it agrees with the RAM, then resumes
+ * it (qemu_ios_state_resume). A load goes into a machine that has not run yet (started with -S over the saved storage):
+ * it resets the machine as loadvm does, loads, flushes every translation, and leaves it stopped for the resume.
+ * Both run on the main loop, under the BQL, while the calling host thread waits.
+ */
+typedef struct {
+    bool save;
+    QemuIosStateWrite write;
+    QemuIosStateRead read;
+    void *opaque;
+    int result;
+    char err[256];
+    QemuEvent done;
+} IosStateJob;
+
+static bool ios_state_stopped_running;  /* the guest ran when the last save or load stopped it */
+
+static int ios_state_write(void *opaque, const void *buf, size_t len)
+{
+    IosStateJob *job = opaque;
+    return job->write(job->opaque, buf, len);
+}
+
+static ssize_t ios_state_read(void *opaque, void *buf, size_t len)
+{
+    IosStateJob *job = opaque;
+    return job->read(job->opaque, buf, len);
+}
+
+static void ios_state_bh(void *opaque)
+{
+    IosStateJob *job = opaque;
+    Error *err = NULL;
+    QIOChannelCallback *ioc;
+
+    ios_sequence_cancel_current();
+    if (qemu_ios_ui_storage_failed()) {
+        snprintf(job->err, sizeof(job->err), "the device's storage could not be written");
+        job->result = -EIO;
+        qemu_event_set(&job->done);
+        return;
+    }
+    ios_state_stopped_running = runstate_is_running();
+    if (job->save) {
+        global_state_store();
+        vm_stop(RUN_STATE_SAVE_VM);
+        ioc = qio_channel_callback_new_writer(ios_state_write, job);
+        job->result = savevm_to_channel(QIO_CHANNEL(ioc), &err);
+    } else {
+        vm_stop(RUN_STATE_RESTORE_VM);
+        ioc = qio_channel_callback_new_reader(ios_state_read, job);
+        job->result = loadvm_from_channel(QIO_CHANNEL(ioc), &err);
+        /* RAM changed behind every translation (and the indirect-branch caches that assume code never moves). */
+        tb_flush__exclusive_or_serial();
+    }
+    object_unref(OBJECT(ioc));
+    if (job->result < 0) {
+        snprintf(job->err, sizeof(job->err), "%s", err ? error_get_pretty(err) : strerror(-job->result));
+        error_free(err);
+    }
+    fprintf(stderr, "[state] %s: %s\n", job->save ? "save" : "load", job->result < 0 ? job->err : "done");
+    qemu_event_set(&job->done);
+}
+
+static int ios_state_run(IosStateJob *job, char *err, unsigned long errlen)
+{
+    if (!qemu_ios_ui_ready()) {
+        snprintf(job->err, sizeof(job->err), "the device is not running");
+        job->result = -EAGAIN;
+    } else {
+        qemu_event_init(&job->done, false);
+        aio_bh_schedule_oneshot(qemu_get_aio_context(), ios_state_bh, job);
+        qemu_event_wait(&job->done);
+        qemu_event_destroy(&job->done);
+    }
+    if (err && errlen) {
+        g_strlcpy(err, job->result < 0 ? job->err : "", errlen);
+    }
+    return job->result;
+}
+
+int qemu_ios_state_save(QemuIosStateWrite write, void *opaque, char *err, unsigned long errlen)
+{
+    IosStateJob job = { .save = true, .write = write, .opaque = opaque };
+    return ios_state_run(&job, err, errlen);
+}
+
+int qemu_ios_state_load(QemuIosStateRead read, void *opaque, char *err, unsigned long errlen)
+{
+    IosStateJob job = { .save = false, .read = read, .opaque = opaque };
+    return ios_state_run(&job, err, errlen);
+}
+
+uint64_t qemu_ios_state_ram_bytes(void)
+{
+    return ios_state_ram_total;
+}
+
+static void ios_state_resume_bh(void *opaque)
+{
+    if (ios_state_stopped_running || opaque) {
+        ios_restart_after_save();
+    }
+}
+
+void qemu_ios_state_resume(bool always)
+{
+    if (qemu_ios_ui_ready()) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(), ios_state_resume_bh, always ? (void *)1 : NULL);
+    }
 }
 
 /* --- foreground/background ---------------------------------------------- */

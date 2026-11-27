@@ -1514,6 +1514,24 @@ typedef struct {
     uint8_t *data;
 } GLESSnap;
 
+/*
+ * fn on the GL thread, which owns the host contexts, with the BQL let go meanwhile: the GL thread takes it for a
+ * memory transaction (gles_log_region, as a restored surface's pages are logged), and a save or load holds it.
+ * Nothing else runs on the machine meanwhile: its vCPUs are stopped, and the main loop is the one waiting here.
+ */
+static void gles_snap_on_gl_thread(void (*fn)(void *), void *opaque)
+{
+    bool locked = bql_locked();
+
+    if (locked) {
+        bql_unlock();
+    }
+    gles_queue_run(fn, opaque);
+    if (locked) {
+        bql_lock();
+    }
+}
+
 static GLESSnap gles_snap;
 
 static void gles_snap_save_1(void *opaque)
@@ -1530,7 +1548,7 @@ static int gles_snap_pre_save(void *opaque)
 {
     GByteArray *b;
 
-    gles_queue_run(gles_snap_save_1, &b);
+    gles_snap_on_gl_thread(gles_snap_save_1, &b);
     gles_snap.len = b->len;
     gles_snap.data = (uint8_t *)g_byte_array_free(b, false);
     return 0;
@@ -1548,7 +1566,7 @@ static int gles_snap_post_load(void *opaque, int version_id)
 {
     bool ok;
 
-    gles_queue_run(gles_snap_load_1, &ok);
+    gles_snap_on_gl_thread(gles_snap_load_1, &ok);
     gles_queue_forget();
     gles_snap_post_save(opaque);
     return ok ? 0 : -EINVAL;

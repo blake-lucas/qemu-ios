@@ -74,6 +74,18 @@
 
 const unsigned int postcopy_ram_discard_version;
 
+/* LT_STATE_LOG=1: each section a save state writes or loads, on stderr (LightTouch's save states). */
+static bool savevm_log(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("LT_STATE_LOG");
+        on = v && *v && strcmp(v, "0") && strcmp(v, "off");
+    }
+    return on;
+}
+
 /* Subcommands for QEMU_VM_COMMAND */
 enum qemu_vm_cmd {
     MIG_CMD_INVALID = 0,   /* Must be 0 */
@@ -2615,6 +2627,9 @@ qemu_loadvm_section_start_full(QEMUFile *f, uint8_t type, Error **errp)
 
     trace_qemu_loadvm_state_section_startfull(section_id, idstr,
             instance_id, version_id);
+    if (savevm_log()) {
+        fprintf(stderr, "[state] load %s/%u v%u\n", idstr, instance_id, version_id);
+    }
     /* Find savevm section */
     se = find_se(idstr, instance_id);
     if (se == NULL) {
@@ -3465,6 +3480,53 @@ void load_snapshot_resume(RunState state)
     if (state == RUN_STATE_RUNNING && runstate_get() == RUN_STATE_SUSPENDED) {
         qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, &error_abort);
     }
+}
+
+int savevm_to_channel(QIOChannel *ioc, Error **errp)
+{
+    QEMUFile *f;
+    int ret, ret2;
+
+    GLOBAL_STATE_CODE();
+    if (!migrate_can_snapshot(errp) || migration_is_blocked(errp)) {
+        return -EINVAL;
+    }
+    bdrv_drain_all_begin();
+    f = qemu_file_new_output(ioc);
+    ret = qemu_savevm_state(f, errp);
+    ret2 = qemu_fclose(f);
+    bdrv_drain_all_end();
+    if (ret == 0 && ret2 < 0) {
+        error_setg_errno(errp, -ret2, "Error while writing VM state");
+        ret = ret2;
+    }
+    return ret;
+}
+
+int loadvm_from_channel(QIOChannel *ioc, Error **errp)
+{
+    MigrationIncomingState *mis = migration_incoming_get_current();
+    QEMUFile *f;
+    int ret;
+
+    GLOBAL_STATE_CODE();
+    if (!migrate_can_snapshot(errp)) {
+        return -EINVAL;
+    }
+    bdrv_drain_all_begin();
+    f = qemu_file_new_input(ioc);
+    qemu_system_reset(SHUTDOWN_CAUSE_SNAPSHOT_LOAD);
+    mis->from_src_file = f;
+    if (!yank_register_instance(MIGRATION_YANK_INSTANCE, errp)) {
+        mis->from_src_file = NULL;
+        qemu_fclose(f);
+        bdrv_drain_all_end();
+        return -EINVAL;
+    }
+    ret = qemu_loadvm_state(f, errp);
+    migration_incoming_state_destroy();     /* closes f */
+    bdrv_drain_all_end();
+    return ret;
 }
 
 bool delete_snapshot(const char *name, bool has_devices,

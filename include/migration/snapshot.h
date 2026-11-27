@@ -16,6 +16,7 @@
 #define QEMU_MIGRATION_SNAPSHOT_H
 
 #include "qapi/qapi-builtin-types.h"
+#include "io/channel.h"
 #include "qapi/qapi-types-run-state.h"
 
 /**
@@ -67,5 +68,16 @@ bool delete_snapshot(const char *name,
  * @state: state to restore
  */
 void load_snapshot_resume(RunState state);
+
+/**
+ * savevm_to_channel: Save the whole machine (RAM and every device) to @ioc.
+ * loadvm_from_channel: Reset the machine and load it from @ioc.
+ *
+ * The state stream of an internal snapshot, with no block device: an embedding host (LightTouch's save states) keeps
+ * it, and keeps the guest's storage in step itself. The caller holds the BQL with the VM stopped. A machine whose
+ * migration is blocked refuses to save, with the blocker's reason.
+ */
+int savevm_to_channel(QIOChannel *ioc, Error **errp);
+int loadvm_from_channel(QIOChannel *ioc, Error **errp);
 
 #endif
