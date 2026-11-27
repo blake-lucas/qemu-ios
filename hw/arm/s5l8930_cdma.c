@@ -1534,8 +1534,13 @@ static int cdma_post_load(void *opaque, int version_id)
     for (int ch = 0; ch < CDMA_CHANNELS; ch++) {
         /* A stalled segment resumes with remain as its length (cdma_run's
          * bound); a paced chain divides by its rate. */
-        if ((s->in_seg_mig[ch] && s->ch[ch].remain > CDMA_MAX_SEGMENT) ||
+        /* An A6 UART ring's remain is a wrapping byte counter, not the segment's length (cdma_run). */
+        bool counter = s->a6 && cdma_waits_for_uart(s, &s->ch[ch]);
+
+        if ((s->in_seg_mig[ch] && !counter && s->ch[ch].remain > CDMA_MAX_SEGMENT) ||
             (s->paced[ch] && !s->paced_bps[ch])) {
+            error_report("s5l8930-cdma: restored channel %d is inconsistent (in_seg %d remain %u paced %d bps %u)",
+                         ch, s->in_seg_mig[ch], s->ch[ch].remain, s->paced[ch], s->paced_bps[ch]);
             return -EINVAL;
         }
         s->ch[ch].in_seg = s->in_seg_mig[ch];
@@ -1548,6 +1553,54 @@ static int cdma_post_load(void *opaque, int version_id)
     }
     return 0;
 }
+
+/*
+ * The A6's channels past the A4's 0x26, and its SKG: a subsection, so the A4's wire stays as it was qualified.
+ */
+#define CDMA_EXTRA_CHANNELS (CDMA_CHANNELS - CDMA_LEGACY_CHANNELS)
+
+static bool cdma_extended_needed(void *opaque)
+{
+    S5L8930CDMAState *s = opaque;
+
+    return s->num_channels != CDMA_LEGACY_CHANNELS || s->skg_probe;
+}
+
+static const VMStateDescription vmstate_s5l8930_cdma_extended = {
+    .name = "s5l8930.cdma/extended",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cdma_extended_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_SUB_ARRAY(ch, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                                 vmstate_cdma_channel, CDMAChannel),
+        VMSTATE_SUB_ARRAY(paced, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                          vmstate_info_bool, bool),
+        VMSTATE_SUB_ARRAY(paced_start, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                          vmstate_info_int64, int64_t),
+        VMSTATE_SUB_ARRAY(paced_end, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                          vmstate_info_int64, int64_t),
+        VMSTATE_SUB_ARRAY(paced_desc, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                          vmstate_info_uint32, uint32_t),
+        VMSTATE_SUB_ARRAY(paced_sent, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                          vmstate_info_uint64, uint64_t),
+        VMSTATE_SUB_ARRAY(paced_bps, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                          vmstate_info_uint32, uint32_t),
+        VMSTATE_SUB_ARRAY(sink_pending, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                          vmstate_info_bool, bool),
+        VMSTATE_SUB_ARRAY(in_seg_mig, S5L8930CDMAState, CDMA_LEGACY_CHANNELS, CDMA_EXTRA_CHANNELS, 0,
+                          vmstate_info_bool, bool),
+        VMSTATE_UINT32(secret_ctrl, S5L8930CDMAState),
+        VMSTATE_UINT32_ARRAY(secret_seed, S5L8930CDMAState, 8),
+        VMSTATE_UINT32(skg_slot, S5L8930CDMAState),
+        VMSTATE_UINT32(skg_count, S5L8930CDMAState),
+        VMSTATE_UINT32(skg_control, S5L8930CDMAState),
+        VMSTATE_UINT32(skg_status, S5L8930CDMAState),
+        VMSTATE_UINT8_2DARRAY(secret_key, S5L8930CDMAState, 8, 32),
+        VMSTATE_UINT8(secret_valid, S5L8930CDMAState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_s5l8930_cdma = {
     .name = "s5l8930.cdma",
@@ -1576,6 +1629,10 @@ static const VMStateDescription vmstate_s5l8930_cdma = {
         VMSTATE_SUB_ARRAY(sink_pending, S5L8930CDMAState, 0, CDMA_LEGACY_CHANNELS, 4, vmstate_info_bool, bool),
         VMSTATE_SUB_ARRAY(in_seg_mig, S5L8930CDMAState, 0, CDMA_LEGACY_CHANNELS, 4, vmstate_info_bool, bool),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_s5l8930_cdma_extended,
+        NULL
     }
 };
 
@@ -1589,14 +1646,6 @@ static void s5l8930_cdma_realize(DeviceState *dev, Error **errp)
         return;
     }
     memory_region_set_size(&s->cdma_mem, (uint64_t)s->num_channels << CDMA_CHAN_SHIFT);
-    if (s->num_channels != CDMA_LEGACY_CHANNELS || s->skg_probe) {
-        /* Keep the existing A4 migration wire unchanged. The experimental
-         * A6 variant must not silently lose its additional channel state. */
-        error_setg(&s->migration_blocker, "CDMA extended-channel migration is not implemented");
-        if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
-            return;
-        }
-    }
     if (!s->gid_path) {
         return;
     }

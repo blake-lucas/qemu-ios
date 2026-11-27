@@ -6,6 +6,7 @@
 #define HW_MISC_IOS_BASEBAND_H
 
 #include "hw/misc/ios_baseband_core.h"
+#include "migration/vmstate.h"
 #include "chardev/char.h"
 #include "net/net.h"
 
@@ -57,5 +58,8 @@ bool ios_baseband_spi_srdy(DeviceState *dev);
 void ios_baseband_spi_done(DeviceState *dev, const uint8_t *unread_miso);
 void ios_baseband_spi_request(DeviceState *dev);
 void ios_baseband_spi_set_ready(DeviceState *dev, void (*cb)(void *), void *opaque);
+
+/* A call's state in a save state, for the modems that keep calls of their own (the iPhone 5's MDM9x15). */
+extern const VMStateDescription vmstate_ios_bb_call;
 
 #endif

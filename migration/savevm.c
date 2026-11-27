@@ -1050,6 +1050,9 @@ static int vmstate_save(QEMUFile *f, SaveStateEntry *se, JSONWriter *vmdesc,
         trace_savevm_section_skip(se->idstr, se->section_id);
         return 0;
     }
+    if (savevm_log()) {
+        fprintf(stderr, "[state] save %s/%u\n", se->idstr, se->instance_id);
+    }
 
     trace_savevm_section_start(se->idstr, se->section_id);
     save_section_header(f, se, QEMU_VM_SECTION_FULL);
@@ -3491,11 +3494,13 @@ int savevm_to_channel(QIOChannel *ioc, Error **errp)
     if (!migrate_can_snapshot(errp) || migration_is_blocked(errp)) {
         return -EINVAL;
     }
-    bdrv_drain_all_begin();
+    /*
+     * No drained section, unlike save_snapshot: the stopped VM's requests are done (vm_stop drained them), and a
+     * device's pre_save may flush its storage (the A4 IOP's NAND), which would wait on a drain forever.
+     */
     f = qemu_file_new_output(ioc);
     ret = qemu_savevm_state(f, errp);
     ret2 = qemu_fclose(f);
-    bdrv_drain_all_end();
     if (ret == 0 && ret2 < 0) {
         error_setg_errno(errp, -ret2, "Error while writing VM state");
         ret = ret2;
@@ -3513,19 +3518,18 @@ int loadvm_from_channel(QIOChannel *ioc, Error **errp)
     if (!migrate_can_snapshot(errp)) {
         return -EINVAL;
     }
-    bdrv_drain_all_begin();
+    /* Nor here: a device's post_load may write its storage (the NOR's whole copy). */
+    bdrv_drain_all();
     f = qemu_file_new_input(ioc);
     qemu_system_reset(SHUTDOWN_CAUSE_SNAPSHOT_LOAD);
     mis->from_src_file = f;
     if (!yank_register_instance(MIGRATION_YANK_INSTANCE, errp)) {
         mis->from_src_file = NULL;
         qemu_fclose(f);
-        bdrv_drain_all_end();
         return -EINVAL;
     }
     ret = qemu_loadvm_state(f, errp);
     migration_incoming_state_destroy();     /* closes f */
-    bdrv_drain_all_end();
     return ret;
 }
 

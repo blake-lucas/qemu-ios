@@ -1034,6 +1034,31 @@ void qemu_ios_ui_vm_stopped(void)
 
 static uint64_t ios_state_ram_total;     /* the machine's RAM, for a save's progress estimate */
 
+/*
+ * LT_STATE_AUDIT=1: at start, every realized device of the machine whose class carries no VMState, on stderr. Such a
+ * device's registers are not in a save state (unless it registers its state another way): after a load it holds its
+ * reset values. For checking a board's save-state coverage.
+ */
+static int ios_state_audit_one(Object *obj, void *opaque)
+{
+    DeviceState *dev = (DeviceState *)object_dynamic_cast(obj, TYPE_DEVICE);
+
+    if (dev && dev->realized && !DEVICE_GET_CLASS(dev)->vmsd) {
+        g_autofree char *path = object_get_canonical_path(obj);
+        fprintf(stderr, "[state-audit] no vmsd: %s (%s)\n", object_get_typename(obj), path ? path : "?");
+    }
+    return 0;
+}
+
+static void ios_state_audit(void)
+{
+    const char *v = getenv("LT_STATE_AUDIT");
+
+    if (v && *v && strcmp(v, "0")) {
+        object_child_foreach_recursive(object_get_root(), ios_state_audit_one, NULL);
+    }
+}
+
 void qemu_ios_ui_vm_started(void)
 {
     int i;
@@ -1042,6 +1067,7 @@ void qemu_ios_ui_vm_started(void)
         return;
     }
     ios_state_ram_total = ram_bytes_total();
+    ios_state_audit();
     ios.con = qemu_console_lookup_by_index(0);
     qatomic_set(&ios_is_ipad1, object_dynamic_cast(qdev_get_machine(),
                                                    MACHINE_TYPE_NAME("ipad1")) != NULL);
