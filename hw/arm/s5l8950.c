@@ -1762,7 +1762,8 @@ static void a6_uart_rxdma(void *opaque, int pin, int level)
  * What the host hears from the speaker port: the CS35L19's volume, which carries the Ringer's level on the speaker
  * (cs35l19.c), except while the headphone port plays unmuted. With a headphone in, 14G61 rings through both, the
  * headphones at their own level (cs42l65_output_gain), and the host hears the headphones, as on the iPhone 4 and the
- * iPod touch 4G (cs42l58_output_gain); a sound iOS sends to the speaker alone still plays.
+ * iPod touch 4G (cs42l58_output_gain). i2s0 streams silence between sounds while a headphone is in, so a sound iOS
+ * sent to the speaker alone would be muted too; none was seen with rings, texts and lock sounds.
  */
 static double a6_speaker_gain(void *opaque)
 {
