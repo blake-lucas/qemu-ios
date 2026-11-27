@@ -275,6 +275,10 @@ static void gles_native_copy_tex_image(GLenum target, GLint level, GLenum intern
         GLESEGLTexture *texture=gles_native_bound_texture(target);
         if (texture) { texture->width=w; texture->height=h; }
     }
+    /* The framebuffer's pixels are the level's: an RGB(A) level reads back; an alpha or luminance one keeps zeros. */
+    if (!error) gles_native_level_set(gles_native_target(target),level,internal,w,h,
+                                      internal==GL_RGB ? GL_RGB : internal==GL_RGBA ? GL_RGBA : internal,
+                                      GL_UNSIGNED_BYTE,NULL);
     gles_native_texture_finish(target,old);
 }
 static void gles_native_copy_tex_sub_image(GLenum target, GLint level, GLint xoff, GLint yoff,

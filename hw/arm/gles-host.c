@@ -833,9 +833,9 @@ static Error *gles_save_blocker;
 
 static bool gles_begin_context(void)
 {
-#if defined(GLES_HOST_EAGL) || defined(GLES_HOST_EGL_ES)
-    /* The legacy desktop GL backends (CGL, WGL, and EGL's desktop GL context on Linux) save live GL state
-     * (gles-host-snapshot.c.inc); the iOS-host EAGL and native GLES backends cannot yet. */
+#if defined(GLES_HOST_EAGL) && !defined(GLES_HOST_EGL_ES)
+    /* The desktop GL backends (CGL, WGL, EGL's desktop GL context on Linux) and Android's native ES one save live
+     * GL state (gles-host-snapshot.c.inc); the iOS-host EAGL and ANGLE backends cannot yet. */
     if (!qatomic_read(&gles_live_contexts)) {
         error_setg(&gles_save_blocker,
                    "Live OpenGL ES state cannot be saved (including accelerated system UI)");
@@ -12040,7 +12040,7 @@ static int64_t gles_context_operation(unsigned slot, unsigned ctx, unsigned argc
 }
 
 static void gles_drop_all(void);
-#if defined(GLES_HOST_ANGLE) || defined(GLES_HOST_EGL_ES)
+#if defined(GLES_HOST_ANGLE)
 static void gles_snapshot_register(void) {} /* migration blocker is held for live native GLES state */
 #else
 #include "gles-host-snapshot.c.inc"

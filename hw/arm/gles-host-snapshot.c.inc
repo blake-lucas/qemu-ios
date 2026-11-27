@@ -1,7 +1,7 @@
 /*
- * Saving and restoring live GL state (#included by gles-host.c, CGL backend).
+ * Saving and restoring live GL state (#included by gles-host.c: the desktop GL backends, and Android's native ES).
  *
- * The state lives in host CGL contexts, which QEMU cannot serialize, so it is
+ * The state lives in host GL contexts, which QEMU cannot serialize, so it is
  * read back through GL at save time and rebuilt through GL at load time:
  *
  *   - share groups and contexts keep their handles (the guest holds them);
@@ -27,6 +27,34 @@
 #define SNAP_SCAN_GAP 256            /* names probed past the last live one */
 
 static uint32_t gles_group_handle(GLESGroup *group);
+
+/*
+ * The native ES backend (GLES_HOST_EGL_ES) runs each guest context in a host context of its own API: an ES1 one has
+ * no programs, an ES2 one no fixed function, and on Android a call outside the context's API jumps to address 0
+ * (gles_native_BlendEquation). snap_fixed and snap_shaders say which state the current context has; a desktop
+ * compatibility context has both. ES also reads no texture back: see snap_put_textures_es.
+ */
+#ifdef GLES_HOST_EGL_ES
+static bool snap_fixed(void) { return gh.api_version != 2; }
+static bool snap_shaders(void) { return gh.api_version == 2; }
+#ifndef GL_SOURCE0_RGB
+#define GL_SOURCE0_RGB GL_SRC0_RGB
+#define GL_SOURCE0_ALPHA GL_SRC0_ALPHA
+#endif
+#ifndef GL_POINT_SPRITE
+#define GL_POINT_SPRITE GL_POINT_SPRITE_OES
+#define GL_COORD_REPLACE GL_COORD_REPLACE_OES
+#endif
+#ifndef GL_RENDERBUFFER_INTERNAL_FORMAT_EXT
+#define GL_RENDERBUFFER_INTERNAL_FORMAT_EXT GL_RENDERBUFFER_INTERNAL_FORMAT
+#endif
+#ifndef GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL_EXT
+#define GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL_EXT GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL
+#endif
+#else
+static bool snap_fixed(void) { return true; }
+static bool snap_shaders(void) { return true; }
+#endif
 
 typedef struct { GByteArray *b; } SnapW;
 typedef struct { const uint8_t *p; size_t n, off; bool bad; } SnapR;
@@ -156,9 +184,10 @@ static void snap_set_stack(GLenum mode, GLenum depth_pname, GLint depth, GLfloat
     }
 }
 
+static void snap_capture_fixed(GLESCtxGL *s);
+
 static void snap_capture_gl(GLESCtxGL *s)
 {
-    GLint mode = GL_MODELVIEW;
     memset(s, 0, sizeof(*s));
     glGetIntegerv(GL_VIEWPORT, s->viewport);
     glGetIntegerv(GL_SCISSOR_BOX, s->scissor);
@@ -170,14 +199,15 @@ static void snap_capture_gl(GLESCtxGL *s)
     glGetBooleanv(GL_DEPTH_WRITEMASK, &s->depth_mask);
     glGetBooleanv(GL_SAMPLE_COVERAGE_INVERT, &s->sample_inv);
     glGetIntegerv(GL_STENCIL_WRITEMASK, &s->stencil_wm);
-    glGetIntegerv(GL_STENCIL_BACK_WRITEMASK, &s->stencil_back_wm);
+    s->stencil_back_wm = s->stencil_wm;
+    if (snap_shaders()) glGetIntegerv(GL_STENCIL_BACK_WRITEMASK, &s->stencil_back_wm);
     glGetIntegerv(GL_BLEND_SRC_RGB, &s->blend_src_rgb);
     glGetIntegerv(GL_BLEND_DST_RGB, &s->blend_dst_rgb);
     glGetIntegerv(GL_BLEND_SRC_ALPHA, &s->blend_src_a);
     glGetIntegerv(GL_BLEND_DST_ALPHA, &s->blend_dst_a);
     glGetIntegerv(GL_BLEND_EQUATION_RGB, &s->blend_eq_rgb);
     glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &s->blend_eq_a);
-    glGetFloatv(GL_BLEND_COLOR, s->blend_color);
+    if (snap_shaders()) glGetFloatv(GL_BLEND_COLOR, s->blend_color);
     glGetIntegerv(GL_DEPTH_FUNC, &s->depth_func);
     glGetIntegerv(GL_CULL_FACE_MODE, &s->cull_mode);
     glGetIntegerv(GL_FRONT_FACE, &s->front_face);
@@ -189,20 +219,53 @@ static void snap_capture_gl(GLESCtxGL *s)
                                      GL_STENCIL_BACK_PASS_DEPTH_PASS };
         for (int i = 0; i < 6; i++) {
             glGetIntegerv(f[i], &s->st[0][i]);
-            glGetIntegerv(b[i], &s->st[1][i]);
+            s->st[1][i] = s->st[0][i];
+            if (snap_shaders()) glGetIntegerv(b[i], &s->st[1][i]);
         }
     }
     glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &s->poly_factor);
     glGetFloatv(GL_POLYGON_OFFSET_UNITS, &s->poly_units);
     glGetFloatv(GL_LINE_WIDTH, &s->line_width);
+    glGetFloatv(GL_SAMPLE_COVERAGE_VALUE, &s->sample_cov);
+    for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) s->enables[i] = glIsEnabled(snap_enables[i]);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &s->active_tex);
+    if (snap_fixed()) {
+        snap_capture_fixed(s);
+    } else {
+        glGetIntegerv(GL_GENERATE_MIPMAP_HINT, &s->hints[ARRAY_SIZE(snap_hints) - 1]);
+        glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &s->units);
+        s->units = MIN(s->units, (GLint)GLES_MAX_TEXUNITS);
+        s->mv_depth = s->proj_depth = 1;    /* no stacks, but snap_gl_ok's bounds */
+        for (int u = 0; u < s->units; u++) {
+            glActiveTexture(GL_TEXTURE0 + u);
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &s->unit[u].bind2d);
+            s->unit[u].mat_depth = 1;
+        }
+        glActiveTexture(s->active_tex);
+    }
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &s->fbo);
+    glGetIntegerv(GL_RENDERBUFFER_BINDING_EXT, &s->rb);
+    if (snap_shaders()) {
+        glGetIntegerv(GL_CURRENT_PROGRAM, &s->program);
+        for (unsigned i = 1; i < GLES_MAX_ATTRIBS; i++) {
+            glGetVertexAttribfv(i, GL_CURRENT_VERTEX_ATTRIB, s->vattr[i]);
+        }
+    }
+    while (glGetError() != GL_NO_ERROR) {
+        /* pnames a context does not know leave their zero */
+    }
+}
+
+/* The fixed-function state, with the texture units' environments and the matrix stacks. */
+static void snap_capture_fixed(GLESCtxGL *s)
+{
+    GLint mode = GL_MODELVIEW;
     glGetFloatv(GL_POINT_SIZE, &s->point_size);
     glGetIntegerv(GL_ALPHA_TEST_FUNC, &s->alpha_func);
     glGetFloatv(GL_ALPHA_TEST_REF, &s->alpha_ref);
-    glGetFloatv(GL_SAMPLE_COVERAGE_VALUE, &s->sample_cov);
     glGetIntegerv(GL_SHADE_MODEL, &s->shade_model);
     glGetIntegerv(GL_LOGIC_OP_MODE, &s->logic_op);
     for (unsigned i = 0; i < ARRAY_SIZE(snap_hints); i++) glGetIntegerv(snap_hints[i], &s->hints[i]);
-    for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) s->enables[i] = glIsEnabled(snap_enables[i]);
 
     for (int i = 0; i < 8; i++) {
         SnapLight *l = &s->light[i];
@@ -237,7 +300,7 @@ static void snap_capture_gl(GLESCtxGL *s)
     glGetFloatv(GL_POINT_DISTANCE_ATTENUATION, s->pt_att);
     glGetFloatv(GL_POINT_FADE_THRESHOLD_SIZE, &s->pt_fade);
     for (int i = 0; i < 6; i++) {
-        GLdouble eq[4];
+        double eq[4] = { 0 };
         glGetClipPlane(GL_CLIP_PLANE0 + i, eq);
         for (int k = 0; k < 4; k++) s->clip[i][k] = eq[k];
     }
@@ -248,7 +311,6 @@ static void snap_capture_gl(GLESCtxGL *s)
     snap_get_stack(GL_PROJECTION, GL_PROJECTION_STACK_DEPTH, GL_PROJECTION_MATRIX,
                    &s->proj_depth, s->proj, SNAP_AUX_DEPTH);
 
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &s->active_tex);
     glGetIntegerv(GL_MAX_TEXTURE_UNITS, &s->units);
     s->units = MIN(s->units, (GLint)GLES_MAX_TEXUNITS);
     for (int u = 0; u < s->units; u++) {
@@ -277,15 +339,6 @@ static void snap_capture_gl(GLESCtxGL *s)
     }
     glActiveTexture(s->active_tex);
     glMatrixMode(mode);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &s->fbo);
-    glGetIntegerv(GL_RENDERBUFFER_BINDING_EXT, &s->rb);
-    glGetIntegerv(GL_CURRENT_PROGRAM, &s->program);
-    for (unsigned i = 1; i < GLES_MAX_ATTRIBS; i++) {
-        glGetVertexAttribfv(i, GL_CURRENT_VERTEX_ATTRIB, s->vattr[i]);
-    }
-    while (glGetError() != GL_NO_ERROR) {
-        /* pnames a context does not know leave their zero */
-    }
 }
 
 /* The counts snap_apply_gl indexes its arrays with, as snap_capture_gl bounds them. */
@@ -309,6 +362,8 @@ static void snap_set_enable(GLenum cap, GLboolean on)
     if (on) glEnable(cap); else glDisable(cap);
 }
 
+static void snap_apply_fixed(const GLESCtxGL *s);
+
 static void snap_apply_gl(const GLESCtxGL *s)
 {
     glViewport(s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3]);
@@ -319,28 +374,56 @@ static void snap_apply_gl(const GLESCtxGL *s)
     glClearStencil(s->clear_stencil);
     glColorMask(s->color_mask[0], s->color_mask[1], s->color_mask[2], s->color_mask[3]);
     glDepthMask(s->depth_mask);
-    glStencilMaskSeparate(GL_FRONT, s->stencil_wm);
-    glStencilMaskSeparate(GL_BACK, s->stencil_back_wm);
     glBlendFuncSeparate(s->blend_src_rgb, s->blend_dst_rgb, s->blend_src_a, s->blend_dst_a);
     glBlendEquationSeparate(s->blend_eq_rgb, s->blend_eq_a);
-    glBlendColor(s->blend_color[0], s->blend_color[1], s->blend_color[2], s->blend_color[3]);
+    if (snap_shaders()) {
+        glStencilMaskSeparate(GL_FRONT, s->stencil_wm);
+        glStencilMaskSeparate(GL_BACK, s->stencil_back_wm);
+        glBlendColor(s->blend_color[0], s->blend_color[1], s->blend_color[2], s->blend_color[3]);
+        for (int f = 0; f < 2; f++) {
+            GLenum face = f ? GL_BACK : GL_FRONT;
+            glStencilFuncSeparate(face, s->st[f][0], s->st[f][1], s->st[f][2]);
+            glStencilOpSeparate(face, s->st[f][3], s->st[f][4], s->st[f][5]);
+        }
+    } else {
+        glStencilMask(s->stencil_wm);
+        glStencilFunc(s->st[0][0], s->st[0][1], s->st[0][2]);
+        glStencilOp(s->st[0][3], s->st[0][4], s->st[0][5]);
+    }
     glDepthFunc(s->depth_func);
     glCullFace(s->cull_mode);
     glFrontFace(s->front_face);
-    for (int f = 0; f < 2; f++) {
-        GLenum face = f ? GL_BACK : GL_FRONT;
-        glStencilFuncSeparate(face, s->st[f][0], s->st[f][1], s->st[f][2]);
-        glStencilOpSeparate(face, s->st[f][3], s->st[f][4], s->st[f][5]);
-    }
     glPolygonOffset(s->poly_factor, s->poly_units);
     glLineWidth(s->line_width);
+    glSampleCoverage(s->sample_cov, s->sample_inv);
+    for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) snap_set_enable(snap_enables[i], s->enables[i]);
+    if (snap_fixed()) {
+        snap_apply_fixed(s);
+    } else {
+        glHint(GL_GENERATE_MIPMAP_HINT, s->hints[ARRAY_SIZE(snap_hints) - 1]);
+        for (int u = 0; u < s->units; u++) {
+            glActiveTexture(GL_TEXTURE0 + u);
+            glBindTexture(GL_TEXTURE_2D, s->unit[u].bind2d);
+        }
+    }
+    glActiveTexture(s->active_tex ? s->active_tex : GL_TEXTURE0);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, s->fbo);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, s->rb);
+    if (snap_shaders()) {
+        glUseProgram(s->program);
+        for (unsigned i = 1; i < GLES_MAX_ATTRIBS; i++) glVertexAttrib4fv(i, s->vattr[i]);
+    }
+    while (glGetError() != GL_NO_ERROR) {
+    }
+}
+
+static void snap_apply_fixed(const GLESCtxGL *s)
+{
     glPointSize(s->point_size);
     glAlphaFunc(s->alpha_func, s->alpha_ref);
-    glSampleCoverage(s->sample_cov, s->sample_inv);
     glShadeModel(s->shade_model);
     glLogicOp(s->logic_op);
     for (unsigned i = 0; i < ARRAY_SIZE(snap_hints); i++) glHint(snap_hints[i], s->hints[i]);
-    for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) snap_set_enable(snap_enables[i], s->enables[i]);
 
     /* Positions, spot directions and clip planes were read in eye space; set
      * them under an identity modelview so they come back unchanged. */
@@ -362,24 +445,24 @@ static void snap_apply_gl(const GLESCtxGL *s)
         glLightf(n, GL_QUADRATIC_ATTENUATION, l->att[2]);
     }
     for (int i = 0; i < 6; i++) {
-        GLdouble eq[4] = { s->clip[i][0], s->clip[i][1], s->clip[i][2], s->clip[i][3] };
+        double eq[4] = { s->clip[i][0], s->clip[i][1], s->clip[i][2], s->clip[i][3] };
         glClipPlane(GL_CLIP_PLANE0 + i, eq);
     }
     glPopMatrix();
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, s->lm_amb);
-    glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, s->lm_two);
+    glLightModelf(GL_LIGHT_MODEL_TWO_SIDE, (GLfloat)s->lm_two);
     glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, s->mat_amb);
     glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, s->mat_dif);
     glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, s->mat_spec);
     glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, s->mat_emi);
     glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, s->mat_shin);
-    glFogi(GL_FOG_MODE, s->fog_mode);
+    glFogf(GL_FOG_MODE, (GLfloat)s->fog_mode);
     glFogf(GL_FOG_DENSITY, s->fog_density);
     glFogf(GL_FOG_START, s->fog_start);
     glFogf(GL_FOG_END, s->fog_end);
     glFogfv(GL_FOG_COLOR, s->fog_color);
-    glColor4fv(s->cur_color);
-    glNormal3fv(s->cur_normal);
+    glColor4f(s->cur_color[0], s->cur_color[1], s->cur_color[2], s->cur_color[3]);
+    glNormal3f(s->cur_normal[0], s->cur_normal[1], s->cur_normal[2]);
     glPointParameterf(GL_POINT_SIZE_MIN, s->pt_min);
     glPointParameterf(GL_POINT_SIZE_MAX, s->pt_max);
     glPointParameterfv(GL_POINT_DISTANCE_ATTENUATION, s->pt_att);
@@ -401,22 +484,15 @@ static void snap_apply_gl(const GLESCtxGL *s)
         glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, t->rgb_scale);
         glTexEnvf(GL_TEXTURE_ENV, GL_ALPHA_SCALE, t->a_scale);
         glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, t->coord_replace);
-        glMultiTexCoord4fv(GL_TEXTURE0 + u, t->cur_tex);
+        glMultiTexCoord4f(GL_TEXTURE0 + u, t->cur_tex[0], t->cur_tex[1], t->cur_tex[2], t->cur_tex[3]);
         snap_set_enable(GL_TEXTURE_2D, t->tex2d);
         snap_set_enable(GL_TEXTURE_RECTANGLE_ARB, t->rect);
         glBindTexture(GL_TEXTURE_2D, t->bind2d);
         glBindTexture(GL_TEXTURE_RECTANGLE_ARB, t->bindrect);
         snap_set_stack(GL_TEXTURE, GL_TEXTURE_STACK_DEPTH, t->mat_depth, (GLfloat (*)[16])t->mat);
     }
-    glActiveTexture(s->active_tex ? s->active_tex : GL_TEXTURE0);
     snap_set_stack(GL_PROJECTION, GL_PROJECTION_STACK_DEPTH, s->proj_depth, (GLfloat (*)[16])s->proj);
     snap_set_stack(GL_MODELVIEW, GL_MODELVIEW_STACK_DEPTH, s->mv_depth, (GLfloat (*)[16])s->mv);
-    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, s->fbo);
-    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, s->rb);
-    glUseProgram(s->program);
-    for (unsigned i = 1; i < GLES_MAX_ATTRIBS; i++) glVertexAttrib4fv(i, s->vattr[i]);
-    while (glGetError() != GL_NO_ERROR) {
-    }
 }
 
 /* ---- per-namespace objects ------------------------------------------------ */
@@ -517,6 +593,197 @@ static bool snap_scan(GLuint *name, GLuint *gap)
     return *gap < SNAP_SCAN_GAP;
 }
 
+#ifdef GLES_HOST_EGL_ES
+/*
+ * ES has no glGetTexImage and no level queries, so the native layer keeps each level's size and format
+ * (GLESEGLLevel). An RGB or RGBA level is read through a framebuffer and comes back as RGBA bytes; the layer kept
+ * the bytes of the others; a level glGenerateMipmap made is made again, as is one a framebuffer can't read (ES 2.0
+ * attaches level 0 only without OES_fbo_render_mipmap). Cube maps aren't kept (nor on the desktop).
+ */
+static bool snap_es_read_level(GLenum target, GLuint name, GLint level, GLsizei w, GLsizei h, uint8_t *px)
+{
+    GLuint fb = 0;
+    GLint old = 0, pack = 4;
+    GLenum status;
+
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &old);
+    glGenFramebuffersEXT(1, &fb);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fb);
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, target, name, level);
+    status = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
+    if (status == GL_FRAMEBUFFER_COMPLETE_EXT) {
+        glGetIntegerv(GL_PACK_ALIGNMENT, &pack);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glPixelStorei(GL_PACK_ALIGNMENT, pack);
+        if (glGetError() != GL_NO_ERROR) status = 0;
+    }
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, target, 0, 0);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, old);
+    glDeleteFramebuffersEXT(1, &fb);
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    return status == GL_FRAMEBUFFER_COMPLETE_EXT;
+}
+
+/* A drawable's color texture held in an AHardwareBuffer had no upload to record: its size is the drawable's. */
+static bool snap_es_drawable_level(GLuint name, GLESEGLLevel *l)
+{
+    GHashTableIter it;
+    gpointer v;
+    GLESHost *h = &gh_legacy;
+
+    if (gles_contexts) g_hash_table_iter_init(&it, gles_contexts);
+    for (;;) {
+        if (h->inited && h->cgl && h->cgl->textures == gles_egl_current->textures && h->tex == name &&
+            h->drawable_width && h->drawable_height) {
+            *l = (GLESEGLLevel){ h->drawable_width, h->drawable_height, GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE };
+            return true;
+        }
+        if (!gles_contexts || !g_hash_table_iter_next(&it, NULL, &v)) return false;
+        h = v;
+    }
+}
+
+static void snap_put_textures(SnapW *w)
+{
+    GByteArray *body = g_byte_array_new();
+    SnapW tw = { body };
+    uint32_t count = 0;
+    GArray *names = g_array_new(false, false, sizeof(GLuint));
+    static bool cube_said;
+
+    sw32(w, gles_egl_current->textures->next_name);
+    /* Names first: binding one can free another the layer was keeping only for a binding. */
+    for (GLESEGLTexture *t = gles_egl_current->textures->head; t; t = t->next) {
+        if (t->deleted || t->hidden || !t->name) continue;
+        if (t->target == GL_TEXTURE_2D || t->target == GL_TEXTURE_RECTANGLE_ARB) {
+            g_array_append_val(names, t->name);
+        } else if (t->target && !cube_said) {
+            cube_said = true;
+            fprintf(stderr, "[gles] snapshot: texture %u has an unsupported target 0x%x; dropped\n", t->name,
+                    t->target);
+        }
+    }
+    for (guint i = 0; i < names->len; i++) {
+        static const GLenum p[] = { GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S,
+                                    GL_TEXTURE_WRAP_T, GL_GENERATE_MIPMAP, GL_TEXTURE_MAX_LEVEL };
+        GLuint name = g_array_index(names, GLuint, i);
+        GLESEGLTexture *t = gles_native_texture(name, false);
+        GLenum target;
+
+        if (!t) continue;
+        target = t->target;
+        glBindTexture(target, name);
+        count++;
+        sw32(&tw, name);
+        sw32(&tw, target);
+        for (unsigned k = 0; k < ARRAY_SIZE(p); k++) {
+            GLint v = INT32_MIN; /* a parameter this context doesn't have stays as it is on load */
+            if (k < 4 || (k == 4 && snap_fixed())) glGetTexParameteriv(target, p[k], &v);
+            sw32(&tw, v);
+        }
+        while (glGetError() != GL_NO_ERROR) {
+        }
+        for (GLint lvl = 0; lvl < GLES_EGL_LEVELS; lvl++) {
+            GLESEGLLevel l;
+            bool generated;
+            g_autofree uint8_t *px = NULL;
+            const void *bytes = NULL;
+            uint32_t len = 0;
+
+            t = gles_native_texture(name, false);
+            if (!t) break;
+            l = t->level[lvl];
+            generated = l.generated;
+            if (!l.width && !(lvl == 0 && snap_es_drawable_level(name, &l))) continue;
+            if (!generated && l.shadow) {
+                bytes = l.shadow;
+                len = (uint32_t)((size_t)l.width * l.height * gles_native_level_bpp(l.format, l.type));
+            } else if (!generated) {
+                px = g_malloc((size_t)l.width * l.height * 4);
+                if (snap_es_read_level(target, name, lvl, l.width, l.height, px)) {
+                    bytes = px;
+                    len = l.width * l.height * 4;
+                    l.internal = l.format = GL_RGBA;
+                    l.type = GL_UNSIGNED_BYTE;
+                } else if (lvl > 0) {
+                    generated = true;
+                } else {
+                    fprintf(stderr, "[gles] snapshot: texture %u (0x%x/0x%x) can't be read; dropped\n", name,
+                            l.format, l.type);
+                    continue;
+                }
+            }
+            sw32(&tw, lvl + 1);
+            sw32(&tw, l.width);
+            sw32(&tw, l.height);
+            sw32(&tw, l.internal);
+            sw32(&tw, l.format);
+            sw32(&tw, l.type);
+            sw32(&tw, generated);
+            swbytes(&tw, bytes, len);
+        }
+        sw32(&tw, 0);
+    }
+    g_array_free(names, true);
+    sw32(w, count);
+    g_byte_array_append(w->b, body->data, body->len);
+    g_byte_array_free(body, true);
+}
+
+static void snap_get_textures(SnapR *r)
+{
+    uint32_t next = sr32(r), n = sr32(r);
+
+    gles_egl_current->textures->next_name = MAX(gles_egl_current->textures->next_name, next);
+    for (uint32_t i = 0; i < n && !r->bad; i++) {
+        GLuint name = sr32(r);
+        GLenum target = sr32(r);
+        GLint p[6];
+        bool generated = false;
+
+        for (int k = 0; k < 6; k++) p[k] = sr32(r);
+        if (r->bad || !name || (target != GL_TEXTURE_2D && target != GL_TEXTURE_RECTANGLE_ARB)) {
+            r->bad = true;
+            break;
+        }
+        glBindTexture(target, name);
+        /* Parameters first: GENERATE_MIPMAP (ES1) remakes the chain as level 0 arrives. */
+        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, p[0]);
+        glTexParameteri(target, GL_TEXTURE_MAG_FILTER, p[1]);
+        glTexParameteri(target, GL_TEXTURE_WRAP_S, p[2]);
+        glTexParameteri(target, GL_TEXTURE_WRAP_T, p[3]);
+        if (p[4] != INT32_MIN && target == GL_TEXTURE_2D) glTexParameteri(target, GL_GENERATE_MIPMAP, p[4]);
+        for (uint32_t lvl; (lvl = sr32(r)) && !r->bad;) {
+            GLint wd = sr32(r), ht = sr32(r);
+            GLenum internal = sr32(r), format = sr32(r), type = sr32(r);
+            bool made = sr32(r);
+            uint32_t len;
+            const uint8_t *px = srbytes(r, &len);
+
+            if (lvl > GLES_EGL_LEVELS || wd <= 0 || ht <= 0 || wd > 4096 || ht > 4096) {
+                r->bad = true;
+                break;
+            }
+            if (made) {
+                generated = true;
+                continue;
+            }
+            if (px && (uint64_t)wd * ht * gles_native_level_bpp(format, type) == len &&
+                gles_charge_texture(target, lvl - 1, len)) {
+                gles_tex_charge.table = NULL;
+                glTexImage2D(target, lvl - 1, internal, wd, ht, 0, format, type, px);
+            }
+        }
+        if (generated && target == GL_TEXTURE_2D) glGenerateMipmapEXT(target);
+        while (glGetError() != GL_NO_ERROR) {
+        }
+    }
+}
+#else
 static void snap_put_textures(SnapW *w)
 {
     GByteArray *body = g_byte_array_new();
@@ -621,6 +888,7 @@ static void snap_get_textures(SnapR *r)
         glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, p[5]);
     }
 }
+#endif
 
 static void snap_put_renderbuffers(SnapW *w)
 {
@@ -688,11 +956,16 @@ static void snap_put_framebuffers(SnapW *w)
                 GLint rect = 0;
                 glGetFramebufferAttachmentParameterivEXT(GL_FRAMEBUFFER_EXT, snap_attachments[i],
                     GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL_EXT, &lvl);
+#ifdef GLES_HOST_EGL_ES
+                GLESEGLTexture *t = obj ? gles_native_texture(obj, false) : NULL;
+                rect = t && t->target == GL_TEXTURE_RECTANGLE_ARB;
+#else
                 /* The texture target is not an attachment query in GL 2.1:
                  * a rectangle texture refuses a 2D bind. */
                 glBindTexture(GL_TEXTURE_RECTANGLE_ARB, obj);
                 rect = glGetError() == GL_NO_ERROR;
                 glBindTexture(GL_TEXTURE_RECTANGLE_ARB, 0);
+#endif
                 target = rect ? GL_TEXTURE_RECTANGLE_ARB : GL_TEXTURE_2D;
             }
             sw32(&fw, type);
@@ -734,6 +1007,11 @@ static void snap_put_glsl(SnapW *w)
     gpointer k, v;
 
     sw32(w, *next);
+    /* An ES1 context has no programs to ask about (and none in its table: iOS shares no objects across APIs). */
+    if (!snap_shaders()) {
+        sw32(w, 0);
+        return;
+    }
     sw32(w, *t ? g_hash_table_size(*t) : 0);
     if (!*t) return;
     for (int pass = 0; pass < 2; pass++) {
@@ -888,7 +1166,11 @@ static void snap_get_glsl(SnapR *r)
             GLint loc = (GLint)sr32(r);
             if (loc >= 0) glBindAttribLocation(pr, loc, name);
         }
+#ifdef GLES_HOST_EGL_ES
+        if (linked) { glLinkProgram(pr); gles_fetch_link(pr); }
+#else
         if (linked) { gles_link_program(pr); gles_fetch_link(pr); }
+#endif
         for (uint32_t k = 0; k < MIN(nsh, 16); k++) glDeleteShader(shs[k]);  /* freed with the program */
         g_hash_table_insert(*t, GUINT_TO_POINTER(guest), GUINT_TO_POINTER(pr));
         uint32_t nuni = sr32(r);
@@ -1276,6 +1558,22 @@ static uint32_t snap_get_tables(SnapR *r, GHashTable *buffers, GHashTable *surfa
 
 /* Queries are context-local. Ended results are materialized; an active query
  * is split at the snapshot boundary and its partial result is accumulated. */
+#ifdef GLES_HOST_EGL_ES
+/* The native ES backend has no occlusion queries (gles_query_* are the desktop's). */
+static void snap_put_queries(SnapW *w, GLESHost *h)
+{
+    sw32(w, 0);
+    sw32(w, 0);
+    sw32(w, 0);
+}
+static void snap_get_queries(SnapR *r, GLESHost *h)
+{
+    sr32(r);
+    sr32(r);
+    if (sr32(r)) r->bad = true;
+}
+static void snap_restore_queries(GLESHost *h) {}
+#else
 static void snap_put_query(SnapW *w, GLESHost *h, uint32_t id, GLESQuery *q, bool deleted)
 {
     GLuint result=0;
@@ -1323,6 +1621,7 @@ static void snap_restore_queries(GLESHost *h)
     GLESQuery *active=h->deleted_query?h->deleted_query:g_hash_table_lookup(h->queries,GUINT_TO_POINTER(h->active_query));
     if(active){if(h->deleted_query)glGenQueries(1,&active->host);active->partial=active->saved;active->restored=false;glBeginQuery(GL_SAMPLES_PASSED,active->host);}
 }
+#endif
 
 /* Save one context: its own fields, and when it is the context that carries
  * its namespace's objects, those too. Leaves its GL state as it found it. */
@@ -1405,26 +1704,78 @@ static GByteArray *gles_snapshot_save(void)
 }
 
 /*
- * A context's program as the guest left it current, with what glUseProgram
- * derives from it (its framebuffer fetch uniforms). Programs come back with new
- * host names (snap_get_glsl), and a context's objects may come with a later
- * context of its share group, so this runs once every context is back; the host
- * name snap_apply_gl bound was the old one, which named another program or
- * none.
+ * A context's program as the guest left it current, with what glUseProgram derives from it (its framebuffer fetch
+ * uniforms), and on Android its drawable back in an AHardwareBuffer. Programs come back with new host names
+ * (snap_get_glsl), and a context's objects may come with a later context of its share group, so this runs once every
+ * context is back; the host name snap_apply_gl bound was the old one, which named another program or none.
  */
-static void snap_use_program(GLESHost *h) {
-  GLuint host;
+#ifdef GLES_HOST_AHB
+/*
+ * A restored drawable's color is ordinary texture storage, which the present reads back with glReadPixels. Put it
+ * back in an AHardwareBuffer, as gles_drawable_storage made it, so the present reads the pixels in place again;
+ * they are copied over. Without one (refused, or LT_GLES_NO_IOSURFACE), the readback stays.
+ */
+static void snap_drawable_ahb(GLESHost *h)
+{
+    GLESAhb ahb = { .image = EGL_NO_IMAGE_KHR };
+    GLint texture = 0, framebuffer = 0;
+    GLuint color, old = h->tex;
+    uint32_t w = h->drawable_width, ht = h->drawable_height;
+    bool done = false;
 
-  if (!h->inited || h->failed)
-    return;
-  gh_current = h;
-  CGLSetCurrentContext(h->cgl);
-  host = h->program ? gles_glsl_host(h->program) : 0;
-  glUseProgram(host);
-  h->fetch_sampler = host ? glGetUniformLocation(host, "gles_fetch") : -1;
-  h->fetch_size = host ? glGetUniformLocation(host, "gles_fetch_size") : -1;
-  while (glGetError() != GL_NO_ERROR) {
-  }
+    if (gles_no_iosurface || h->iosurface || !old || !h->fbo || !w || !ht) return;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &framebuffer);
+    color = gles_private_name(glIsTexture);
+    glBindTexture(GL_TEXTURE_2D, color);
+    if (gles_ahb_attach(&ahb, w, ht)) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, h->fbo);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, ht);
+        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, color, 0);
+        done = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) == GL_FRAMEBUFFER_COMPLETE_EXT &&
+               glGetError() == GL_NO_ERROR;
+        if (!done) {
+            glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, old, 0);
+        } else if (h->fbo_color) {
+            glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, h->fbo_color);
+            glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, color, 0);
+        }
+    }
+    if (done) {
+        glDeleteTextures(1, &old);
+        h->tex = color;
+        h->ahb = ahb;
+        h->iosurface = true;
+    } else {
+        gles_ahb_free(&ahb);
+        glDeleteTextures(1, &color);
+    }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)texture == old ? h->tex : (GLuint)texture);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, framebuffer);
+    while (glGetError() != GL_NO_ERROR) {
+    }
+}
+#endif
+
+static void snap_use_program(GLESHost *h)
+{
+    GLuint host;
+
+    if (!h->inited || h->failed) return;
+    gh_current = h;
+    CGLSetCurrentContext(h->cgl);
+#ifdef GLES_HOST_AHB
+    snap_drawable_ahb(h);
+#endif
+    if (!snap_shaders()) return;
+    host = h->program ? gles_glsl_host(h->program) : 0;
+    glUseProgram(host);
+    h->fetch_sampler = host ? glGetUniformLocation(host, "gles_fetch") : -1;
+    h->fetch_size = host ? glGetUniformLocation(host, "gles_fetch_size") : -1;
+    while (glGetError() != GL_NO_ERROR) {
+    }
 }
 
 static bool gles_snapshot_load(const uint8_t *p, size_t n)
@@ -1522,15 +1873,6 @@ static bool gles_snapshot_load(const uint8_t *p, size_t n)
         if (objects) snap_get_objects(&r);
         snap_apply_gl(&s);
         snap_restore_queries(h);
-        /* A restore call the host refused (a value it has no such state for)
-         * must not reach the guest's glGetError, or a game that checks it acts
-         * on an error it never made. */
-        for (GLenum e; (e = glGetError()) != GL_NO_ERROR;) {
-          fprintf(stderr,
-                  "[gles] snapshot: context %08x restored with GL error 0x%x "
-                  "(cleared)\n",
-                  handle, e);
-        }
     }
     if (!r.bad) {
       GHashTableIter it;
