@@ -12371,9 +12371,18 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
  * the first flush, then 5 s in a row under 1 MB/s, sampled at presents -- a second flush packs the
  * steady-state code together. Poco F3, Jetpack Joyride, 30 s of play, interleaved pairs, a fixed-time
  * flush in the menu after loading or in play: 29.3 -> 31.4 fps. Gives up 120 s after the first flush.
+ *
+ * The first-frame flush itself now waits for the same moment (LT_FLUSH_DEFER=off flushes at the
+ * first frame again): an app's first frame often comes in the middle of its launch (Unity's splash,
+ * a launch image), and retranslating everything there slowed the launch that iOS's 20 s watchdog
+ * times. Boomblastica on a desktop slowed to about half speed: launch to its OpenFeint start 15-17 s
+ * and one watchdog kill in six launches, against 11-16 s and none without that flush (issue 24). The
+ * settle flush empties the cache again anyway, so the steady state is the same. A deferred flush that
+ * never sees translation settle still empties the cache when it gives up.
  */
 static struct {
     bool pending;
+    bool deferred;          /* the first-frame flush is still to come: flush on giving up too */
     int64_t start, next;
     size_t base, last;
     int quiet;
@@ -12393,7 +12402,7 @@ static void gles_flush_code_settle(CPUState *cpu, int64_t now)
         log = getenv("LT_FLUSH_SETTLE_LOG") != NULL;
         min_growth = (mb ? atoi(mb) : 16) * MiB;
     }
-    if (!on || !gles_settle.pending || now < gles_settle.next) {
+    if ((!on && !gles_settle.deferred) || !gles_settle.pending || now < gles_settle.next) {
         return;
     }
     gles_settle.next = now + NANOSECONDS_PER_SECOND;
@@ -12411,25 +12420,33 @@ static void gles_flush_code_settle(CPUState *cpu, int64_t now)
     gles_settle.last = size;
     if (gles_settle.quiet >= 5) {
         gles_settle.pending = false;
-        info_report("gles: the app has loaded: emptying the code cache again (%zu MB, %.0f s after "
-                    "its first frame)", size / MiB, (now - gles_settle.start) / 1e9);
+        info_report("gles: the app has loaded: emptying the code cache%s (%zu MB, %.0f s after "
+                    "its first frame)", gles_settle.deferred ? "" : " again", size / MiB,
+                    (now - gles_settle.start) / 1e9);
         queue_tb_flush(cpu);
     } else if (now - gles_settle.start > 120 * NANOSECONDS_PER_SECOND) {
         gles_settle.pending = false;
+        if (gles_settle.deferred) {
+            info_report("gles: the app never settled: emptying the code cache %.0f s after its "
+                        "first frame (%zu MB)", (now - gles_settle.start) / 1e9, size / MiB);
+            queue_tb_flush(cpu);
+        }
     }
 }
 
 static void gles_flush_code_on_app(CPUState *cpu, uint32_t ctx)
 {
-    static int on = -1;
+    static int on = -1, defer;
     static uint32_t last_ctx;
     static int64_t last_ns;
     int64_t now;
 
     if (on < 0) {
         const char *v = getenv("LT_FLUSH_ON_APP");
+        const char *d = getenv("LT_FLUSH_DEFER");
 
         on = tcg_enabled() && (!v || (strcmp(v, "0") && strcmp(v, "off")));
+        defer = !d || (strcmp(d, "0") && strcmp(d, "off"));
     }
     if (!on) {
         return;
@@ -12444,14 +12461,22 @@ static void gles_flush_code_on_app(CPUState *cpu, uint32_t ctx)
         return;
     }
     last_ns = now;
+    gles_settle.pending = true;
+    gles_settle.deferred = defer;
+    gles_settle.start = now;
+    gles_settle.next = now + NANOSECONDS_PER_SECOND;
+    gles_settle.quiet = 0;
+    if (defer) {
+        /* Settled = LT_FLUSH_SETTLE_MB translated since now, then quiet. */
+        gles_settle.base = gles_settle.last = tcg_code_size();
+        info_report("gles: a new app's first frame: the code cache (%zu MB) is emptied once it "
+                    "has loaded", tcg_code_size() / MiB);
+        return;
+    }
     info_report("gles: a new app's first frame: emptying the code cache (%zu MB)",
                 tcg_code_size() / MiB);
     queue_tb_flush(cpu);
-    gles_settle.pending = true;
-    gles_settle.start = now;
-    gles_settle.next = now + NANOSECONDS_PER_SECOND;
     gles_settle.base = gles_settle.last = 0;
-    gles_settle.quiet = 0;
 }
 
 #include "gles-host-queue.c.inc"
