@@ -1020,10 +1020,6 @@ static void a6_iop_write(void *opaque, hwaddr off, uint64_t value,
                   current_cpu == CPU(s->iop_cpu) ? "core" : "AP", (unsigned)off,
                   (unsigned)value);
     s->iop_regs[off / 4] = value;
-    if (getenv("LT_STATE_A6_DEBUG") && off < 0x10) {
-        fprintf(stderr, "[state] A6 IOP %s write +%03x = %08x\n", current_cpu == CPU(s->iop_cpu) ? "core" : "AP",
-                (unsigned)off, (unsigned)value);
-    }
     if (off == 0 && value == 0 && current_cpu != CPU(s->iop_cpu)) {
         /* The native AP stops the IOP before replacing its firmware on wake.
          * Retaining DRAM does not permit the old core to keep executing while
@@ -1801,8 +1797,6 @@ static void a6_uart_rxdma(void *opaque, int pin, int level)
  * files carry their own. Host input (buttons held, the attitude) is not machine state, and the firmware windows are
  * made again from their saved bases.
  */
-static int a6_pre_save_debug(S5L8950State *s);
-
 /* The Secure bank of a Cortex-A9 core's cp15, as one array (save) and back (load). */
 static uint64_t *a6_secure_reg(CPUARMState *env, unsigned i)
 {
@@ -1836,10 +1830,6 @@ static void a6_secure_load(S5L8950State *s)
         }
         for (unsigned i = 0; i < A6_SECURE_REGS; i++) {
             uint64_t *reg = a6_secure_reg(&cores[k]->env, i);
-            if (*reg != s->vm_secure[k][i] && getenv("LT_STATE_A6_DEBUG")) {
-                fprintf(stderr, "[state] A6 %s secure reg %u: CPU state %08" PRIx64 ", saved %08" PRIx64 "\n",
-                        k ? "AE2" : "IOP", i, *reg, s->vm_secure[k][i]);
-            }
             *reg = s->vm_secure[k][i];
         }
         arm_rebuild_hflags(&cores[k]->env);
@@ -1856,7 +1846,7 @@ static int a6_pre_save(void *opaque)
     s->vm_iop_fw_base = s->iop_fw_mapped ? A6_RAM_BASE + s->iop_fw.alias_offset : 0;
     s->vm_ae2_fw_entry = s->ae2_fw_mapped ? A6_RAM_BASE + s->ae2_low_ram.alias_offset : 0;
     a6_secure_save(s);
-    return a6_pre_save_debug(s);
+    return 0;
 }
 
 static int a6_post_load(void *opaque, int version_id)
@@ -1872,8 +1862,6 @@ static int a6_post_load(void *opaque, int version_id)
     for (unsigned i = 0; i < A6_IRQS; i++) {
         a6_set_destination(s, i, s->destination[i]);     /* the per-target words follow from it */
     }
-    fprintf(stderr, "[state] A6: IOP window %d at %08x, AE2 window %d at %08x\n", s->vm_iop_fw, iop_base,
-            s->vm_ae2_fw, ae2_entry);
     if (s->vm_iop_fw) {
         a6_map_iop_firmware(s, iop_base);
     } else {
@@ -1888,76 +1876,6 @@ static int a6_post_load(void *opaque, int version_id)
     qemu_set_irq(s->vibrator, s->vibrator_enable && s->vibrator_pwm);
     a6_irq_update(s);
     a6_ae2_irq_update(s);
-    if (getenv("LT_STATE_A6_DEBUG")) {
-        CPUARMState *env = &s->iop_cpu->env;
-        uint32_t words[4] = {0};
-        address_space_read(cpu_get_address_space(CPU(s->iop_cpu), 0), 0, MEMTXATTRS_UNSPECIFIED, words,
-                           sizeof(words));
-        fprintf(stderr, "[state] A6 IOP: pc %08x cpsr %08x sctlr %08" PRIx64 " ttbr0 %08" PRIx64 " vbar %08" PRIx64
-                " power %d halted %d mem0 %08x %08x %08x %08x\n", env->regs[15], cpsr_read(env),
-                env->cp15.sctlr_el[1], env->cp15.ttbr0_el[1], env->cp15.vbar_el[1], s->iop_cpu->power_state,
-                CPU(s->iop_cpu)->halted, words[0], words[1], words[2], words[3]);
-        {
-            uint32_t secure[2] = {0};
-            int n = 2;
-            address_space_read(cpu_get_address_space(CPU(s->iop_cpu), 1), 0, MEMTXATTRS_UNSPECIFIED, secure,
-                               sizeof(secure));
-            for (int i = 0; i < s->iop_cpu->cpreg_array_len; i++) {
-                const ARMCPRegInfo *ri = get_arm_cp_reginfo(s->iop_cpu->cp_regs, s->iop_cpu->cpreg_indexes[i]);
-                if (ri && !strncmp(ri->name, "DACR", 4)) {
-                    fprintf(stderr, "[state] A6 IOP loaded cpreg %s key %08" PRIx64 " value %08" PRIx64 " type %x\n",
-                            ri->name, s->iop_cpu->cpreg_indexes[i], s->iop_cpu->cpreg_values[i], (unsigned)ri->type);
-                }
-            }
-            fprintf(stderr, "[state] A6 IOP: ases %d secure-as mem0 %08x %08x scr %08" PRIx64 " secure %d sctlr_s %08"
-                    PRIx64 " dacr_s %08" PRIx64 " ttbr0_s %08" PRIx64 "\n", n, secure[0], secure[1],
-                    env->cp15.scr_el3, arm_is_secure(env), env->cp15.sctlr_el[3], env->cp15.dacr_s,
-                    env->cp15.ttbr0_el[3]);
-        }
-        env = &s->ae2_cpu->env;
-        address_space_read(cpu_get_address_space(CPU(s->ae2_cpu), 0), 0, MEMTXATTRS_UNSPECIFIED, words,
-                           sizeof(words));
-        fprintf(stderr, "[state] A6 AE2: pc %08x cpsr %08x sctlr %08" PRIx64 " power %d halted %d mem0 %08x %08x\n",
-                env->regs[15], cpsr_read(env), env->cp15.sctlr_el[1], s->ae2_cpu->power_state,
-                CPU(s->ae2_cpu)->halted, words[0], words[1]);
-    }
-    return 0;
-}
-
-static int a6_pre_save_debug(S5L8950State *s)
-{
-    if (getenv("LT_STATE_A6_DEBUG")) {
-        CPUARMState *env = &s->iop_cpu->env;
-        uint32_t words[4] = {0};
-        address_space_read(cpu_get_address_space(CPU(s->iop_cpu), 0), 0, MEMTXATTRS_UNSPECIFIED, words,
-                           sizeof(words));
-        fprintf(stderr, "[state] A6 IOP at save: pc %08x cpsr %08x sctlr %08" PRIx64 " ttbr0 %08" PRIx64
-                " power %d halted %d mem0 %08x %08x %08x %08x\n", env->regs[15], cpsr_read(env),
-                env->cp15.sctlr_el[1], env->cp15.ttbr0_el[1], s->iop_cpu->power_state, CPU(s->iop_cpu)->halted,
-                words[0], words[1], words[2], words[3]);
-        for (int k = 0; k < 2; k++) {
-            ARMCPU *c = k ? s->ae2_cpu : s->iop_cpu;
-            fprintf(stderr, "[state] A6 %s at save: index %d dacr_s %08" PRIx64 " dacr_ns %08" PRIx64 " sctlr_s %08"
-                    PRIx64 " ttbr0_s %08" PRIx64 "\n", k ? "AE2" : "IOP", CPU(c)->cpu_index, c->env.cp15.dacr_s,
-                    c->env.cp15.dacr_ns, c->env.cp15.sctlr_el[3], c->env.cp15.ttbr0_el[3]);
-        }
-        for (int i = 0; i < s->iop_cpu->cpreg_array_len; i++) {
-            const ARMCPRegInfo *ri = get_arm_cp_reginfo(s->iop_cpu->cp_regs, s->iop_cpu->cpreg_indexes[i]);
-            if (ri && !strncmp(ri->name, "DACR", 4)) {
-                fprintf(stderr, "[state] A6 IOP cpreg %s key %08" PRIx64 " value %08" PRIx64 " fieldoffset %zx (dacr_s %zx "
-                        "dacr_ns %zx) raw %08" PRIx64 " readfn %p rawreadfn %p type %x\n", ri->name,
-                        s->iop_cpu->cpreg_indexes[i], s->iop_cpu->cpreg_values[i], (size_t)ri->fieldoffset,
-                        offsetof(CPUARMState, cp15.dacr_s), offsetof(CPUARMState, cp15.dacr_ns),
-                        read_raw_cp_reg(&s->iop_cpu->env, ri), ri->readfn, ri->raw_readfn, (unsigned)ri->type);
-            }
-        }
-        env = &s->ae2_cpu->env;
-        address_space_read(cpu_get_address_space(CPU(s->ae2_cpu), 0), 0, MEMTXATTRS_UNSPECIFIED, words,
-                           sizeof(words));
-        fprintf(stderr, "[state] A6 AE2 at save: pc %08x cpsr %08x sctlr %08" PRIx64 " power %d halted %d mem0 %08x "
-                "%08x mapped %d\n", env->regs[15], cpsr_read(env), env->cp15.sctlr_el[1], s->ae2_cpu->power_state,
-                CPU(s->ae2_cpu)->halted, words[0], words[1], s->ae2_fw_mapped);
-    }
     return 0;
 }
 

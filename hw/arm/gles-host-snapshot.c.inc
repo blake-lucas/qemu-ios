@@ -1404,6 +1404,29 @@ static GByteArray *gles_snapshot_save(void)
     return w.b;
 }
 
+/*
+ * A context's program as the guest left it current, with what glUseProgram
+ * derives from it (its framebuffer fetch uniforms). Programs come back with new
+ * host names (snap_get_glsl), and a context's objects may come with a later
+ * context of its share group, so this runs once every context is back; the host
+ * name snap_apply_gl bound was the old one, which named another program or
+ * none.
+ */
+static void snap_use_program(GLESHost *h) {
+  GLuint host;
+
+  if (!h->inited || h->failed)
+    return;
+  gh_current = h;
+  CGLSetCurrentContext(h->cgl);
+  host = h->program ? gles_glsl_host(h->program) : 0;
+  glUseProgram(host);
+  h->fetch_sampler = host ? glGetUniformLocation(host, "gles_fetch") : -1;
+  h->fetch_size = host ? glGetUniformLocation(host, "gles_fetch_size") : -1;
+  while (glGetError() != GL_NO_ERROR) {
+  }
+}
+
 static bool gles_snapshot_load(const uint8_t *p, size_t n)
 {
     SnapR r = { p, n, 0, false };
@@ -1499,6 +1522,23 @@ static bool gles_snapshot_load(const uint8_t *p, size_t n)
         if (objects) snap_get_objects(&r);
         snap_apply_gl(&s);
         snap_restore_queries(h);
+        /* A restore call the host refused (a value it has no such state for)
+         * must not reach the guest's glGetError, or a game that checks it acts
+         * on an error it never made. */
+        for (GLenum e; (e = glGetError()) != GL_NO_ERROR;) {
+          fprintf(stderr,
+                  "[gles] snapshot: context %08x restored with GL error 0x%x "
+                  "(cleared)\n",
+                  handle, e);
+        }
+    }
+    if (!r.bad) {
+      GHashTableIter it;
+      gpointer v;
+      snap_use_program(&gh_legacy);
+      g_hash_table_iter_init(&it, gles_contexts);
+      while (g_hash_table_iter_next(&it, NULL, &v))
+        snap_use_program(v);
     }
     gh_current = &gh_legacy;
     CGLSetCurrentContext(NULL);
