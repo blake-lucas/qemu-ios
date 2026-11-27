@@ -64,11 +64,27 @@ static const Property ohci_sysbus_properties[] = {
     DEFINE_PROP_DMAADDR("dma-offset", OHCISysBusState, dma_offset, 0),
 };
 
+/*
+ * A transfer the device held at the save (USB_RET_ASYNC: the modem's or Wi-Fi's interrupt and bulk IN endpoints wait
+ * for data) is not in the device's state, and the controller takes one such packet at a time: kept as async_td, it
+ * blocked every endpoint of the host for ever after a load (the iPhone 5's modem went quiet, CommCenter and then
+ * SpringBoard waited on it). Its TD is still in guest memory, so it is submitted again.
+ */
+static int ohci_sysbus_post_load(void *opaque, int version_id)
+{
+    OHCISysBusState *s = opaque;
+
+    s->ohci.async_td = 0;
+    s->ohci.async_complete = false;
+    return 0;
+}
+
 /* Save states (the iPhone 5's HSIC hosts, which carry its Wi-Fi and modem): the controller as the PCI one saves it. */
 static const VMStateDescription vmstate_ohci_sysbus = {
     .name = "ohci-sysbus",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ohci_sysbus_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(ohci, OHCISysBusState, 1, vmstate_ohci_state, OHCIState),
         VMSTATE_END_OF_LIST()

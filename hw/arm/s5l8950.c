@@ -1873,6 +1873,19 @@ static int a6_post_load(void *opaque, int version_id)
         a6_unmap_ae2_firmware(s);
     }
     a6_secure_load(s);
+    /*
+     * The AP cores' generic timers: ISTATUS, the timer's output and its QEMUTimer follow from CTL, CVAL and the
+     * counter, so work them out again, as a register write would. A save can catch a core whose enabled timer has
+     * no QEMUTimer pending; restored that way, the core never took its timer interrupt again, its timer callouts
+     * stopped and iOS's UI with them (some of the iPhone 5's saves). This runs after the cores and their timer
+     * OR gates are loaded, so the FIQ line ends up as the timer says.
+     */
+    for (unsigned i = 0; i < 2; i++) {
+        if (s->cpu[i] && s->cpu[i]->gt_timer[GTIMER_PHYS]) {
+            arm_gt_ptimer_cb(s->cpu[i]);
+            arm_gt_vtimer_cb(s->cpu[i]);
+        }
+    }
     qemu_set_irq(s->vibrator, s->vibrator_enable && s->vibrator_pwm);
     a6_irq_update(s);
     a6_ae2_irq_update(s);
