@@ -14,6 +14,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/ios-boot-args.h"
 #include "hw/arm/machines-qom.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
@@ -299,9 +300,11 @@ struct S5L8920MachineState {
     QEMUBH *bt_kick;                     /* resumes the CDMA receive from the HCI's UART */
     bool gles_debug;                     /* paint what the GL bridge refuses magenta (tests) */
     bool wifi;                           /* bridge the Wi-Fi card to -netdev id=wifi0 (default on) */
+    char *wifi_country;                  /* the access point's 802.11d country (wifi-country), NULL = the card's */
     bool usb_attached;                   /* usb-attached (default on) */
     int battery_level;                   /* battery-level, -1 = the PMU model's own */
     unsigned battery_charging;           /* battery-charging: 0 auto, 1 on, 2 off */
+    bool quiet_boot;                    /* omit -v in the RAM boot handoff */
     bool baseband_on;                    /* baseband=on: the fake modem behind spi2 */
     char *imei;                          /* the unit's IMEI, for that modem to report */
     DeviceState *bb_modem;
@@ -412,6 +415,11 @@ static void s5l8920_cpu_reset(void *opaque)
     if (image_len > size - KBOOT_TRAILER_LEN || load_pa < S5L8920_DRAM_BASE ||
         (uint64_t)load_pa + image_len > S5L8920_DRAM_BASE + s->board->dram_size) {
         error_report("s5l8920: kboot bundle does not fit in DRAM");
+        exit(1);
+    }
+    if (s->quiet_boot && !ios_boot_args_quiet((uint8_t *)data, image_len,
+                                             load_pa, bootargs_pa)) {
+        error_report("quiet-boot: invalid ARM32 boot command line");
         exit(1);
     }
     if (s->bb_modem) {
@@ -608,14 +616,6 @@ static void s5l8920_i2c_create(S5L8920MachineState *s, int n)
  * (contrib/gles-public) uses, as ipad1's: GLES, guest packages (which also
  * answer the shim's hello), the pasteboard and the guest agent (it_agent).
  */
-static int s5l8920_agent_copy(void *opaque, uint32_t address, uint8_t *data, size_t length, bool write)
-{
-    if (length && length - 1 > UINT32_MAX - address) {
-        return -1;
-    }
-    return cpu_memory_rw_debug(opaque, address, data, length, write);
-}
-
 static void s5l8920_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
 {
     CPUState *cs = env_cpu(env);
@@ -655,7 +655,7 @@ static void s5l8920_qemu_call(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t
         }
         q.retval = ipod_agent_call(s->agent, q.call_number, q.args.ag.token, q.args.ag.buffer_guest_ptr,
                                    q.args.ag.offset, q.args.ag.length, qemu_clock_get_ms(QEMU_CLOCK_REALTIME),
-                                   candidate, s5l8920_agent_copy, cs);
+                                   candidate, guest_copy, cs);
         err = q.retval < 0 ? EINVAL : 0;
         break;
     }
@@ -697,6 +697,17 @@ static uint32_t s5l8920_uart_rx_avail(void *opaque, hwaddr addr, bool to_device)
 static void s5l8920_cdma_kick(void *opaque)
 {
     s5l8930_cdma_kick(DEVICE(opaque));
+}
+
+/*
+ * The AMC's port took what CDMA wrote to it: the AAC encoder program's PCM, which Voice Memos
+ * streams in a frame at a time. The chain completes then, as on the A4 (ipad1.c); without this it
+ * stayed running, the driver's DMA command stayed active, and its next frame failed to set up
+ * (AppleAMC-170.4 asserts at AppleAMCDriver_r2.cpp:2148), so a recording could not be stopped.
+ */
+static void s5l8920_amc_port_sink(void *opaque)
+{
+    s5l8930_cdma_sink_done(DEVICE(opaque), S5L8920_AMC_PORT_BASE, AMC_PORT_SIZE);
 }
 
 static void s5l8920_bt_rxdma(void *opaque, int n, int level)
@@ -838,6 +849,9 @@ static void s5l8920_init(MachineState *machine)
 
         ipod_touch_sdio_set_chip(card, &s->board->wifi);
         object_property_add_alias(OBJECT(machine), "wifi-bssid", OBJECT(card), "bssid");
+        if (s->wifi_country) {
+            object_property_set_str(OBJECT(card), "country", s->wifi_country, &error_fatal);
+        }
         card->card_present = true;
         sysbus_realize_and_unref(SYS_BUS_DEVICE(card), &error_fatal);
         if (s->wifi && !qemu_find_netdev("wifi0")) {
@@ -901,7 +915,7 @@ static void s5l8920_init(MachineState *machine)
     qdev_prop_set_uint8(dev, "version", 1);     /* DT cdma-version */
     qdev_prop_set_uint64(dev, "dram-size", s->board->dram_size);
     qdev_prop_set_uint32(dev, "paced-base", S5L8920_I2S0_FIFO);
-    qdev_prop_set_uint32(dev, "paced-ports", 1);
+    qdev_prop_set_uint32(dev, "paced-ports", 2);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, S5L8920_CDMA_BASE);
@@ -950,6 +964,7 @@ static void s5l8920_init(MachineState *machine)
         sysbus_connect_irq(sbd, 0, s5l8920_irq(s, S5L8920_IRQ_AMC + 7));
         sysbus_mmio_map(sbd, 1, S5L8920_AMC_PORT_BASE);
         IPOD_TOUCH_AMC(dev)->port_kick = s5l8920_cdma_kick;
+        IPOD_TOUCH_AMC(dev)->port_sink = s5l8920_amc_port_sink;
         IPOD_TOUCH_AMC(dev)->port_opaque = cdma;
         s5l8930_cdma_set_source(cdma, S5L8920_AMC_PORT_BASE, AMC_PORT_SIZE,
                                 ipod_touch_amc_port_avail, dev);
@@ -1130,6 +1145,12 @@ static void s5l8920_init(MachineState *machine)
      */
     dev = qdev_new(TYPE_S5L8930_I2S);
     qdev_prop_set_bit(dev, "audio-out", true);
+    /*
+     * The phone's or computer's microphone reaches this port's RX FIFO (+4 of its FIFO window,
+     * read by the capture chain while CTRL bit 1 runs receive; s5l8930_i2s.c). It was left out
+     * because a 3GS recorded silence, which was the four-byte FIFO window reading 0.
+     */
+    qdev_prop_set_bit(dev, "host-mic", true);
     qdev_prop_set_bit(dev, "ctrl-run", true);   /* AppleS5L8920XI2SController starts TX with CTRL bit 0 */
     qdev_prop_set_uint64(dev, "nco-base", S5L8920_AUDIO_COMPLEX);
     qdev_prop_set_uint32(dev, "nco-ref-hz", S5L8920_NCOREF_HZ);
@@ -1140,6 +1161,23 @@ static void s5l8920_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, S5L8920_I2S0_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, S5L8920_I2S0_FIFO);
+
+    /*
+     * I2S1, the Voice device (DT audio1, registers at 0x84501400). Un1box found that on 3GS iOS 6
+     * mediaserverd builds its virtual audio device from both controllers, and with only i2s0
+     * present the audio session had no input ("Connect a microphone" in Voice Memos). Not checked
+     * here: 5.1.1 records through i2s0 and never touches this port. Nothing plays through it
+     * (audio-out is off: it is the telephony path); its RX FIFO takes the same microphone.
+     */
+    dev = qdev_new(TYPE_S5L8930_I2S);
+    qdev_prop_set_uint8(dev, "port", 1);
+    qdev_prop_set_bit(dev, "host-mic", true);
+    qdev_prop_set_bit(dev, "ctrl-run", true);
+    qdev_prop_set_uint64(dev, "nco-base", S5L8920_AUDIO_COMPLEX);
+    qdev_prop_set_uint32(dev, "nco-ref-hz", S5L8920_NCOREF_HZ);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, S5L8920_I2S0_BASE + 0x1000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, S5L8920_I2S0_FIFO + 0x1000);
 
     /* USB device mode: the S5L8720's DWC OTG core and PHY; the built-in host enumerates it. */
     dev = qdev_new(TYPE_IPOD_TOUCH_USB_PHYS);
@@ -1471,6 +1509,17 @@ static void s5l8920_set_wifi(Object *obj, bool value, Error **errp)
     S5L8920_MACHINE(obj)->wifi = value;
 }
 
+static char *s5l8920_get_wifi_country(Object *obj, Error **errp)
+{
+    return g_strdup(S5L8920_MACHINE(obj)->wifi_country ?: "");
+}
+
+static void s5l8920_set_wifi_country(Object *obj, const char *value, Error **errp)
+{
+    g_free(S5L8920_MACHINE(obj)->wifi_country);
+    S5L8920_MACHINE(obj)->wifi_country = g_strdup(value);
+}
+
 /* The agent's properties (tests and the app drive it over QMP), as ipad1's. */
 static void s5l8920_set_agent_request(Object *obj, const char *value, Error **errp)
 {
@@ -1565,8 +1614,20 @@ static void s5l8920_set_battery_charging(Object *obj, const char *value, Error *
     error_setg(errp, "battery-charging must be auto, on or off");
 }
 
+static bool s5l8920_get_quiet_boot(Object *obj, Error **errp)
+{
+    return S5L8920_MACHINE(obj)->quiet_boot;
+}
+
+static void s5l8920_set_quiet_boot(Object *obj, bool value, Error **errp)
+{
+    S5L8920_MACHINE(obj)->quiet_boot = value;
+}
+
 static void s5l8920_instance_init(Object *obj)
 {
+    object_property_add_bool(obj, "quiet-boot", s5l8920_get_quiet_boot,
+                             s5l8920_set_quiet_boot);
     S5L8920MachineState *s = S5L8920_MACHINE(obj);
 
     s->wifi = true;
@@ -1595,6 +1656,7 @@ static void s5l8920_instance_finalize(Object *obj)
     g_free(S5L8920_MACHINE(obj)->kboot_path);
     g_free(S5L8920_MACHINE(obj)->nand_path);
     g_free(S5L8920_MACHINE(obj)->nand_overlay_path);
+    g_free(S5L8920_MACHINE(obj)->wifi_country);
 }
 
 static char *s5l8920_get_imei(Object *obj, Error **errp)
@@ -1728,6 +1790,9 @@ static void s5l8920_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "wifi", s5l8920_get_wifi, s5l8920_set_wifi);
     object_class_property_set_description(klass, "wifi",
         "Bridge the Wi-Fi card to -netdev id=wifi0 (a NAT one is made when absent); off keeps the card, unbridged");
+    object_class_property_add_str(klass, "wifi-country", s5l8920_get_wifi_country, s5l8920_set_wifi_country);
+    object_class_property_set_description(klass, "wifi-country",
+        "The access point's 802.11d country, two letters (unset: US)");
     object_class_property_add_bool(klass, "gles-debug", s5l8920_get_gles_debug, s5l8920_set_gles_debug);
     object_class_property_add_bool(klass, "baseband", s5l8920_get_baseband, s5l8920_set_baseband);
     object_class_property_add_bool(klass, "ring-switch", s5l8920_get_ring_switch, s5l8920_set_ring_switch);

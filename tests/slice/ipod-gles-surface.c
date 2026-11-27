@@ -4,15 +4,18 @@
  *
  * SLICE:gles-prelude hw/arm/gles-host.c range #include <TargetConditionals.h> | /* Old guest engines retain
  * SLICE:gles-refusals hw/arm/gles-host.c range /* ---------------------------------------------------------------- refusals | /* Only expose formats our decoder accepts
+ * SLICE hw/arm/gles-host.c range /* ---------------------------------------------------------- GPU memory | /*\n * Profiling and strictness
  * SLICE hw/arm/gles-host.c fn gles_reject
  * SLICE hw/arm/gles-host.c range #define GLES_PRIVATE_NAME | static bool gles_is_drawable(
  * SLICE hw/arm/gles-host.c range static GLESPVRTC *gles_pvrtc_texture( | static int64_t gles_generate_mipmap(
+ * SLICE:helpers hw/arm/gles-host.c fn gles_image_bytes gles_read_pixels
  * SLICE:helpers hw/arm/gles-host.c range static bool gles_surface_range( | /* ------------------------------------------------------------ ES 2.0
  * SLICE:shim contrib/it-gles/mbxshim.c range static char *put_dec( | /* A stub that IS the implementation
  * SLICE:shim contrib/it-gles/mbxshim.c range static int guest_fault_read( | static unsigned texture_bytes(
  * SLICE:shim contrib/it-gles/mbxshim.c range static int surface_fault_read( | static int GLESBindCoreSurface(
  * SLICE:bind contrib/it-gles/mbxshim.c range static int GLESBindCoreSurface( | /*\n * GLESBindView is
  * SLICE:finish contrib/it-gles/mbxshim.c fn GLESFinishTexture GLESSwapNotification
+ * SLICE:layout contrib/gles-public/opengles.c fn fe_gl_fourcc
  * CFLAGS -I$ROOT/include -Wno-pointer-to-int-cast -Wno-pointer-bool-conversion -framework OpenGL -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework CoreFoundation
  * PKG glib-2.0
  */
@@ -41,9 +44,24 @@ static MemoryRegion fake_ram;
 static uint8_t seen[sizeof(ram)];
 static unsigned dirty_clears;
 static vaddr unmapped_lo, unmapped_hi;      /* pages the process no longer maps */
+static vaddr moved_lo, moved_hi;            /* pages the process maps to other memory, MOVED_BY on */
+#define MOVED_BY 0x20000
 static hwaddr cpu_get_phys_page_attrs_debug(CPUState *c, vaddr va, MemTxAttrs *attrs)
-{ return va >= 0x10000000 && va < 0x10000000 + sizeof(ram) && !(va >= unmapped_lo && va < unmapped_hi) ? va : (hwaddr)-1; }
+{
+    if (va < 0x10000000 || va >= 0x10000000 + sizeof(ram) || (va >= unmapped_lo && va < unmapped_hi)) return -1;
+    return va >= moved_lo && va < moved_hi ? va + MOVED_BY : va;
+}
 static int cpu_asidx_from_attrs(CPUState *c, MemTxAttrs attrs) { return 0; }
+/* the caller's MMU: pages in [kernel_lo, kernel_hi) are mapped but not readable at its privilege */
+typedef int MMUAccessType;
+enum { MMU_DATA_LOAD, MMU_DATA_STORE };
+#define TLB_INVALID_MASK 1
+static vaddr kernel_lo, kernel_hi;
+static void *cpu_env(CPUState *c) { return NULL; }
+static int cpu_mmu_index(CPUState *c, bool ifetch) { return 0; }
+static int probe_access_flags(void *env, vaddr va, int size, MMUAccessType type, int idx, bool nonfault,
+                              void **host, uintptr_t ra)
+{ return va >= kernel_lo && va < kernel_hi ? TLB_INVALID_MASK : 0; }
 static AddressSpace *cpu_get_address_space(CPUState *c, int i) { return NULL; }
 static MemoryRegion *address_space_translate(AddressSpace *as, hwaddr pa, hwaddr *xlat, hwaddr *len,
                                              bool w, MemTxAttrs attrs)
@@ -64,6 +82,17 @@ static bool physical_memory_test_and_clear_dirty(ram_addr_t at, ram_addr_t len, 
     memcpy(seen + at, ram + at, len); dirty_clears += d;
     return d;
 }
+static uint32_t gles_cur_ctx;
+static int cpu_memory_rw_debug(CPUState *cpu,vaddr at,void *p,size_t n,bool write)
+{ return gles_guest_rw(cpu,at,p,n,write); }
+static uint16_t lduw_be_p(const void *p)
+{ const uint8_t *b=p;return (b[0]<<8)|b[1]; }
+static uint16_t lduw_le_p(const void *p)
+{ const uint8_t *b=p;return b[0]|(b[1]<<8); }
+static void stw_be_p(void *p,uint16_t v)
+{ uint8_t *b=p;b[0]=v>>8;b[1]=v; }
+static void stw_le_p(void *p,uint16_t v)
+{ uint8_t *b=p;b[0]=v;b[1]=v>>8; }
 #include "helpers.h"
 #define CA_FOURCC_555L GLES_SURFACE_RGB555
 static void w(const char *s) {}
@@ -72,12 +101,13 @@ static void wx(unsigned v) {}
 #define CA_FOURCC_565L GLES_SURFACE_RGB565
 #define CA_FOURCC_BGRA GLES_SURFACE_BGRA32
 static unsigned abi_format = 0x34323076;
+static unsigned abi_plane_stride = 2;
 static unsigned surface_lock_flags = 1;       /* IOSurface's read-only lock (CoreSurface: 2) */
 static int abi_surface_fault_read(unsigned long base,unsigned stride,unsigned rows,unsigned bytes)
 { /* a packed surface's rows are touched for their pixels only (2 x 2 bytes in a 16-byte stride),
    * not their padding, which past the last row's pixels can be another, unmapped page */
   bool packed=abi_format==GLES_SURFACE_RGB555;
-  assert((base==0x10000000 || base==0x10000100) && stride==(packed?16:2) && bytes==(packed?4:2) && rows<=2);return 1; }
+  assert((base==0x10000000 || base==0x10000100) && stride==(packed?16:abi_plane_stride) && bytes==(packed?4:abi_plane_stride) && rows<=2);return 1; }
 #define A(...) (const unsigned[]){__VA_ARGS__}
 static unsigned abi_args[9], abi_locks, abi_finished, abi_signals;
 static int abi_signal_error;
@@ -88,7 +118,7 @@ static int p_IOSurfaceLock(void *s, unsigned mode, unsigned *seed)
 static int p_IOSurfaceUnlock(void *s, unsigned mode, unsigned *seed)
 { surface_arg(s); assert(mode==1); abi_locks--; return 0; }
 static void *p_IOSurfaceGetBaseAddress(void *s) { surface_arg(s); return (void *)0x10000000; }
-static unsigned p_IOSurfaceGetBytesPerRow(void *s) { surface_arg(s); return abi_format==GLES_SURFACE_RGB555?16:2; }
+static unsigned p_IOSurfaceGetBytesPerRow(void *s) { surface_arg(s); return abi_format==GLES_SURFACE_RGB555?16:abi_plane_stride; }
 static unsigned p_IOSurfaceGetBytesPerElement(void *s) { surface_arg(s); return 2; }
 static unsigned p_IOSurfaceGetWidth(void *s) { surface_arg(s); return 2; }
 static unsigned p_IOSurfaceGetHeight(void *s) { surface_arg(s); return 2; }
@@ -98,7 +128,9 @@ static unsigned p_IOSurfaceGetPlaneCount(void *s) { surface_arg(s); return abi_f
 static void *p_IOSurfaceGetBaseAddressOfPlane(void *s, unsigned plane)
 { surface_arg(s); return (void *)(uintptr_t)(0x10000000 + plane * 256); }
 static unsigned p_IOSurfaceGetBytesPerRowOfPlane(void *s, unsigned plane)
-{ surface_arg(s); return 2; }
+{ surface_arg(s); return abi_plane_stride; }
+static unsigned p_IOSurfaceGetWidthOfPlane(void *s, unsigned plane) { surface_arg(s); return plane ? abi_plane_stride/2 : abi_plane_stride; }
+static unsigned p_IOSurfaceGetHeightOfPlane(void *s, unsigned plane) { surface_arg(s); return plane ? 1 : 2; }
 static long long qc(unsigned op, void *gc, unsigned argc, const unsigned *a)
 { if(op==89) { assert(!argc); abi_finished++; return 0; } assert(op==GLES_OP_BIND_SURFACE && (argc==8 || argc==9)); memset(abi_args,0,sizeof(abi_args)); memcpy(abi_args,a,argc*4); return 0; }
 
@@ -120,6 +152,7 @@ static void *dlsym(void *lib,const char *name)
 #include "bind.h"
 #undef surface_fault_read
 #include "finish.h"
+#include "layout.h"
 int main(void)
 {
     void *fault_pages=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
@@ -130,6 +163,31 @@ int main(void)
     assert(GLESBindCoreSurface(NULL, 0x84f5, (void *)0x1234));
     assert(abi_args[0]==0x84f5 && abi_args[1]==0x10000000 && abi_args[6]==0x10000100 && abi_args[8]==4242);
     assert(!abi_locks);
+    /* Native iOS 6 EIS requests packed RGBA planes with 8_8_8_8_REV;
+     * mapping that layout to zero silently imported the whole NV12 image. */
+    unsigned camera_rgba = fe_gl_fourcc(0x1908, 0x8367);
+    assert(camera_rgba == GLES_SURFACE_RGBA32);
+    assert(GLESBindCoreSurfaceAs(NULL,0x84f5,(void *)0x1234,camera_rgba,0,2,2));
+    assert(abi_args[5]==0x34323076 && abi_args[6]==0x10000100);
+    /* One plane of a 4:2:0 surface, as 5.x+ CoreAnimation asks for each (texImageIOSurface's plane): the luma as
+     * L008, the Cb/Cr plane as 2C08 at half the size, neither with a second plane. */
+    assert(GLESBindCoreSurfaceAs(NULL, 0x84f5, (void *)0x1234, GLES_SURFACE_L8, 0, 0, 0));
+    assert(abi_args[1]==0x10000000 && abi_args[2]==2 && abi_args[3]==2 && abi_args[4]==2 &&
+           abi_args[5]==GLES_SURFACE_L8 && !abi_args[6] && !abi_args[7]);
+    assert(GLESBindCoreSurfaceAs(NULL, 0x84f5, (void *)0x1234, GLES_SURFACE_LA88, 1, 0, 0));
+    assert(abi_args[1]==0x10000100 && abi_args[2]==2 && abi_args[3]==1 && abi_args[4]==1 &&
+           abi_args[5]==GLES_SURFACE_LA88 && !abi_args[6] && !abi_args[7] && !abi_locks);
+    abi_plane_stride=8;
+    assert(GLESBindCoreSurfaceAs(NULL,0x84f5,(void *)0x1234,GLES_SURFACE_RGBA32,0,2,2));
+    assert(abi_args[1]==0x10000000 && abi_args[2]==8 && abi_args[3]==2 && abi_args[4]==2 &&
+           abi_args[5]==GLES_SURFACE_RGBA32 && !abi_args[6] && !abi_args[7]);
+    assert(GLESBindCoreSurfaceAs(NULL,0x84f5,(void *)0x1234,camera_rgba,1,2,1));
+    assert(abi_args[1]==0x10000100 && abi_args[2]==8 && abi_args[3]==2 && abi_args[4]==1 &&
+           abi_args[5]==GLES_SURFACE_RGBA32 && !abi_args[6] && !abi_args[7]);
+    assert(!GLESBindCoreSurfaceAs(NULL,0x84f5,(void *)0x1234,GLES_SURFACE_RGBA32,0,3,2));
+    assert(!GLESBindCoreSurfaceAs(NULL,0x84f5,(void *)0x1234,GLES_SURFACE_RGBA32,1,2,2));
+    assert(!abi_locks);
+    abi_plane_stride=2;
     abi_format=GLES_SURFACE_RGB555;
     assert(GLESBindCoreSurface(NULL,0x84f5,(void *)0x1234));
     assert(abi_args[2]==16 && abi_args[5]==GLES_SURFACE_RGB555 && !abi_args[6] && !abi_locks);
@@ -227,7 +285,7 @@ int main(void)
     for(int i=0;i<4;i++) assert(!memcmp(got+i*4,"\0\0\0\xff",4));
     a[3]=3;assert(gles_bind_surface(NULL,a,0)==-1);
     /* The rest of what QuartzCore and IOSurface name, one 2x1 surface each, read back as BGRA bytes:
-     * A008 and L008 sample (0,0,0,a) and (l,l,l,1); 4444 and 1555 are GL's own packed orders; ARGB and
+     * A008 and L008 sample (0,0,0,a) and (l,l,l,1); 4444 and 1555 are GL's own packed orders, 5551 A1R5G5B5; ARGB and
      * ABGR are the 32-bit orders byte-reversed. */
     {
         struct { uint32_t fmt, stride; uint8_t in[8]; uint8_t out[8]; } cases[] = {
@@ -235,6 +293,7 @@ int main(void)
             { GLES_SURFACE_L8,       2, {0x40,0xff},            {0x40,0x40,0x40,0xff, 0xff,0xff,0xff,0xff} },
             { GLES_SURFACE_RGBA4444, 4, {0x0f,0xf0, 0xf0,0x0f}, {0,0,0xff,0xff, 0xff,0xff,0,0} },   /* 0xf00f: R=f A=f; 0x0ff0: G=f B=f */
             { GLES_SURFACE_RGBA5551, 4, {0x01,0xf8, 0x3f,0x00}, {0,0,0xff,0xff, 0xff,0,0,0xff} },   /* 0xf801 red, 0x003f blue */
+            { GLES_SURFACE_ARGB1555, 4, {0x00,0xfc, 0x1f,0x00}, {0,0,0xff,0xff, 0xff,0,0,0} },      /* 0xfc00 red, 0x001f blue, clear */
             { GLES_SURFACE_ARGB32,   8, {0x80,1,2,3, 0xff,9,8,7}, {3,2,1,0x80, 7,8,9,0xff} },
             { GLES_SURFACE_ABGR32,   8, {0x80,1,2,3, 0xff,9,8,7}, {1,2,3,0x80, 9,8,7,0xff} },
         };
@@ -250,6 +309,26 @@ int main(void)
         assert(gles_bind_surface(NULL,b,0) == -1);
         char *rejects = gles_host_rejects();
         assert(strstr(rejects, "surface:XYZ0\t1\n"));
+        free(rejects);
+    }
+    /* Cover Flow's twiddled A1R5G5B5 ('s551'): a 4x4 whose pixel at memory index i is blue i (alpha set but at i = 15),
+     * read back in rows, where each row's indices interleave y's bits (even) with x's (odd). */
+    {
+        static const uint8_t index[16] = { 0,2,8,10, 1,3,9,11, 4,6,12,14, 5,7,13,15 };
+        uint8_t texels[64];
+        uint32_t b[] = { GL_TEXTURE_RECTANGLE_ARB, 0x10000000, 8, 4, 4, GLES_SURFACE_ARGB1555_TWIDDLED, 0, 0 };
+        for (unsigned i = 0; i < 16; i++) { ram[i * 2] = i; ram[i * 2 + 1] = i == 15 ? 0 : 0x80; }
+        assert(!gles_bind_surface(NULL,b,0));
+        glGetTexImage(GL_TEXTURE_RECTANGLE_ARB, 0, GL_BGRA, GL_UNSIGNED_BYTE, texels);
+        for (unsigned p = 0; p < 16; p++) {
+            unsigned i = index[p];
+            assert(texels[p * 4] == ((i << 3) | (i >> 2)) && !texels[p * 4 + 1] && !texels[p * 4 + 2]);
+            assert(texels[p * 4 + 3] == (i == 15 ? 0 : 255));
+        }
+        b[3] = 8; b[2] = 16;                            /* not square: refused, counted */
+        assert(gles_bind_surface(NULL,b,0) == -1);
+        char *rejects = gles_host_rejects();
+        assert(strstr(rejects, "surface:s551:8x4/16\t1\n"));
         free(rejects);
     }
     /* Photos thumbnail rows use opaque RGB555, with padded guest rows. */
@@ -365,10 +444,32 @@ int main(void)
         assert(got[0] == 0x44 && got[16] == 0x44);
         assert(!g_hash_table_lookup(gh.surfaces, GUINT_TO_POINTER(third)));
         unmapped_lo = unmapped_hi = 0;
+        /* An ID names a live surface only: 1.x's CoreSurface IDs are kernel addresses, used again
+         * once a buffer is freed, and the next buffer under one shares some of its pages or none
+         * (issue 109). An attach under a known ID reads the pages the process maps now: here
+         * the first is other memory and the last the same, so checking the last alone kept the
+         * old first page. */
+        glBindTexture(GL_TEXTURE_RECTANGLE_ARB, third);
+        memset(ram + 8192, 0x66, 8192);
+        assert(!gles_bind_surface(NULL, c, 78));
+        assert(!gles_bind_surface(NULL, none, 0)); gles_surface_forget(GL_TEXTURE_RECTANGLE_ARB);
+        memset(ram + 8192 + MOVED_BY, 0x77, 4096);
+        moved_lo = 0x10000000 + 8192; moved_hi = moved_lo + 4096;
+        assert(!gles_bind_surface(NULL, c, 78));
+        glGetTexImage(GL_TEXTURE_RECTANGLE_ARB,0,GL_BGRA,GL_UNSIGNED_BYTE,got);
+        assert(got[0] == 0x77 && got[16] == 0x66);
+        moved_lo = moved_hi = 0;
         glDisable(GL_TEXTURE_RECTANGLE_ARB);
     }
     munmap(fault_pages,16384);
     g_hash_table_destroy(gh.surfaces);
     CGLSetCurrentContext(NULL);CGLDestroyContext(context);
-    puts("PASS: IOSurface page faults and ABI, native textured draw, NV12 ranges, deferred FBO writeback, ES 2.0 refresh and bounds, dirty-page refresh, detached copies, IOSurface page records, unmapped surfaces keep their pixels");
+    /* A surface page the caller may not read (a kernel page under a user process) is not found by its page walk. */
+    {
+        ram_addr_t at;
+        kernel_lo = 0x10004000; kernel_hi = 0x10005000;
+        assert(!gles_page_ram(NULL, 0x10004000, &at) && gles_page_ram(NULL, 0x10003000, &at) && at == 0x3000);
+        kernel_lo = kernel_hi = 0;
+    }
+    puts("PASS: IOSurface page faults and ABI, native textured draw, NV12 ranges, deferred FBO writeback, ES 2.0 refresh and bounds, dirty-page refresh, detached copies, IOSurface page records, unmapped surfaces keep their pixels, unreadable pages are not surfaces, a reused ID's moved pages");
 }

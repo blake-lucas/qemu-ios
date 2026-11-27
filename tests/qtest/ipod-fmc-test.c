@@ -180,6 +180,29 @@ static void image_store_program_erase_reopen(void)
     remove_image(dir);
 }
 
+/* FMDNUM is the guest's: a program word with a count outside the page ends the program (nothing past the page buffer
+ * is written), and the next program works. */
+static void program_count_outside_page(void)
+{
+    char *dir = image_store(8);
+    uint8_t ones[PAGE], meta[12] = { 1, 2, 3 };
+    memset(ones, 0x3c, sizeof(ones));
+    QTestState *q = start(dir);
+    static const uint32_t counts[] = { 0x80000000, 0x1000, 2047, 0 };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(counts); i++) {
+        command(q, 0x500, 1, 9);
+        qtest_writel(q, FMC + 0x30, counts[i]);
+        qtest_writel(q, FMC + 0x80, 0xdeadbeef);
+        qtest_writel(q, FMC + 0x80, 0xdeadbeef);
+    }
+    assert_erased(q, 1, 9);
+    program(q, 1, 9, ones, meta);
+    assert_page(q, 1, 9, 0x3c, meta);
+    qtest_quit(q);
+    remove_image(dir);
+}
+
 static void expect_startup_failure(const char *machine, const char *error_text)
 {
     g_autofree char *drive = g_strdup_printf("if=pflash,format=raw,file=%s", nor);
@@ -228,6 +251,7 @@ int main(int argc, char **argv)
     g_assert_true(g_file_set_contents(nor, zero, 1048576, NULL));
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/ipod/fmc/image-store", image_store_program_erase_reopen);
+    qtest_add_func("/ipod/fmc/program-count-outside-page", program_count_outside_page);
     qtest_add_func("/ipod/fmc/image-store-refuses-overlay", image_store_refuses_overlay);
     qtest_add_func("/ipod/fmc/image-store-refuses-other-geometry", image_store_refuses_other_geometry);
     result = g_test_run();

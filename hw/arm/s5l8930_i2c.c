@@ -192,9 +192,17 @@ static void s5l8930_i2c_init(Object *obj)
     s->bus = i2c_init_bus(DEVICE(obj), "i2c");
 }
 
+static int s5l8930_i2c_post_load(void *opaque, int version_id)
+{
+    S5L8930I2CState *s = opaque;
+    return s->tx_len <= I2C_FIFO_DEPTH && s->rx_len <= I2C_FIFO_DEPTH && s->rx_pos <= s->rx_len ?
+           0 : -EINVAL;
+}
+
 static const VMStateDescription vmstate_s5l8930_i2c = {
     .name = TYPE_S5L8930_I2C,
     .version_id = 1,
+    .post_load = s5l8930_i2c_post_load,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(addr, S5L8930I2CState),
@@ -521,6 +529,24 @@ void s5l8930_d1815_usb_cable_event(DeviceState *dev)
     d1815_update_irq(s);
 }
 
+/*
+ * The "event" inputs: interrupt lines of the PMU's DT children (their
+ * interrupt-parent is the PMU), by vector as above. A rising line latches its
+ * event bit; the child's handler clears its own source. The iPhone 4's and the
+ * iPad's CD3282 Mikey (0x17, 0x29) uses one for its headphone jack.
+ */
+#define PMU_CHILD_VECTORS   (PMU_EVENT_COUNT * 8)
+
+static void d1815_child_irq(void *opaque, int vector, int level)
+{
+    S5L8930D1815State *s = opaque;
+
+    if (level) {
+        s->regs[PMU_EVENT + (vector >> 3)] |= 1u << (vector & 7);
+        d1815_update_irq(s);
+    }
+}
+
 /* QEMU's RTC (-rtc base=, clock=), in Unix seconds: the host's UTC by default. */
 static int64_t d1815_rtc_clock(void)
 {
@@ -548,7 +574,7 @@ static int d1815_event(I2CSlave *i2c, enum i2c_event event)
 static uint8_t d1815_recv(I2CSlave *i2c)
 {
     S5L8930D1815State *s = S5L8930_D1815(i2c);
-    uint8_t reg = s->reg++;
+    uint8_t reg = s->reg++ & 0xff;          /* regs[] covers every uint8_t */
     uint8_t v = s->regs[reg];
 
     switch (reg) {
@@ -581,7 +607,7 @@ static int d1815_send(I2CSlave *i2c, uint8_t data)
         s->reg = data;
         return 0;
     }
-    reg = s->reg++;
+    reg = s->reg++ & 0xff;                  /* regs[] covers every uint8_t */
     switch (reg) {
     case PMU_EVENT ... PMU_EVENT + PMU_EVENT_COUNT - 1:
     case PMU_STATUS ... PMU_STATUS + 4:
@@ -680,6 +706,7 @@ static void d1815_init(Object *obj)
     I2C_SLAVE(obj)->address = D1815_ADDR;
     qdev_init_gpio_out(DEVICE(obj), &s->irq, 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->ap_power, "ap-power", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), d1815_child_irq, "event", PMU_CHILD_VECTORS);
     s->adc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, d1815_adc_done, s);
 }
 
@@ -1042,7 +1069,7 @@ static int ak8973_event(I2CSlave *i2c, enum i2c_event event)
 static uint8_t ak8973_recv(I2CSlave *i2c)
 {
     S5L8930AK8973State *s = S5L8930_AK8973(i2c);
-    uint8_t v = s->regs[s->reg];
+    uint8_t v = s->regs[s->reg];            /* bounded: uint8_t reg, regs[256] */
 
     if (s->reg == AK_H1X + 2) {
         s->regs[AK_ST] &= ~AK_ST_INT;       /* data read out */
@@ -1177,7 +1204,7 @@ static void ak8975_measure(S5L8930AK8973State *s)
 static uint8_t ak8975_recv(I2CSlave *i2c)
 {
     S5L8930AK8973State *s = S5L8930_AK8973(i2c);
-    uint8_t v = s->regs[s->reg];
+    uint8_t v = s->regs[s->reg];            /* bounded: uint8_t reg, regs[256] */
 
     if (s->reg >= AK75_HXL && s->reg <= AK75_ST2) {
         s->regs[AK75_ST1] = 0;              /* data read out */
@@ -1232,6 +1259,99 @@ static const TypeInfo s5l8930_ak8975_info = {
     .name          = TYPE_S5L8930_AK8975,
     .parent        = TYPE_S5L8930_AK8973,
     .class_init    = ak8975_class_init,
+};
+
+/* ---- AKM AK8963C 3-axis magnetometer (I2C1 0x0C, "compass,akm8963") ----
+ *
+ * The iPhone 5's. 14G61 AppleAKM8963 probes WIA (0x00) and accepts what it
+ * reads; the part is the AK8975's register file (ST1 DRDY, HXL..HZH, ST2,
+ * CNTL1 at 0x0A, the ASA fuse ROM at 0x10-0x12 in mode 0xF) with CNTL1's BIT
+ * (bit 4) choosing 16-bit output at 0.15 uT/LSB over 14-bit at 0.6 uT/LSB,
+ * which ST2's BITM echoes; continuous modes 2 and 6 (8 and 100 Hz) and the
+ * soft reset at CNTL2 (0x0B). A continuous mode has a fresh sample whenever
+ * ST1 is read with none pending. The DT node's matrix is the identity, as the
+ * iPhone 4's AK8975B; the field is the AK8973 model's.
+ */
+
+#define AK63_CNTL2  0x0b
+
+static void ak8963_measure(S5L8930AK8973State *s)
+{
+    bool bit16 = s->regs[AK75_CNTL] & 0x10;
+    double b[3];
+
+    ak_field(s, b);
+    for (int i = 0; i < 3; i++) {
+        int16_t v = CLAMP(lround(b[i] / (bit16 ? 0.15 : 0.6)), bit16 ? -32760 : -8190, bit16 ? 32760 : 8190);
+
+        s->regs[AK75_HXL + 2 * i] = v;
+        s->regs[AK75_HXL + 2 * i + 1] = (uint16_t)v >> 8;
+    }
+    s->regs[AK75_ST1] = 1;                  /* DRDY */
+    s->regs[AK75_ST2] = bit16 ? 0x10 : 0;   /* BITM */
+    if ((s->regs[AK75_CNTL] & 0xf) == 1) {
+        s->regs[AK75_CNTL] &= 0x10;         /* single measurement: back to power-down */
+    }
+}
+
+static uint8_t ak8963_recv(I2CSlave *i2c)
+{
+    S5L8930AK8973State *s = S5L8930_AK8973(i2c);
+    uint8_t mode = s->regs[AK75_CNTL] & 0xf;
+
+    if (s->reg == AK75_ST1 && !(s->regs[AK75_ST1] & 1) && (mode == 2 || mode == 4 || mode == 6)) {
+        ak8963_measure(s);
+    }
+    return ak8975_recv(i2c);
+}
+
+static void ak8963_reset(DeviceState *dev)
+{
+    S5L8930AK8973State *s = S5L8930_AK8973(dev);
+
+    ak8975_reset(dev);
+    s->regs[0x01] = 0x9a;                   /* INFO, a reserved device byte */
+}
+
+static int ak8963_send(I2CSlave *i2c, uint8_t data)
+{
+    S5L8930AK8973State *s = S5L8930_AK8973(i2c);
+    uint8_t reg;
+
+    if (s->addressing) {
+        s->addressing = false;
+        s->reg = data;
+        return 0;
+    }
+    reg = s->reg++;
+    if (reg == AK75_CNTL) {
+        s->regs[reg] = data & 0x1f;
+        s->regs[AK75_ST1] = 0;
+        if ((data & 0xf) == 1) {
+            ak8963_measure(s);
+        }
+    } else if (reg == AK63_CNTL2 && (data & 1)) {
+        ak8963_reset(DEVICE(s));            /* SRST */
+    } else if (reg == 0x0c) {
+        s->regs[reg] = data & 0x40;         /* ASTC SELF */
+    }
+    return 0;
+}
+
+static void ak8963_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
+
+    device_class_set_legacy_reset(dc, ak8963_reset);
+    k->recv = ak8963_recv;
+    k->send = ak8963_send;
+}
+
+static const TypeInfo s5l8930_ak8963_info = {
+    .name          = TYPE_S5L8930_AK8963,
+    .parent        = TYPE_S5L8930_AK8975,
+    .class_init    = ak8963_class_init,
 };
 
 /* ---- ST L3G4200D 3-axis gyroscope (I2C2 0x68, "gyro,ap3gdl") ----
@@ -1365,7 +1485,7 @@ static void l3g_schedule(S5L8930L3GState *s)
 
     if (s->regs[L3G_CTRL1] & 0x08) {
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NANOSECONDS_PER_SECOND / hz[s->regs[L3G_CTRL1] >> 6]);
+                  NANOSECONDS_PER_SECOND / hz[(s->regs[L3G_CTRL1] >> 6) & 3]);
     } else {
         timer_del(s->timer);
     }
@@ -1480,6 +1600,9 @@ static void l3g_realize(DeviceState *dev, Error **errp)
 
 static int l3g_post_load(void *opaque, int version_id)
 {
+    if (((S5L8930L3GState *)opaque)->level > L3G_FIFO_SLOTS) {
+        return -EINVAL;                         /* l3g_pop moves level slots of fifo[] */
+    }
     l3g_schedule(opaque);
     return 0;
 }
@@ -1535,6 +1658,7 @@ static void s5l8930_i2c_register_types(void)
     type_register_static(&s5l8930_tca6408_info);
     type_register_static(&s5l8930_ak8973_info);
     type_register_static(&s5l8930_ak8975_info);
+    type_register_static(&s5l8930_ak8963_info);
     type_register_static(&s5l8930_l3g_info);
 }
 

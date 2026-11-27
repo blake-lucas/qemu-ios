@@ -34,6 +34,10 @@
 #include "hw/arm/ipod_touch_2g.h"
 #include "cpu.h"
 #include "qemu/main-loop.h"
+#include "accel/tcg/probe.h"
+#include "accel/tcg/cpu-mmu-index.h"
+#include "exec/target_page.h"
+#include "exec/tlb-flags.h"
 
 int32_t guest_svcs_errno = 0;
 
@@ -43,22 +47,8 @@ uint64_t qemu_call_status(CPUARMState *env, const struct ARMCPRegInfo *ri)
     return 0;
 }
 
-static int agent_copy(void *opaque, uint32_t address, uint8_t *data,
-                      size_t length, bool write)
-{
-    if (length && length - 1 > UINT32_MAX - address) {
-        return -1;
-    }
-    return cpu_memory_rw_debug(opaque, address, data, length, write);
-}
-
-/*
- * The request block, 52 bytes on the caller's stack, read and written back once per call: GL calls
- * come thousands of times a second, and a debug access walks the guest page tables and dispatches
- * through the address space each time (~12% of the vCPU in a draw-call benchmark on a Poco F3).
- * LT_QCALL_FAST=off always takes the debug path (A/B).
- */
-static int qcall_rw(CPUState *cpu, uint64_t va, void *buf, size_t len, bool write)
+/* LT_QCALL_FAST=off: no host-pointer path for guest memory, only the debug access (A/B). */
+static bool qcall_fast(void)
 {
     static int fast = -1;
 
@@ -66,10 +56,69 @@ static int qcall_rw(CPUState *cpu, uint64_t va, void *buf, size_t len, bool writ
         const char *v = getenv("LT_QCALL_FAST");
         fast = !(v && !strcmp(v, "off"));
     }
-    if (fast && guest_rw_ram(cpu, va, buf, len, write)) {
+    return fast;
+}
+
+/*
+ * Guest memory for a guest-services caller, at the caller's privilege: the
+ * vCPU's TLB as a load or store at its current MMU index would see it. Plain
+ * RAM goes through the host pointers (guest_rw_ram); a page the caller may
+ * access that isn't plain RAM (MMIO, dirty tracking, a watchpoint) takes a
+ * debug access. A page the caller can't access at its level is refused for an
+ * unprivileged caller, so User code can't reach kernel or read-only pages
+ * through the host; a privileged caller (the kernel, which owns the page
+ * tables anyway) gets the debug access, as before. Returns 0 or -1.
+ */
+int guest_copy(void *opaque, uint32_t address, uint8_t *data, size_t length,
+               bool write)
+{
+    CPUState *cpu = opaque;
+    CPUArchState *env = cpu_env(cpu);
+    MMUAccessType type = write ? MMU_DATA_STORE : MMU_DATA_LOAD;
+    int idx = cpu_mmu_index(cpu, false);
+    bool user = (env->uncached_cpsr & CPSR_M) == ARM_CPU_MODE_USR;
+    vaddr p = address, last = (vaddr)address + length - 1;
+    void *host;
+
+    if (!length) {
         return 0;
     }
-    return cpu_memory_rw_debug(cpu, va, buf, len, write);
+    if (last > UINT32_MAX) {
+        return -1;
+    }
+    if (qcall_fast() && guest_rw_ram(cpu, address, data, length, write)) {
+        return 0;
+    }
+    for (;;) {
+        if (probe_access_flags(env, p, 0, type, idx, true, &host, 0) &
+            TLB_INVALID_MASK) {
+            if (user) {
+                return -1;
+            }
+            break;
+        }
+        if ((p & TARGET_PAGE_MASK) == (last & TARGET_PAGE_MASK)) {
+            break;
+        }
+        p = (p & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
+    }
+    /* bounded: data is the caller's, length bytes long */
+    return cpu_memory_rw_debug(cpu, address, data, length, write) ? -1 : 0;
+}
+
+/*
+ * The request block, 52 bytes on the caller's stack, read and written back once per call: GL calls
+ * come thousands of times a second, and a debug access walks the guest page tables and dispatches
+ * through the address space each time (~12% of the vCPU in a draw-call benchmark on a Poco F3).
+ * Through guest_copy. LT_QCALL_FAST=off skips the host-pointer
+ * path and always takes the debug access (A/B).
+ */
+static int qcall_rw(CPUState *cpu, uint64_t va, void *buf, size_t len, bool write)
+{
+    if (va > UINT32_MAX) {
+        return -1;
+    }
+    return guest_copy(cpu, va, buf, len, write);
 }
 
 /* The other boards' QEMU_CALL handlers read and write the request block through this. */
@@ -202,7 +251,7 @@ void qemu_call(CPUARMState *env, const struct ARMCPRegInfo *ri, uint64_t value)
                 qcall.args.ag.token, qcall.args.ag.buffer_guest_ptr,
                 qcall.args.ag.offset, qcall.args.ag.length,
                 qemu_clock_get_ms(QEMU_CLOCK_REALTIME), candidate,
-                agent_copy, cpu);
+                guest_copy, cpu);
             guest_svcs_errno = qcall.retval < 0 ? EINVAL : 0;
             break;
         }

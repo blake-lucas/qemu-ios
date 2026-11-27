@@ -441,6 +441,8 @@ struct qemu_work_item;
  * @sem: WIN32 only semaphore used only for qtest
  * @thread_id: native thread id of vCPU, only live once @created is #true
  * @running: #true if CPU is currently running (lockless).
+ * @exec_seen: set by cpu_exec at a TB boundary, cleared by MTTCG's guest clock check (lockless).
+ * @idle: #true while the MTTCG vCPU thread sleeps in qemu_process_cpu_events; @idles counts its wakes (lockless).
  * @has_waiter: #true if a CPU is currently waiting for the cpu_exec_end;
  * valid under cpu_list_lock.
  * @created: Indicates whether the CPU thread has been successfully created.
@@ -512,6 +514,8 @@ struct CPUState {
 #endif
     int thread_id;
     bool running, has_waiter;
+    bool exec_seen, idle;
+    unsigned idles;
     struct QemuCond *halt_cond;
     bool thread_kicked;
     bool created;
@@ -585,6 +589,16 @@ struct CPUState {
      * if it were the only CPU (no CF_PARALLEL). See mttcg_start_vcpu_thread.
      */
     bool tcg_unshared;
+    /*
+     * Set by a board: CPUs in different TLB domains never share translations, so a guest's broadcast TLB
+     * maintenance (TLBI...IS) reaches only its own domain (cputlb.c). The A6's IOP and AE2 cores run their own
+     * firmware on their own memory maps beside the two AP cores. 0 for every CPU unless the board sets it.
+     */
+    int tlb_domain;
+    /* Spin briefly on a contended BQL as vCPU 0 does (cpus-bql-spin.c.inc): a board's other application core. */
+    bool bql_spin;
+    /* Broadcast TLB flushes queued for this CPU, run at its next TB boundary (cputlb.c, tlb_shootdown_service). */
+    struct TLBShootdownQueue *tlb_sd;
     uint32_t tcg_cflags;
     uint32_t halted;
     int32_t exception_index;
@@ -1103,6 +1117,28 @@ void free_queued_cpu_work(CPUState *cpu);
  * @cpu: The CPU which work queue to process.
  */
 void process_queued_cpu_work(CPUState *cpu);
+
+/* Exclusive work by function (cpu-common.c), printed by the vCPU accounting. */
+struct it_acct_excl { void *fn; uint64_t n, wait_ns, work_ns, max_wait; };
+extern bool it_acct_excl_on;
+extern struct it_acct_excl it_acct_excl[16];
+void it_acct_excl_note(void *fn, int64_t wait, int64_t work);
+
+/* Run the broadcast TLB flushes queued for @cpu, on its own thread, without the BQL (cputlb.c). */
+void tlb_shootdown_service_slow(CPUState *cpu);
+extern bool tlb_shootdown_inline;
+extern bool tlb_shootdown_board;
+/*
+ * The indirect-branch caches (indirect-cache=on) also in TBs that several vCPUs run (CF_PARALLEL): a board opt-in,
+ * as they rest on the guest never remapping code in place (accel/tcg/translator.c, cross-page-chain).
+ */
+extern bool tcg_indirect_cache_parallel;
+static inline void tlb_shootdown_service(CPUState *cpu)
+{
+    if (unlikely(tlb_shootdown_inline) && cpu->tlb_sd) {
+        tlb_shootdown_service_slow(cpu);
+    }
+}
 
 /**
  * cpu_exec_start:

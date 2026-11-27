@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#define LOG_GUEST_ERROR 2
+#define qemu_log_mask(...) ((void)0)
 typedef unsigned Clock;
 typedef int ClockEvent;
 typedef struct audsettings { int freq, nchannels; } Settings;

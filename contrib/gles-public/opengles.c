@@ -41,6 +41,7 @@
 #include "../it-gles/mbxshim.c"
 
 #include <pthread.h>
+#include "xfer-abi.h"
 
 #define GLES_FN(n, f, id, argc, fl) GLES_ROW_##n,
 enum {
@@ -53,6 +54,7 @@ extern int syscall(int, ...);
 extern void *memset(void *, int, unsigned long);
 extern int memcmp(const void *, const void *, unsigned long);
 extern int strcmp(const char *, const char *);
+extern int dlclose(void *);
 
 /* ------------------------------------------------------------ the command buffer --- */
 
@@ -101,12 +103,31 @@ static void fe_destroy_gc(GuestGC *gc)
 
 /* Per thread: the GC gl* calls go to, and whose it is (an EAGLContext or an egl context) so
  * +currentContext / eglGetCurrentContext answer with the object that was made current. */
-typedef struct { GuestGC *gc; void *owner; int is_egl; void *draw, *read; } fe_cur_t;
+typedef struct {
+    GuestGC *gc;
+    void *owner;
+    int is_egl;
+    void *draw, *read;
+    void **native;
+} fe_cur_t;
 static pthread_key_t fe_key;
 static pthread_once_t fe_once = PTHREAD_ONCE_INIT;
 static void *fe_hand[GLES_N_HAND];
+static unsigned fe_native_key;
+static unsigned fe_native_gc_word;
+static pthread_once_t fe_native_once = PTHREAD_ONCE_INIT;
+static void fe_native_current(fe_cur_t *c, GuestGC *gc);
 
-static void fe_key_init(void) { pthread_key_create(&fe_key, free); }
+static void fe_cur_free(void *value)
+{
+    fe_cur_t *c = value;
+    if (fe_native_key && pthread_getspecific(fe_native_key) == c->native)
+        pthread_setspecific(fe_native_key, 0);
+    free(c->native);
+    free(c);
+}
+
+static void fe_key_init(void) { pthread_key_create(&fe_key, fe_cur_free); }
 
 static fe_cur_t *fe_cur(int create)
 {
@@ -123,6 +144,7 @@ static void fe_set_current(GuestGC *gc, void *owner, int is_egl, void *draw, voi
     if (!c) return;
     if (c->gc && c->gc != gc) batch_flush(c->gc);
     c->gc = gc; c->owner = owner; c->is_egl = is_egl; c->draw = draw; c->read = read;
+    fe_native_current(c, gc);
 }
 
 static GuestGC *fe_gc(void)
@@ -143,12 +165,17 @@ static int fe_es2(void)
 }
 
 /* APPLE_sync (6.x and 7.x CoreAnimation fence every frame): the host runs each call to completion before the
- * next, so a fence is signaled the moment it exists. Answered here, nothing goes to the host. */
+ * next, so a fence is signaled the moment it exists. On a host that reports GLES_CAP_FENCE_FINISH (the A6's) a
+ * fence first publishes queued drawing and rendered IOSurface pixels to CPU consumers; elsewhere nothing goes to
+ * the host, as those boards were qualified with. */
 #define FE_GL_ALREADY_SIGNALED 0x911A
 static unsigned fe_fenceSync(void *gc, unsigned condition, unsigned flags)
 {
     static unsigned next;
-    (void)gc; (void)condition; (void)flags;
+    static int finish = -1;
+    (void)condition; (void)flags;
+    if (gc && finish < 0) finish = (qc(GLES_OP_CAPABILITIES, gc, 0, A(0)) & GLES_CAP_FENCE_FINISH) != 0;
+    if (gc && finish > 0) qc(GLES_ID_glFinish, gc, 0, A(0));
     return ++next ? next : ++next;                          /* 0 is no sync */
 }
 static unsigned fe_isSync(void *gc, unsigned sync) { (void)gc; return sync != 0; }
@@ -176,9 +203,29 @@ static void fe_getSynciv(void *gc, unsigned sync, unsigned pname, int bufsize, i
 }
 
 static const char *fe_getString(void *gc, unsigned name);
-static int fe_getIntegerv(void *gc, unsigned pname, unsigned params);
-static int fe_getFloatv(void *gc, unsigned pname, unsigned params);
-static int fe_getBooleanv(void *gc, unsigned pname, unsigned params);
+static int fe_gpu(void *gc);
+/* The GPUs' extension lists and limits, and the glGet thunks that clamp to them. */
+#include "../it-gles/gles_gpus.h"
+
+static int fe_readPixels(void *gc, unsigned x, unsigned y, unsigned width,
+                          unsigned height, unsigned format, unsigned type, unsigned pixels)
+{
+    if (gc && ((GuestGC *)gc)->host && pixels) {
+        unsigned alignment = 4;
+        qc(GLES_ID_glGetIntegerv, gc, 2, A(0x0d05 /* GL_PACK_ALIGNMENT */,
+            (unsigned)(unsigned long)&alignment));
+        if (alignment == 1 || alignment == 2 || alignment == 4 || alignment == 8) {
+            GuestGC layout = {0};
+            layout.unpack_alignment = alignment;
+            /* The shared sizing helper uses unpack fields. A local layout
+             * supplies pack alignment without changing this context's uploads. */
+            unsigned bytes = texture_bytes(&layout, width, height, format, type);
+            guest_fault_write(pixels, bytes);
+        }
+    }
+    return (int)qc(GLES_ID_glReadPixels, gc, 7,
+        A(x, y, width, height, format, type, pixels));
+}
 
 /* The host reads a string argument with a debug read that cannot fault pages in: touch them first. */
 static int fe_shaderSource(void *gc, unsigned sh, unsigned count, unsigned strs, unsigned lens)
@@ -224,6 +271,7 @@ static void fe_hello(void)
     fe_hand[GLES_ID_glGetAttribLocation] = (void *)fe_getAttribLocation;
     fe_hand[GLES_ID_glGetUniformLocation] = (void *)fe_getUniformLocation;
     fe_hand[GLES_ID_glFenceSyncAPPLE] = (void *)fe_fenceSync;
+    fe_hand[GLES_ID_glReadPixels] = (void *)fe_readPixels;
     fe_hand[GLES_ID_glIsSyncAPPLE] = (void *)fe_isSync;
     fe_hand[GLES_ID_glDeleteSyncAPPLE] = (void *)fe_deleteSync;
     fe_hand[GLES_ID_glClientWaitSyncAPPLE] = (void *)fe_clientWaitSync;
@@ -800,6 +848,16 @@ static unsigned fe_preflight(void *ctx, unsigned a, unsigned b, unsigned c)
     return a;
 }
 
+/* Whether a w x h drawable fits the GPU's renderbuffers (gles_gpus.h): its driver gives a larger layer no storage. */
+static int fe_drawable_fits(GuestGC *gc, unsigned w, unsigned h)
+{
+    float v[2] = { 65535, 0 };
+    fe_limit(fe_gpu(gc), 0x84E8, v, 1);                                 /* MAX_RENDERBUFFER_SIZE */
+    if (w <= v[0] && h <= v[0]) return 1;
+    refused("drawable:", "gpu-size", w > h ? w : h);
+    return 0;
+}
+
 /* NULL releases the layer (unbinds it: CA refuses a second bind while the layer still belongs to the first). */
 static int fe_bind_layer(GuestGC *gc, void *drawable)
 {
@@ -850,11 +908,45 @@ static int fe_bind_layer(GuestGC *gc, void *drawable)
     }
     wd_ = v->width; ht = v->height;
     if (flags & 4) { unsigned t = wd_; wd_ = ht; ht = t; }
-    if (qc(GLES_OP_DRAWABLE_STORAGE, gc, 2, A(wd_, ht)) < 0) {
+    if (!fe_drawable_fits(gc, wd_, ht) || qc(GLES_OP_DRAWABLE_STORAGE, gc, 2, A(wd_, ht)) < 0) {
         ca_detach_view(v);
         return 0;
     }
     return 1;
+}
+
+extern unsigned long long mach_absolute_time(void);
+extern int mach_timebase_info(unsigned *);
+extern int usleep(unsigned);
+
+/* A device's present waits for a free buffer, which the panel hands back at its next vblank, so a loop that presents
+ * faster than 60 times a second is held to the panel there. fe_present never waits (with no buffer free it drops the
+ * frame), so such a loop ran free: Doodle Jump's armv7 build stepped its game 120 times a second on the iPod touch 3G
+ * and iPhone 3GS, at double speed. Each view takes one present per 60 Hz slot: a present before its slot waits for it;
+ * one that comes later keeps the slots' phase while it is less than a frame late, else starts them again from now. */
+static void fe_pace(ca_view_t *v)
+{
+    /* No 64-bit divides: the old SDKs link no __udivdi3. A slot and a wait fit 32 bits of 24 MHz ticks. */
+    static double ns_per_tick;
+    static unsigned period;
+    unsigned long long now;
+    if (!period) {
+        unsigned tb[2] = {0, 0};
+        if (mach_timebase_info(tb) || !tb[0] || !tb[1]) return;
+        ns_per_tick = (double)tb[0] / tb[1];
+        period = (unsigned)(16666667.0 / ns_per_tick);
+        if (!period) return;
+    }
+    now = mach_absolute_time();
+    if (v->next_present > now) {
+        unsigned wait = (unsigned)(v->next_present - now);
+        if (wait <= period) usleep((unsigned)(wait * ns_per_tick / 1000.0));
+        v->next_present += period;
+    } else if (v->next_present && now - v->next_present < period) {
+        v->next_present += period;
+    } else {
+        v->next_present = now + period;
+    }
 }
 
 /* The frame goes into this GC's layer surface (or, for the CA compositor, the surface it attached as the
@@ -871,6 +963,7 @@ static int fe_present(GuestGC *gc)
         for (i = 0; i < n; i += 4096) p[i] = p[i];
         if (n) p[n - 1] = p[n - 1];
     }
+    if (v) fe_pace(v);
     return GLESPresentView(gc, 0) != 0;
 }
 
@@ -909,7 +1002,8 @@ static int fe_attach_renderbuffer(GuestGC *gc, void *surf)
     if (!v || !surface_capture(v, surf)) return 0;
     fe_own(v, surf);
     v->need_buffer = 0;
-    return qc(GLES_OP_DRAWABLE_STORAGE, gc, 2, A(v->width, v->height)) >= 0;
+    return fe_drawable_fits(gc, v->width, v->height) &&
+           qc(GLES_OP_DRAWABLE_STORAGE, gc, 2, A(v->width, v->height)) >= 0;
 }
 
 /* 5.x makes some layer IOSurfaces with no pixel format (IOSurfaceGetPixelFormat 0: the home screen's icon labels)
@@ -918,7 +1012,7 @@ static unsigned fe_gl_fourcc(unsigned fmt, unsigned type)
 {
     int ub = type == 0x1401;                          /* GL_UNSIGNED_BYTE */
     if (fmt == 0x80E1 && (ub || type == 0x8367)) return 0x42475241;   /* GL_BGRA: 'BGRA' */
-    if (fmt == 0x1908 && ub) return 0x52474241;                       /* GL_RGBA: 'RGBA' */
+    if (fmt == 0x1908 && (ub || type == 0x8367)) return 0x52474241;   /* GL_RGBA, byte or 8_8_8_8_REV: 'RGBA' */
     if (fmt == 0x1906 && ub) return 0x41303038;                       /* GL_ALPHA: 'A008' */
     if (fmt == 0x1909 && ub) return 0x4c303038;                       /* GL_LUMINANCE: 'L008' */
     if (fmt == 0x190A && ub) return 0x32433038;                       /* GL_LUMINANCE_ALPHA: '2C08' */
@@ -1100,6 +1194,23 @@ __attribute__((constructor)) static void fe_bind_xfer(void)
     p_xfer = (fe_xfer_fn)dlsym(RTLD_DEFAULT, "IOSurfaceAcceleratorTransferSurface");
     p_accGetID = dlsym(RTLD_DEFAULT, "IOSurfaceAcceleratorGetID");
     if (!p_xferSwap || !p_xfer || !p_accGetID) return;
+    /* IOSurface can export lazy compatibility forwarders with these same
+     * names. Inspect the implementation image, not RTLD_DEFAULT's forwarder. */
+    void *implementation = dlopen("/System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/IOSurfaceAccelerator", RTLD_NOW);
+    void *plain = implementation ? dlsym(implementation, "IOSurfaceAcceleratorTransferSurface") : 0;
+    void *swap = implementation ? dlsym(implementation, "IOSurfaceAcceleratorTransferSurfaceWithSwap") : 0;
+    void *conditional = implementation ? dlsym(implementation, "IOSurfaceAcceleratorConditionalTransferSurfaceWithSwap") : 0;
+    int synchronous = ((uintptr_t)plain & (uintptr_t)swap & (uintptr_t)conditional & 1) &&
+        fe_xfer_synchronous_alias((const unsigned char *)((uintptr_t)plain & ~(uintptr_t)1),
+            (const unsigned char *)((uintptr_t)conditional & ~(uintptr_t)1),
+            (const unsigned char *)((uintptr_t)swap & ~(uintptr_t)1));
+    if (implementation) dlclose(implementation);
+    if (synchronous) {
+        /* Its native alias already performs the copy. Treating it as the old
+         * eleven-argument API corrupts its caller and defers to a no-op. */
+        w("[gles] IOSurfaceAccelerator synchronous transfer alias retained\n");
+        return;
+    }
     for (i = 0; i < n; i++) {
         const unsigned char *h = _dyld_get_image_header(i), *lc;
         unsigned long slide = (unsigned long)_dyld_get_image_vmaddr_slide(i), le = 0, k, c;
@@ -1214,17 +1325,6 @@ static const unsigned *fe_cache_image(const char *path, const char **base, unsig
     return 0;
 }
 
-/* Where the `n` bytes at `tag` first appear in [base, base + size), or 0. */
-static const char *fe_find(const char *base, unsigned long size, const char *tag, unsigned long n)
-{
-    unsigned long off;
-    for (off = 0; base && off + n <= size; off++) {
-        unsigned long t = 0;
-        while (t < n && base[off + t] == tag[t]) t++;
-        if (t == n) return base + off;
-    }
-    return 0;
-}
 
 static const char *fe_stock_encode(void)
 {
@@ -1237,11 +1337,6 @@ static const char *fe_stock_encode(void)
 
 /* ------------------------------------------------------ what the GPU reports --- */
 
-/* The GPU this firmware drives, as the column of the tables below: the MBX (ES 1.1 only) where there is no
- * GLEngine.bundle, else the SGX 535 (every SGX board here: iPhone 3GS, iPod touch 3G and 4G, iPhone 4, iPad), in an
- * ES 1.1 or an ES 2.0 context. */
-enum { FE_MBX, FE_SGX1, FE_SGX2 };
-static int fe_gpu(void *gc) { return !fe_es2() ? FE_MBX : gc && ((GuestGC *)gc)->api == 2 ? FE_SGX2 : FE_SGX1; }
 
 /* The image at `path` in the shared cache, else the file itself mapped read-only (2.x and 3.x keep the GL engines
  * out of the cache): its bytes in *base (0 if neither), which stay mapped. */
@@ -1267,7 +1362,40 @@ static void fe_image(const char *path, const char **base, unsigned long *size)
  * GLEngine for the SGX's extension names and GLSL version. */
 #define FE_MBX_ENGINE "/System/Library/Frameworks/OpenGLES.framework/MBXGLEngine.bundle/MBXGLEngine"
 #define FE_SGX_ENGINE "/System/Library/Frameworks/OpenGLES.framework/GLEngine.bundle/GLEngine"
-#define FE_SGX_DRIVER "/System/Library/Extensions/IMGSGX535GLDriver.bundle/IMGSGX535GLDriver"
+/* Firmware caches carry the matching SGX driver. N42 uses 543RC2, N41
+ * 543, and the iPad 4 uses 554; looking only for 535 fabricated that identity
+ * whenever the actual driver was present under a later name. */
+static int fe_sgx_driver(const char **base, unsigned long *size)
+{
+    static const char *paths[] = {
+        "/System/Library/Extensions/IMGSGX535GLDriver.bundle/IMGSGX535GLDriver",
+        "/System/Library/Extensions/IMGSGX543RC2GLDriver.bundle/IMGSGX543RC2GLDriver",
+        "/System/Library/Extensions/IMGSGX543GLDriver.bundle/IMGSGX543GLDriver",
+        "/System/Library/Extensions/IMGSGX554GLDriver.bundle/IMGSGX554GLDriver",
+    };
+    unsigned i;
+    for (i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        fe_image(paths[i], base, size);
+        if (*base) return (int)i;
+    }
+    return -1;
+}
+
+/* The GPU this firmware drives, as the column of gles_gpus.h's tables: the MBX (ES 1.1 only) where there is no
+ * GLEngine.bundle, else the SGX its driver is for, the 543MP3 where that is a later one than the 535 (the iPhone 5's;
+ * the iPad 4's 554 takes the 543's column too) and the 535 on every other SGX board (iPhone 3GS, iPod touch 3G and
+ * 4G, iPhone 4, iPad), in an ES 1.1 or an ES 2.0 context. */
+static int fe_gpu(void *gc)
+{
+    static int sgx = -1;
+    if (!fe_es2()) return FE_MBX;
+    if (sgx < 0) {
+        const char *base;
+        unsigned long size;
+        sgx = fe_sgx_driver(&base, &size) > 0 ? FE_543_1 : FE_SGX1;
+    }
+    return sgx + (gc && ((GuestGC *)gc)->api == 2);                     /* FE_SGX2, FE_543_2 */
+}
 
 /* The first C string in [text, text + size) that starts with `prefix` (at a string's start), or 0. */
 static const char *fe_cstring(const char *text, unsigned long size, const char *prefix)
@@ -1281,95 +1409,26 @@ static const char *fe_cstring(const char *text, unsigned long size, const char *
     return 0;
 }
 
-/* Whether `text` names extension `name` whole: the engines keep each as a string, MBXGLEngine's with a trailing
- * space, so it starts a string and ends at a NUL or a space. */
-static int fe_names(const char *text, unsigned long size, const char *name)
-{
-    unsigned long n = slen(name), off = 0;
-    const char *p;
-    while (off < size && (p = fe_find(text + off, size - off, name, n))) {
-        unsigned long end = (unsigned long)(p - text) + n;
-        if ((p == text || p[-1] == 0) && (end == size || text[end] == 0 || text[end] == ' ')) return 1;
-        off = (unsigned long)(p - text) + 1;
-    }
-    return 0;
-}
-
-/* GL_EXTENSIONS: the extensions the hardware reports (MBXGLEngine's public list on the MBX; Apple's list for the
- * SGX 535 in "OpenGL ES Hardware Platform Guide for iOS", ES 1.1 and ES 2.0) that the bridge implements, each one only
- * where this firmware's engine names it, so a later extension (EXT_discard_framebuffer from 4.0, APPLE_sync from 6.0)
- * stays out of an earlier firmware. FE_X_OLD: on the MBX already in 2.2.1, whose engine is the OpenGLES this file
- * replaces, so with no engine to read only those are given.
- *
- * Left out though the hardware reports them, for want of a host implementation: APPLE_copy_texture_levels,
- * APPLE_framebuffer_multisample, APPLE_rgb_422, EXT_debug_label, EXT_debug_marker, EXT_map_buffer_range,
- * EXT_separate_shader_objects, EXT_shader_framebuffer_fetch, EXT_shader_texture_lod, EXT_texture_storage,
- * OES_element_index_uint, OES_mapbuffer, OES_matrix_palette, OES_stencil8 (a stencil-only renderbuffer the host's
- * framebuffers don't take) and OES_vertex_array_object. APPLE_texture_rectangle and APPLE_core_surface_texture are
- * the MBX engine's private pair, which 2.x CoreAnimation needs before it composites with GL. */
-#define FE_X_MBX  1
-#define FE_X_SGX1 2
-#define FE_X_SGX2 4
-#define FE_X_OLD  8
-static const struct { const char *name; unsigned char on; } fe_ext_table[] = {
-    { "GL_APPLE_core_surface_texture",     FE_X_MBX | FE_X_OLD },
-    { "GL_APPLE_sync",                     FE_X_SGX2 },
-    { "GL_APPLE_texture_2D_limited_npot",  FE_X_SGX1 },
-    { "GL_APPLE_texture_format_BGRA8888",  FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 },
-    { "GL_APPLE_texture_max_level",        FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 },
-    { "GL_APPLE_texture_rectangle",        FE_X_MBX | FE_X_OLD },
-    { "GL_EXT_blend_minmax",               FE_X_SGX1 | FE_X_SGX2 },
-    { "GL_EXT_discard_framebuffer",        FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 },
-    { "GL_EXT_read_format_bgra",           FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 },
-    { "GL_EXT_texture_filter_anisotropic", FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 | FE_X_OLD },
-    { "GL_EXT_texture_lod_bias",           FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-    { "GL_IMG_read_format",                FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 | FE_X_OLD },
-    { "GL_IMG_texture_compression_pvrtc",  FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 | FE_X_OLD },
-    { "GL_IMG_texture_format_BGRA8888",    FE_X_MBX | FE_X_OLD },
-    { "GL_OES_blend_equation_separate",    FE_X_SGX1 },
-    { "GL_OES_blend_func_separate",        FE_X_SGX1 },
-    { "GL_OES_blend_subtract",             FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-    { "GL_OES_compressed_paletted_texture", FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-    { "GL_OES_depth24",                    FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 | FE_X_OLD },
-    { "GL_OES_depth_texture",              FE_X_SGX2 },
-    { "GL_OES_draw_texture",               FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-    { "GL_OES_fbo_render_mipmap",          FE_X_SGX1 | FE_X_SGX2 },
-    { "GL_OES_framebuffer_object",         FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-    { "GL_OES_packed_depth_stencil",       FE_X_SGX1 | FE_X_SGX2 },
-    { "GL_OES_point_size_array",           FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-    { "GL_OES_point_sprite",               FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-    { "GL_OES_read_format",                FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-    { "GL_OES_rgb8_rgba8",                 FE_X_MBX | FE_X_SGX1 | FE_X_SGX2 | FE_X_OLD },
-    { "GL_OES_standard_derivatives",       FE_X_SGX2 },
-    { "GL_OES_stencil_wrap",               FE_X_SGX1 },
-    { "GL_OES_texture_float",              FE_X_SGX2 },
-    { "GL_OES_texture_half_float",         FE_X_SGX2 },
-    { "GL_OES_texture_mirrored_repeat",    FE_X_MBX | FE_X_SGX1 | FE_X_OLD },
-};
-
-/* The list for `gpu` into `out` (`cap` bytes), given its engine's __TEXT (`text`, 0 if none was found). */
-static void fe_extensions(char *out, unsigned cap, int gpu, const char *text, unsigned long size)
-{
-    unsigned i, k, n = 0, col = 1u << gpu;
-    for (i = 0; i < sizeof fe_ext_table / sizeof fe_ext_table[0]; i++) {
-        const char *e = fe_ext_table[i].name;
-        if (!(fe_ext_table[i].on & col)) continue;
-        if (text ? !fe_names(text, size, e) : !(fe_ext_table[i].on & FE_X_OLD)) continue;
-        if (n + slen(e) + 1 >= cap) break;
-        if (n) out[n++] = ' ';
-        for (k = 0; e[k]; k++) out[n++] = e[k];
-    }
-    out[n] = 0;
-}
+static unsigned fe_caps;   /* GLES_OP_CAPABILITIES, read with the first glGetString */
 
 /* GL_VERSION: the SGX driver's own ("OpenGL ES 2.0 IMGSGX535-63.24"; 7.x keeps only the build, "IMGSGX535-97.7",
  * and GLEngine puts it together the same way), MBXGLEngine's ("OpenGL ES-CM 1.1 (48)"), or the bare version. */
 static const char *fe_version(char *out, unsigned cap, int gpu, const char *text, unsigned long size)
 {
-    const char *v = gpu == FE_SGX2 ? "OpenGL ES 2.0" : "OpenGL ES-CM 1.1", *b;
+    const char *v = FE_ES2(gpu) ? "OpenGL ES 2.0" : "OpenGL ES-CM 1.1", *b;
     unsigned n = 0, k;
     if (gpu == FE_MBX) return (b = fe_cstring(text, size, v)) ? b : v;
-    if (!(b = fe_find(text, size, "IMGSGX535-", 10))) return v;
+    const char *search = text, *end = text ? text + size : 0;
+    unsigned long left = size;
+    for (;;) {
+        if (!(b = fe_find(search, left, "IMGSGX", 6))) return v;
+        const char *p = b + 6;
+        while (p < end && ((*p >= '0' && *p <= '9') ||
+               (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z'))) p++;
+        if (p < end && end - p >= 2 && *p == '-' && p[1] >= '0' && p[1] <= '9') break;
+        search = b + 6;
+        left = (unsigned long)(end - search);
+    }
     for (k = 0; v[k] && n + 1 < cap; k++) out[n++] = v[k];
     if (n + 1 < cap) out[n++] = ' ';
     for (k = 0; b + k < text + size && b[k] && n + 1 < cap; k++) out[n++] = b[k];
@@ -1381,120 +1440,37 @@ static const char *fe_version(char *out, unsigned cap, int gpu, const char *text
  * device's GPU answers, each string read once per column. */
 static const char *fe_getString(void *gc, unsigned name)
 {
-    static char ext[3][1024], ver[3][64];
-    static const char *renderer[3], *version[3], *glsl;
+    static char ext[FE_NGPU][1024], ver[FE_NGPU][64];
+    static const char *renderer[FE_NGPU], *version[FE_NGPU], *glsl;
     int gpu = fe_gpu(gc);
     if (!renderer[gpu]) {
         const char *text, *drv;
         unsigned long size, dsize;
         fe_image(gpu == FE_MBX ? FE_MBX_ENGINE : FE_SGX_ENGINE, &text, &size);
-        fe_extensions(ext[gpu], sizeof ext[gpu], gpu, text, size);
+        fe_caps = (unsigned)qc(GLES_OP_CAPABILITIES, gc, 0, A(0));
+        fe_extensions(ext[gpu], sizeof ext[gpu], gpu, fe_caps, text, size);
+        if (FE_ES2(gpu) && fe_names(text, size, "GL_EXT_shader_framebuffer_fetch") &&
+            (fe_caps & GLES_CAP_FRAMEBUFFER_FETCH))
+            w("[gles] coherent framebuffer fetch enabled by renderer capability\n");
         if (gpu != FE_MBX) {
             if (!glsl && !(glsl = fe_cstring(text, size, "OpenGL ES GLSL ES 1.0"))) glsl = "OpenGL ES GLSL ES 1.00";
-            fe_image(FE_SGX_DRIVER, &drv, &dsize);
+            fe_sgx_driver(&drv, &dsize);
             text = drv; size = dsize;
         }
         version[gpu] = fe_version(ver[gpu], sizeof ver[gpu], gpu, text, size);
         if (!(renderer[gpu] = fe_cstring(text, size, "PowerVR ")))
-            renderer[gpu] = gpu == FE_MBX ? "PowerVR MBXLite with VGPLite" : "PowerVR SGX 535";
+            renderer[gpu] = gpu == FE_MBX ? "PowerVR MBXLite with VGPLite" :
+                            gpu >= FE_543_1 ? "PowerVR SGX 543" : "PowerVR SGX 535";
     }
     switch (name) {
     case 0x1F00: return "Imagination Technologies";
     case 0x1F01: return renderer[gpu];
     case 0x1F02: return version[gpu];
     case 0x1F03: return ext[gpu];
-    case 0x8B8C: if (gpu == FE_SGX2) return glsl;              /* SHADING_LANGUAGE_VERSION: ES 2.0 only */
+    case 0x8B8C: if (FE_ES2(gpu)) return glsl;                 /* SHADING_LANGUAGE_VERSION: ES 2.0 only */
                  /* fall through */
     default:     return "";
     }
-}
-
-/* glGet's implementation limits as the GPU reports them, where the host's (the Mac's: 16384-texel textures, 16
- * units) are larger: an app sizes its atlases and picks its paths from these, and CoreAnimation tiles any layer
- * larger than MAX_TEXTURE_SIZE, as on the device. MBX: MBXGLEngine's get (3.1.3, run on each name). SGX 535: Apple's
- * "OpenGL ES Hardware Platform Guide for iOS" tables 1-2 and 1-3, which agree with the driver's configuration
- * (IMGSGX535GLDriver glrSetConfigData, 3.2: 2048, 511.0, 16.0, 4.0). -1: not this GPU's or not clamped (the SGX's
- * anisotropy and smooth widths, which neither source gives). A pair is a range (low, high) except VIEWPORT_DIMS. */
-static const struct { unsigned short pname, n; short v[3][2]; } fe_limit_table[] = {
-    /*                                  MBX          SGX ES 1.1   SGX ES 2.0 */
-    { 0x0D33, 1, { { 1024 },     { 2048 },     { 2048 } } },        /* MAX_TEXTURE_SIZE */
-    { 0x84E8, 1, { { 1024 },     { 2048 },     { 2048 } } },        /* MAX_RENDERBUFFER_SIZE */
-    { 0x851C, 1, { { -1 },       { 2048 },     { 2048 } } },        /* MAX_CUBE_MAP_TEXTURE_SIZE */
-    { 0x0D3A, 2, { { 1024, 1024 }, { 2048, 2048 }, { 2048, 2048 } } }, /* MAX_VIEWPORT_DIMS */
-    { 0x846D, 2, { { 1, 64 },    { 1, 511 },   { 1, 511 } } },      /* ALIASED_POINT_SIZE_RANGE */
-    { 0x846E, 2, { { 1, 64 },    { 1, 16 },    { 1, 16 } } },       /* ALIASED_LINE_WIDTH_RANGE */
-    { 0x0B12, 2, { { 1, 64 },    { 1, 511 },   { -1 } } },          /* SMOOTH_POINT_SIZE_RANGE */
-    { 0x0B22, 2, { { 1, 1 },     { -1 },       { -1 } } },          /* SMOOTH_LINE_WIDTH_RANGE */
-    { 0x84E2, 1, { { 2 },        { 8 },        { -1 } } },          /* MAX_TEXTURE_UNITS */
-    { 0x0D32, 1, { { 1 },        { 6 },        { -1 } } },          /* MAX_CLIP_PLANES */
-    { 0x0D31, 1, { { 8 },        { 8 },        { -1 } } },          /* MAX_LIGHTS */
-    { 0x0D36, 1, { { 16 },       { 16 },       { -1 } } },          /* MAX_MODELVIEW_STACK_DEPTH */
-    { 0x0D38, 1, { { 2 },        { 2 },        { -1 } } },          /* MAX_PROJECTION_STACK_DEPTH */
-    { 0x0D39, 1, { { 4 },        { 4 },        { -1 } } },          /* MAX_TEXTURE_STACK_DEPTH */
-    { 0x84FD, 1, { { 2 },        { 4 },        { -1 } } },          /* MAX_TEXTURE_LOD_BIAS_EXT */
-    { 0x84FF, 1, { { 2 },        { -1 },       { -1 } } },          /* MAX_TEXTURE_MAX_ANISOTROPY_EXT */
-    { 0x8869, 1, { { -1 },       { -1 },       { 16 } } },          /* MAX_VERTEX_ATTRIBS */
-    { 0x8DFB, 1, { { -1 },       { -1 },       { 128 } } },         /* MAX_VERTEX_UNIFORM_VECTORS */
-    { 0x8DFC, 1, { { -1 },       { -1 },       { 8 } } },           /* MAX_VARYING_VECTORS */
-    { 0x8DFD, 1, { { -1 },       { -1 },       { 64 } } },          /* MAX_FRAGMENT_UNIFORM_VECTORS */
-    { 0x8872, 1, { { -1 },       { -1 },       { 8 } } },           /* MAX_TEXTURE_IMAGE_UNITS */
-    { 0x8B4C, 1, { { -1 },       { -1 },       { 0 } } },           /* MAX_VERTEX_TEXTURE_IMAGE_UNITS */
-    { 0x8B4D, 1, { { -1 },       { -1 },       { 8 } } },           /* MAX_COMBINED_TEXTURE_IMAGE_UNITS */
-};
-
-/* How many values `pname` has if it is one of `gpu`'s limits, else 0; then clamp the host's answer `v` to it. */
-static unsigned fe_limit(int gpu, unsigned pname, float v[2], int clamp)
-{
-    unsigned i;
-    for (i = 0; i < sizeof fe_limit_table / sizeof fe_limit_table[0]; i++) {
-        const short *hw = fe_limit_table[i].v[gpu];
-        unsigned n = fe_limit_table[i].n;
-        if (fe_limit_table[i].pname != pname || hw[0] < 0) continue;
-        if (!clamp) return n;
-        if (n == 2 && pname != 0x0D3A) {                    /* a range: raise its low end, lower its high */
-            if (v[0] < hw[0]) v[0] = hw[0];
-            if (v[1] > hw[1]) v[1] = hw[1];
-        } else {
-            if (v[0] > hw[0]) v[0] = hw[0];
-            if (n == 2 && v[1] > hw[1]) v[1] = hw[1];
-        }
-        return n;
-    }
-    return 0;
-}
-
-static int fe_getIntegerv(void *gc, unsigned pname, unsigned params)
-{
-    int *p = (int *)(unsigned long)params, r = (int)qc(GLES_ID_glGetIntegerv, gc, 2, A(pname, params));
-    unsigned n = fe_limit(fe_gpu(gc), pname, 0, 0);
-    float v[2];
-    if (r || !p || !n) return r;
-    v[0] = p[0]; v[1] = n == 2 ? p[1] : 0;
-    fe_limit(fe_gpu(gc), pname, v, 1);
-    p[0] = (int)v[0];
-    if (n == 2) p[1] = (int)v[1];
-    return r;
-}
-static int fe_getFloatv(void *gc, unsigned pname, unsigned params)
-{
-    float *p = (float *)(unsigned long)params;
-    int r = (int)qc(GLES_ID_glGetFloatv, gc, 2, A(pname, params));
-    unsigned n = fe_limit(fe_gpu(gc), pname, 0, 0);
-    if (r || !p || !n) return r;
-    if (n == 1) { float v[2] = { p[0], 0 }; fe_limit(fe_gpu(gc), pname, v, 1); p[0] = v[0]; }
-    else fe_limit(fe_gpu(gc), pname, p, 1);
-    return r;
-}
-static int fe_getBooleanv(void *gc, unsigned pname, unsigned params)
-{
-    unsigned char *p = (unsigned char *)(unsigned long)params;
-    unsigned n = fe_limit(fe_gpu(gc), pname, 0, 0);
-    int v[2], r;
-    if (!n) return (int)qc(GLES_ID_glGetBooleanv, gc, 2, A(pname, params));
-    if ((r = fe_getIntegerv(gc, pname, (unsigned)(unsigned long)v)) || !p) return r;
-    p[0] = v[0] != 0;
-    if (n == 2) p[1] = v[1] != 0;
-    return r;
 }
 
 /* {GC, table}: 5.x QuartzCore and CoreImage load the engine's context from word 0 and call field k through word
@@ -1522,6 +1498,86 @@ static void **fe_macro(GuestGC *gc, void ***cache)
     *cache = m;
     fe_ca_path("macro context");
     return m;
+}
+
+/* Cache-optimized clients can branch directly to the stock GL trampolines,
+ * even when dyld loads this framework as their OpenGLES dependency. Publish
+ * the same current GC and discovered dispatch table for those calls too.
+ * Accept only a complete, independently cross-checked trampoline shape;
+ * unknown ABIs retain the existing public/macro-context path. */
+static int fe_native_dispatch(const unsigned char *p, unsigned slot,
+                              unsigned *key, unsigned *gc_word)
+{
+    unsigned at = 16;
+    /* Later engines return through an IT block when the TLS context is null,
+     * instead of branching around an early return. Keep validating the entire
+     * load/dispatch tail and its independently discovered named slot. */
+    if ((p[14] | p[15] << 8) == 0x2b00 &&
+        (p[16] | p[17] << 8) == 0xbf08 &&
+        (p[18] | p[19] << 8) == 0x4770) at = 20;
+    unsigned tls = p[12] | p[13] << 8;
+    unsigned load_gc = p[at] | p[at + 1] << 8;
+    unsigned target = p[at + 4] | p[at + 5] << 8;
+    if (fe_u32(p + 4) != 0x0f70ee1d || fe_u32(p + 8) != 0x0003f020 ||
+        (tls & 0xf83f) != 0x6803 || (load_gc & 0xf83f) != 0x6818 ||
+        (p[at + 2] | p[at + 3] << 8) != 0xf8d3 || (target >> 12) != 3 ||
+        (p[at + 6] | p[at + 7] << 8) != 0x4718) return 0;
+    unsigned tls_offset = ((tls >> 6) & 31) * 4;
+    unsigned gc_offset = ((load_gc >> 6) & 31) * 4;
+    if (!tls_offset || slot > 1024 || (gc_offset != 12 && gc_offset != 16) ||
+        (target & 0xfff) != gc_offset + 4 + slot * 4) return 0;
+    *gc_word = gc_offset / 4;
+    *key = tls_offset / 4;
+    return 1;
+}
+
+static void fe_native_layout(void)
+{
+    {
+        const unsigned char *p;
+        gles_encode_override = fe_stock_encode();
+        if (!gles_encode_override) return;
+        gles_export_lookup = fe_stock_symbol;
+        if (!gles_discover(0)) return;
+        void *symbol = fe_stock_symbol("glGetIntegerv");
+        if (!symbol || !((unsigned long)symbol & 1)) return;
+        p = (const unsigned char *)((unsigned long)symbol & ~1UL);
+        int slot = gles_slot_of(GLES_ID_glGetIntegerv);
+        unsigned key, gc_word;
+        if (slot < 0 || !fe_native_dispatch(p, (unsigned)slot, &key, &gc_word)) return;
+        fe_native_gc_word = gc_word;
+        fe_native_key = key;
+    }
+}
+
+static void fe_native_current(fe_cur_t *c, GuestGC *gc)
+{
+    static int noted, allowed = -1;
+    /* The A6's host only (GLES_CAP_NATIVE_DISPATCH): elsewhere cached callers stay the no-ops they were qualified as. */
+    if (gc && allowed < 0) allowed = (qc(GLES_OP_CAPABILITIES, gc, 0, A(0)) & GLES_CAP_NATIVE_DISPATCH) != 0;
+    if (allowed <= 0) return;
+    if (gc) pthread_once(&fe_native_once, fe_native_layout);
+    if (!fe_native_key) return;
+    if (!gc) {
+        if (pthread_getspecific(fe_native_key) == c->native)
+            pthread_setspecific(fe_native_key, 0);
+        return;
+    }
+    if (!c->native) {
+        c->native = calloc(fe_native_gc_word + 1 + gli.n, sizeof(void *));
+        if (!c->native) return;
+        gles_fill(c->native + fe_native_gc_word + 1, gli.n, fe_hand);
+    }
+    c->native[fe_native_gc_word] = gc;
+    if (pthread_setspecific(fe_native_key, c->native)) {
+        refused("eagl:", "native-current-context", ~0u);
+    } else if (!noted++) {
+        w("[gles] native cached GL dispatch active (thread slot ");
+        wd(fe_native_key);
+        w(", GC offset ");
+        wd(fe_native_gc_word * 4);
+        w(")\n");
+    }
 }
 
 /* ------------------------------------------------------------------------- EAGL --- */
@@ -1564,6 +1620,7 @@ __attribute__((objc_root_class))
 - (id)init;
 - (void)dealloc;
 - (id)retain;
+- (id)copy;
 - (void)release;
 - (BOOL)respondsToSelector:(SEL)sel;
 - (BOOL)isEqual:(id)other;
@@ -1583,6 +1640,15 @@ NSString *const kEAGLContextPropertySharegroup = @"EAGLContextPropertySharegroup
 NSString *const kEAGLContextPropertyClientRetainRelease = @"EAGLContextPropertyClientRetainRelease";
 /* 7.x */
 NSString *const kEAGLColorFormatSRGBA8 = @"EAGLColorFormatSRGBA8";
+/* iOS10 exports these descriptors even on devices using ordinary BGRA8
+ * drawables. Their exact strings are from the original14G61 OpenGLES image.
+ * Exporting a descriptor does not advertise an XR10 EGL configuration: this
+ * front end still exposes only its qualified8-bit/565/4444 configurations. */
+NSString *const kEAGLColorFormatSRGB_XR10 = @"EAGLColorFormatSRGB_XR10";
+NSString *const kEAGLColorFormatSRGB_XR10_A8_2P = @"EAGLColorFormatSRGB_XR10_A8_2P";
+NSString *const kEAGLColorFormatSRGBA_XR10_64BPP = @"EAGLColorFormatSRGBA_XR10_64BPP";
+NSString *const kEAGLColorFormatRGBA_XR10_64BPP = @"EAGLColorFormatRGBA_XR10_64BPP";
+
 NSString *const kEAGLContextPropertySharedWithCompute = @"EAGLContextPropertySharedWithCompute";
 NSString *const kEAGLContextPropertyVisibleInDebugTools = @"EAGLContextPropertyVisibleInDebugTools";
 
@@ -1653,7 +1719,7 @@ __attribute__((visibility("default")))
 }
 @end
 
-struct eagl_private { GuestGC *gc; EAGLSharegroup *sharegroup; NSUInteger api; void **macro; };
+struct eagl_private { GuestGC *gc; EAGLSharegroup *sharegroup; NSUInteger api; void **macro; id debug_label; };
 
 __attribute__((visibility("default")))
 @interface EAGLContext : NSObject { @public struct eagl_private *_private; }
@@ -1699,6 +1765,7 @@ __attribute__((visibility("default")))
             fe_destroy_gc(_private->gc);
         }
         free(_private->macro);
+        [_private->debug_label release];
         [_private->sharegroup release];
         free(_private);
     }
@@ -1730,12 +1797,30 @@ __attribute__((visibility("default")))
 - (NSUInteger)API { return _private->api; }
 - (EAGLSharegroup *)sharegroup { return _private->sharegroup; }
 
+/* iOS 8 CoreImage labels its internal contexts during UIKit startup.
+ * Keep a copied diagnostic label; it does not change rendering state. */
+- (void)setDebugLabel:(NSString *)label
+{
+    id next = [label copy];
+    [_private->debug_label release];
+    _private->debug_label = next;
+}
+- (NSString *)debugLabel { return _private->debug_label; }
+
 /* The drawable's -nativeWindow (and its color format, which the host does not need: see fe_bind_layer); a nil
  * drawable releases the storage. */
 - (BOOL)renderbufferStorage:(NSUInteger)target fromDrawable:(id)drawable
 {
     void *win = 0;
     (void)target;
+    if (drawable && [drawable respondsToSelector:@selector(drawableProperties)]) {
+        id format = [[drawable drawableProperties] objectForKey:kEAGLDrawablePropertyColorFormat];
+        if ([format isEqual:kEAGLColorFormatSRGB_XR10] || [format isEqual:kEAGLColorFormatSRGB_XR10_A8_2P] ||
+            [format isEqual:kEAGLColorFormatSRGBA_XR10_64BPP] || [format isEqual:kEAGLColorFormatRGBA_XR10_64BPP]) {
+            refused("eagl:", "XR10 drawable", ~0u);
+            return 0;
+        }
+    }
     if (drawable && (![drawable respondsToSelector:@selector(nativeWindow)] || !(win = [drawable nativeWindow]))) {
         refused("eagl:", "drawable", ~0u);
         return 0;
@@ -1764,9 +1849,10 @@ __attribute__((visibility("default")))
                     width:(NSUInteger)width height:(NSUInteger)height format:(NSUInteger)format type:(NSUInteger)type
                     plane:(NSUInteger)plane invert:(BOOL)invert
 {
-    (void)ifmt; (void)width; (void)height; (void)plane; (void)invert;
+    (void)ifmt; (void)invert;
     fe_ca_path("texImageIOSurface:");
-    return GLESBindCoreSurfaceAs(_private->gc, target, surface, fe_gl_fourcc(format, type)) != 0;
+    return GLESBindCoreSurfaceAs(_private->gc, target, surface, fe_gl_fourcc(format, type),
+                                (int)plane, (unsigned)width, (unsigned)height) != 0;
 }
 
 - (void)swapNotification:(void *)fb forTransaction:(unsigned)transaction onLayer:(unsigned)layer

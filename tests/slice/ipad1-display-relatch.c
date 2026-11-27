@@ -6,7 +6,7 @@
  *
  * Mutation (named, must fail this test): drop the early return in front_latch (the compose runs every latch).
  *
- * SLICE:types hw/arm/s5l8930_display.c define (DP_LAYERS|DP_UI_BASE|DP_UI_FORMAT|DP_UI_ADDR|DP_UI_STRIDE|DP_UI_UNSCALED|DP_UI_DST_ORIGIN|DP_UI_SRC_SIZE|DP_UI_DST_END)[[:space:](]
+ * SLICE:types hw/arm/s5l8930_display.c define (DP_LAYERS|DP_UI_BASE|DP_UI_FORMAT|DP_UI_ADDR|DP_UI_STRIDE|DP_UI_UNSCALED|DP_UI_DST_ORIGIN|DP_UI_SRC_END|DP_UI_DST_END|DP_UI_FORMAT_LINEAR|DP_UI_SRC_ORIGIN)[[:space:](]
  * SLICE:types hw/arm/s5l8930_display.c typedef UILayer
  * SLICE hw/arm/s5l8930_display.c fn scanout_layer layer_row_bytes layer_fetch layers_fetch layer_row layers video_compose blend front_latch
  * PKG glib-2.0
@@ -28,6 +28,7 @@ typedef struct { uint32_t regs[0x6000 / 4]; uint32_t swap_id; } DisplayPipe;
 #include "types.h"
 
 typedef struct S5L8930DisplayState {
+    bool h5p;
     DisplayPipe pipe[1];
     uint8_t *front, *front_next;
     size_t front_size;
@@ -44,7 +45,7 @@ static unsigned reads;
 
 /* The two stubs: a fixed panel, and guest memory at IOVA = offset into ram. */
 static void panel_size(S5L8930DisplayState *s, unsigned *w, unsigned *h) { *w = W; *h = H; }
-static void fb_read(S5L8930DisplayState *s, uint32_t va, uint8_t *dst, unsigned len)
+static void fb_read(S5L8930DisplayState *s, uint32_t va, uint8_t *dst, unsigned len, const uint32_t *tables)
 {
     assert(va + len <= sizeof(ram));
     memcpy(dst, ram + va, len);
@@ -68,7 +69,8 @@ int main(void)
     r[DP_LAYERS / 4] = 0x200;
     r[(DP_UI_BASE(1) + DP_UI_ADDR) / 4] = BASE;
     r[(DP_UI_BASE(1) + DP_UI_STRIDE) / 4] = W * 4;
-    r[(DP_UI_BASE(1) + DP_UI_SRC_SIZE) / 4] = W << 16 | H;
+    r[(DP_UI_BASE(1) + DP_UI_FORMAT) / 4] |= DP_UI_FORMAT_LINEAR;
+    r[(DP_UI_BASE(1) + DP_UI_SRC_END) / 4] = W << 16 | H;
     for (unsigned i = 0; i < W * H; i++) {
         ram[BASE + i * 4 + 3] = 0xff;
     }
@@ -94,8 +96,9 @@ int main(void)
 
     /* Same bytes, the layer moved right by 4: composed again, columns 0-3 clear. */
     r[(DP_UI_BASE(1) + DP_UI_DST_ORIGIN) / 4] = 4 << 16;
-    r[(DP_UI_BASE(1) + DP_UI_SRC_SIZE) / 4] = (W - 4) << 16 | H;
+    r[(DP_UI_BASE(1) + DP_UI_SRC_END) / 4] = (W - 4) << 16 | H;
     r[(DP_UI_BASE(1) + DP_UI_STRIDE) / 4] = W * 4;
+    r[(DP_UI_BASE(1) + DP_UI_FORMAT) / 4] |= DP_UI_FORMAT_LINEAR;
     front_latch(s);
     assert(s->front_gen == 3);
     memset(want, 0, sizeof(want));
@@ -115,8 +118,9 @@ int main(void)
     r[DP_LAYERS / 4] = 0x300;
     r[(DP_UI_BASE(0) + DP_UI_ADDR) / 4] = base0;
     r[(DP_UI_BASE(0) + DP_UI_STRIDE) / 4] = W * 4;
+    r[(DP_UI_BASE(0) + DP_UI_FORMAT) / 4] |= DP_UI_FORMAT_LINEAR;
     r[(DP_UI_BASE(1) + DP_UI_DST_ORIGIN) / 4] = 0;
-    r[(DP_UI_BASE(1) + DP_UI_SRC_SIZE) / 4] = W << 16 | H;
+    r[(DP_UI_BASE(1) + DP_UI_SRC_END) / 4] = W << 16 | H;
     for (unsigned i = 0; i < W * H; i++) {
         ram[base0 + i * 4 + 3] = 0xff;
     }

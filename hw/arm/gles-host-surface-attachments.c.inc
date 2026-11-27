@@ -6,6 +6,10 @@
     case GLES_SLOT_FB_RENDERBUFFER: {    /* target, attach, rbtarget, rb */
         uint32_t attach = a[1], rb = a[3];
 
+        if (!gles_guest_name_ok(rb)) {
+            gles_refuse("name:private:%u", slot);
+            return gles_reject(GL_INVALID_OPERATION);
+        }
         if (attach == GL_COLOR_ATTACHMENT0_EXT) {
             if (gles_sync_surface(cpu)) return -1;
             /* A color renderbuffer that never got GL storage is the CA
@@ -13,14 +17,20 @@
              * other color attachment takes that meaning away again. */
             gles_set_drawable(gh.bound_framebuffer,
                               rb && !g_hash_table_contains(
-                                  gh.rb_sized, GUINT_TO_POINTER(rb)));
+                                  gh.rb_sized, GUINT_TO_POINTER(rb)) ? rb : 0);
         }
         gles_trace_attach("glFramebufferRenderbuffer", attach, rb);
+        gles_note_attach_rebind(attach, GL_RENDERBUFFER_EXT, rb, 0, 0);
         gh.fb_dirty = true;
         if (gles_is_drawable(gh.bound_framebuffer)) {
             /* gh.fbo already carries the color target we present out of and a
              * matching depth buffer; re-attaching over either breaks the
-             * present path. */
+             * present path. The A6 keeps the native named attachment too, so a
+             * later allocation of this shared renderbuffer can stop using the
+             * surrogate. */
+            if (gles_a6) {
+                gles_record_drawable_attachment(a);
+            }
             return 0;
         }
         glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, attach,
@@ -38,11 +48,16 @@
          * current color attachment sent its render-to-texture pass to the
          * screen and left the texture empty, which composited as a white
          * level while the menus (UIKit) looked perfect. */
+        if (!gles_guest_name_ok(a[3])) {
+            gles_refuse("name:private:%u", slot);
+            return gles_reject(GL_INVALID_OPERATION);
+        }
         if (a[1] == GL_COLOR_ATTACHMENT0_EXT) {
             if (gles_sync_surface(cpu)) return -1;
-            gles_set_drawable(gh.bound_framebuffer, false);
+            gles_set_drawable(gh.bound_framebuffer, 0);
         }
         gles_trace_attach("glFramebufferTexture2D", a[1], a[3]);
+        gles_note_attach_rebind(a[1], GL_TEXTURE, a[3], a[4], a[2]);
         gh.fb_dirty = true;
         if (gles_is_drawable(gh.bound_framebuffer)) {
             return 0;

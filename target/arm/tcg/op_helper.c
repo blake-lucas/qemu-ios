@@ -1227,11 +1227,15 @@ void HELPER(tidcp_el0)(CPUARMState *env, uint32_t syndrome)
     }
 }
 
+/* Names the BQL acquisition for the vCPU accounting (system/cpus.c). */
+extern __thread const char *it_acct_site;
+
 void HELPER(set_cp_reg)(CPUARMState *env, const void *rip, uint32_t value)
 {
     const ARMCPRegInfo *ri = rip;
 
     if (ri->type & ARM_CP_IO) {
+        it_acct_site = ri->name;
         bql_lock();
         ri->writefn(env, ri, value);
         bql_unlock();
@@ -1245,7 +1249,8 @@ uint32_t HELPER(get_cp_reg)(CPUARMState *env, const void *rip)
     const ARMCPRegInfo *ri = rip;
     uint32_t res;
 
-    if (ri->type & ARM_CP_IO) {
+    if ((ri->type & (ARM_CP_IO | ARM_CP_IO_READ_UNLOCKED)) == ARM_CP_IO) {
+        it_acct_site = ri->name;
         bql_lock();
         res = ri->readfn(env, ri);
         bql_unlock();
@@ -1261,6 +1266,7 @@ void HELPER(set_cp_reg64)(CPUARMState *env, const void *rip, uint64_t value)
     const ARMCPRegInfo *ri = rip;
 
     if (ri->type & ARM_CP_IO) {
+        it_acct_site = ri->name;
         bql_lock();
         ri->writefn(env, ri, value);
         bql_unlock();
@@ -1274,7 +1280,8 @@ uint64_t HELPER(get_cp_reg64)(CPUARMState *env, const void *rip)
     const ARMCPRegInfo *ri = rip;
     uint64_t res;
 
-    if (ri->type & ARM_CP_IO) {
+    if ((ri->type & (ARM_CP_IO | ARM_CP_IO_READ_UNLOCKED)) == ARM_CP_IO) {
+        it_acct_site = ri->name;
         bql_lock();
         res = ri->readfn(env, ri);
         bql_unlock();

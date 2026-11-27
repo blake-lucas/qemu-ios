@@ -141,6 +141,13 @@ struct VXDH264 {
     uint32_t key[2];                 /* SPS0, PIC0's size fields of the open stream */
     GByteArray *sps, *pps;           /* what the decoder has */
     GPtrArray *pending;              /* the current picture's slices, Annex B */
+    bool decode_order;               /* hand pictures back as they finish decoding, not as the decoder outputs them */
+    struct {                         /* the picture the decoder last allocated: the one being decoded */
+        uint8_t *plane[3];
+        int stride[3];
+        int width, height;
+        bool valid;
+    } cur;
 };
 
 static void params_init(VXDH264 *h)
@@ -407,9 +414,40 @@ static GByteArray *make_pps(const Params *p, const VXDSlice *sl, unsigned pps_id
     return bw_nal(&w, 0x68);
 }
 
+/*
+ * The decoder allocates each picture's buffer as it starts the picture; note where, so the finished picture can be
+ * read from it at once (vxd_h264_decode), not when the decoder outputs it.
+ */
+static int vxd_get_buffer(AVCodecContext *c, AVFrame *frame, int flags)
+{
+    VXDH264 *h = c->opaque;
+    int err = avcodec_default_get_buffer2(c, frame, flags);
+
+    if (err >= 0 && (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P)) {
+        for (int i = 0; i < 3; i++) {
+            h->cur.plane[i] = frame->data[i];
+            h->cur.stride[i] = frame->linesize[i];
+        }
+        h->cur.width = frame->width;
+        h->cur.height = frame->height;
+        h->cur.valid = true;
+    }
+    return err;
+}
+
+/* Frames the decoder has output (decode order mode: pictures were handed back already), dropped. */
+static void vxd_discard_output(VXDH264 *h)
+{
+    while (h->codec && avcodec_receive_frame(h->codec, h->frame) >= 0) {
+        av_frame_unref(h->frame);
+    }
+}
+
 VXDH264 *vxd_h264_new(void)
 {
     VXDH264 *h = g_new0(VXDH264, 1);
+    const char *order = getenv("LT_VXD_PICTURE_ORDER");        /* "output": as the decoder outputs them (the old way) */
+    h->decode_order = !(order && !strcmp(order, "output"));
     params_init(h);
     h->pending = g_ptr_array_new_with_free_func((GDestroyNotify)g_byte_array_unref);
     return h;
@@ -458,8 +496,12 @@ int vxd_h264_decode(VXDH264 *h, const VXDSlice *sl, VXDPicture *pic)
         rbsp[n++] = sl->nal[i];
         zeros = sl->nal[i] ? 0 : zeros + 1;
     }
+    if (n < 2) {                 /* a NAL header and at least a byte of slice header */
+        return -1;
+    }
     VXDSlice rs = *sl;
     rs.sr_bit = sr_bit;
+    vxd_discard_output(h);          /* a picture handed back by the last call is still in the decoder's output */
 
     unsigned pps_id = 0, alive = 0;
     for (int pass = 0; pass < 2 && !alive; pass++) {
@@ -496,6 +538,10 @@ int vxd_h264_decode(VXDH264 *h, const VXDSlice *sl, VXDPicture *pic)
             return -1;
         }
         h->codec->thread_count = 1;
+        h->codec->opaque = h;
+        if (h->decode_order) {
+            h->codec->get_buffer2 = vxd_get_buffer;
+        }
         h->codec->flags |= AV_CODEC_FLAG_LOW_DELAY;
         h->codec->flags2 |= AV_CODEC_FLAG2_CHUNKS;
         if (avcodec_open2(h->codec, codec, NULL) < 0) {
@@ -540,6 +586,7 @@ int vxd_h264_decode(VXDH264 *h, const VXDSlice *sl, VXDPicture *pic)
         h->sps = g_steal_pointer(&sps);
         h->pps = g_steal_pointer(&pps);
     }
+    h->cur.valid = false;
     for (unsigned i = 0; i < h->pending->len; i++) {
         GByteArray *nal = h->pending->pdata[i];
         if (vxd_send(h, nal->data, nal->len, sl->tag) < 0) {
@@ -548,11 +595,35 @@ int vxd_h264_decode(VXDH264 *h, const VXDSlice *sl, VXDPicture *pic)
         }
     }
     g_ptr_array_set_size(h->pending, 0);
+    if (h->decode_order) {
+        /*
+         * The hardware writes a picture to its buffer as it decodes it, and the guest shows it from there in display
+         * order. The decoder outputs in display order: a reference picture only after the B pictures that follow it
+         * in decode order, two renders later, though the render's fence has been answered. A picture shown from its
+         * buffer in between was the one that buffer held before (a stream of I P B B pictures showed every third
+         * frame from the past). So the picture is read where it was decoded, now.
+         */
+        if (!h->cur.valid) {
+            return 0;
+        }
+        for (int i = 0; i < 3; i++) {
+            pic->plane[i] = h->cur.plane[i];
+            pic->stride[i] = h->cur.stride[i];
+        }
+        pic->width = h->cur.width;
+        pic->height = h->cur.height;
+        pic->tag = sl->tag;
+        h->cur.valid = false;
+        return 1;
+    }
     return vxd_h264_next(h, pic);
 }
 
 int vxd_h264_next(VXDH264 *h, VXDPicture *pic)
 {
+    if (h->decode_order) {
+        return 0;
+    }
     int err = avcodec_receive_frame(h->codec, h->frame);
     if (err == AVERROR(EAGAIN)) {
         return 0;

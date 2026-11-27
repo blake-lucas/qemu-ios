@@ -2251,23 +2251,27 @@ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
     },
     /* The counter itself */
     { .name = "CNTPCT", .cp = 15, .crm = 14, .opc1 = 0,
-      .access = PL0_R, .type = ARM_CP_64BIT | ARM_CP_NO_RAW | ARM_CP_IO,
+      .access = PL0_R, .type = ARM_CP_64BIT | ARM_CP_NO_RAW | ARM_CP_IO |
+              ARM_CP_IO_READ_UNLOCKED,
       .accessfn = gt_pct_access,
       .readfn = gt_cnt_read, .resetfn = arm_cp_reset_ignore,
     },
     { .name = "CNTPCT_EL0", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 3, .crn = 14, .crm = 0, .opc2 = 1,
-      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
+      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO |
+              ARM_CP_IO_READ_UNLOCKED,
       .accessfn = gt_pct_access, .readfn = gt_cnt_read,
     },
     { .name = "CNTVCT", .cp = 15, .crm = 14, .opc1 = 1,
-      .access = PL0_R, .type = ARM_CP_64BIT | ARM_CP_NO_RAW | ARM_CP_IO,
+      .access = PL0_R, .type = ARM_CP_64BIT | ARM_CP_NO_RAW | ARM_CP_IO |
+              ARM_CP_IO_READ_UNLOCKED,
       .accessfn = gt_vct_access,
       .readfn = gt_virt_cnt_read, .resetfn = arm_cp_reset_ignore,
     },
     { .name = "CNTVCT_EL0", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 3, .crn = 14, .crm = 0, .opc2 = 2,
-      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
+      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO |
+              ARM_CP_IO_READ_UNLOCKED,
       .accessfn = gt_vct_access, .readfn = gt_virt_cnt_read,
     },
     /* Comparison value, indicating when the timer goes off */
@@ -2873,10 +2877,14 @@ static void vmsa_ttbcr_write(CPUARMState *env, const ARMCPRegInfo *ri,
         }
     }
 
-    if (arm_feature(env, ARM_FEATURE_LPAE)) {
+    if (arm_feature(env, ARM_FEATURE_LPAE) &&
+        ((raw_read(env, ri) | value) & TTBCR_EAE)) {
         /*
          * With LPAE the TTBCR could result in a change of ASID
-         * via the TTBCR.A1 bit, so do a TLB flush.
+         * via the TTBCR.A1 bit, so do a TLB flush. With the
+         * Short-descriptor format before and after (EAE clear),
+         * the ASID is CONTEXTIDR's and N, PD0 and PD1 only steer
+         * walks, as on a core without LPAE.
          */
         tlb_flush(CPU(cpu));
     }
@@ -7137,6 +7145,21 @@ void register_cp_regs_for_features(ARMCPU *cpu)
     }
     if (arm_feature(env, ARM_FEATURE_GENERIC_TIMER)) {
         define_arm_cp_regs(cpu, generic_timer_cp_reginfo);
+#ifndef CONFIG_USER_ONLY
+        if (arm_feature(env, ARM_FEATURE_SWIFT_INTERRUPT_PROBE)) {
+            /* Swift exposes CNTVOFF at EL1 without architected Hyp mode.
+             * Keep the generic timer's write semantics: an offset change
+             * must immediately update ISTATUS, IRQ and the next deadline.
+             * This register owns its reset state; there is no EL2 alias. */
+            const ARMCPRegInfo swift_cntvoff = {
+                .name = "SWIFT_CNTVOFF", .cp = 15, .opc1 = 4, .crm = 14,
+                .type = ARM_CP_64BIT | ARM_CP_IO | ARM_CP_OVERRIDE,
+                .access = PL1_RW, .writefn = gt_cntvoff_write,
+                .fieldoffset = offsetof(CPUARMState, cp15.cntvoff_el2),
+            };
+            define_one_arm_cp_reg(cpu, &swift_cntvoff);
+        }
+#endif
     }
     if (cpu_isar_feature(aa64_ecv_traps, cpu)) {
         define_arm_cp_regs(cpu, gen_timer_ecv_cp_reginfo);
@@ -9191,6 +9214,10 @@ static void arm_cpu_do_interrupt_aarch32(CPUState *cs)
         addr = 0x1c;
         /* Disable FIQ, IRQ and imprecise data aborts.  */
         mask = CPSR_A | CPSR_I | CPSR_F;
+        if (arm_feature(env, ARM_FEATURE_SWIFT_INTERRUPT_PROBE)) {
+            new_mode = ARM_CPU_MODE_IRQ;
+            mask = CPSR_A | CPSR_I;
+        }
         if (env->cp15.scr_el3 & SCR_FIQ) {
             /* FIQ routed to monitor mode */
             new_mode = ARM_CPU_MODE_MON;
@@ -9694,6 +9721,7 @@ static struct {
         uint64_t n, ns, max_ns;
     } exception[32];
     uint64_t svc[1024], svc_other;
+    uint64_t fullfsync;     /* fcntl / fcntl_nocancel (92 / 406) with F_FULLFSYNC (51): a sync that reaches the flash */
     uint64_t abort_status[32];
     uint64_t mach_send, mach_receive;
     /* Kernel episodes: from an exception taken from user mode to the exception return to user mode, in
@@ -9815,6 +9843,7 @@ static inline QEMU_ALWAYS_INLINE uint64_t arm_exception_prof_begin(CPUState *cs)
 
         if (nr >= -512 && nr < 512) {
             arm_exception_prof.svc[nr + 512]++;
+            arm_exception_prof.fullfsync += (nr == 92 || nr == 406) && env->regs[1] == 51;
         } else {
             arm_exception_prof.svc_other++;
         }
@@ -9870,6 +9899,7 @@ static void arm_exception_prof_end(int exc, uint64_t start)
     }
     fprintf(stderr, "[exception-prof] svc r12 other n %" PRIu64 "\n",
             arm_exception_prof.svc_other);
+    fprintf(stderr, "[exception-prof] fcntl F_FULLFSYNC n %" PRIu64 "\n", arm_exception_prof.fullfsync);
     fprintf(stderr, "[exception-prof] mach-msg send-attempts %" PRIu64
             " receive-attempts %" PRIu64 "\n",
             arm_exception_prof.mach_send, arm_exception_prof.mach_receive);

@@ -1,7 +1,11 @@
-/* Production CA drawable resizing, dimensions and full writeback on native CGL.
+/* Production CA drawable resizing, dimensions and full writeback on native CGL, and the drawable's charge
+ * against the GPU memory cap.
  *
+ * SLICE hw/arm/gles-host.c define GLES_MAX_GPU_BYTES
+ * SLICE hw/arm/gles-host.c range /* Bytes held by every buffer object | /*\n * Grow-and-keep
+ * SLICE hw/arm/gles-host.c range /* ---------------------------------------------------------- GPU memory | /*\n * Profiling and strictness
  * SLICE hw/arm/gles-host.c range #define GLES_PRIVATE_NAME | static bool gles_is_drawable(
- * SLICE hw/arm/gles-host.c fn gles_texture_begin gles_drawable_storage gles_present_to_surface
+ * SLICE hw/arm/gles-host.c fn gles_texture_begin gles_image_bytes gles_read_pixels gles_drawable_storage gles_present_to_surface
  * SLICE:query hw/arm/gles-host.c range case GLES_SLOT_GET_RB_PARAMETERIV: | case GLES_SLOT_GET_FB_ATTACH_PARAM:
  * PKG glib-2.0
  * CFLAGS -framework OpenGL
@@ -20,20 +24,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #define GLES_SLOT_GET_RB_PARAMETERIV 670
 #define GLES_SURFACE_BGRA32 0x42475241
 #define GLES_SURFACE_RGBA32 0x52474241
 #define GLES_SURFACE_RGB565 0x4c353635
 #define GLES_BGRA_READ_TYPE GL_UNSIGNED_INT_8_8_8_8_REV
 #define GLES_FB_WIDTH 320
+#define GLES_FB_MAX 4096
 #define GLES_FB_HEIGHT 480
+#define GLES_MAX_TEX_BYTES ((size_t)4096*4096*4)
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
+#define QEMU_BUILD_BUG_ON(x) _Static_assert(!(x), #x)
 typedef struct { int unused; } CPUState;
 typedef uint64_t hwaddr;
 static struct {
+ GHashTable *charged,*own_charged;
  GLuint fbo,tex,depth;
  uint32_t drawable_width,drawable_height,bound_framebuffer,bound_renderbuffer;
  uint8_t *readback;
+ size_t readback_size;
  GHashTable *rb_sized;
  GLenum error;
  bool iosurface,fb_dirty,depth_cleared_this_frame,drawable_announced;
@@ -89,7 +100,6 @@ static void check_pixels(unsigned width,unsigned height,unsigned format)
  glDisable(GL_SCISSOR_TEST);
  glPixelStorei(GL_PACK_ALIGNMENT,8);
  assert(!gles_present_to_surface(NULL,RAM_BASE,stride,width,height,format));
- GLint alignment;glGetIntegerv(GL_PACK_ALIGNMENT,&alignment);assert(alignment==8);
  for(unsigned y=0;y<height;y++) {
   for(unsigned x=0;x<width;x++) {
    if(bpp==4) {
@@ -161,6 +171,32 @@ int main(void)
  {GLuint next;glGenTextures(1,&next);assert(next<GLES_PRIVATE_NAME);glDeleteTextures(1,&next);}
  assert(glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT)==GL_FRAMEBUFFER_COMPLETE_EXT);
  assert(gles_present_to_surface(NULL,RAM_BASE,320*4,320,480,GLES_SURFACE_BGRA32)<0);
+ /* A drawable larger than the readback buffer it has (a restore used to give every context a panel-sized one):
+    the present refuses instead of reading 1024x1024 pixels into it. Here the buffer ends at an inaccessible page. */
+ {
+  assert(!gles_drawable_storage(1024,1024));
+  size_t panel=(size_t)GLES_FB_WIDTH*GLES_FB_HEIGHT*4,page=getpagesize(),span=(panel+page-1)/page*page;
+  uint8_t *map=mmap(NULL,span+page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+  assert(map!=MAP_FAILED && !mprotect(map+span,page,PROT_NONE));
+  uint8_t *saved=gh.readback;size_t saved_size=gh.readback_size;
+  gh.readback=map+span-panel;gh.readback_size=panel;
+  assert(gles_present_to_surface(NULL,RAM_BASE,1024*4,1024,1024,GLES_SURFACE_BGRA32)<0);
+  gh.readback=saved;gh.readback_size=saved_size;munmap(map,span+page);
+ }
+ /* The drawable is charged against GLES_MAX_GPU_BYTES (color, depth-stencil and readback): one byte past the cap is
+    GL_OUT_OF_MEMORY with the old drawable kept, at the cap it is made, and a smaller one gives the difference back. */
+ {
+  uint64_t big=(uint64_t)2048*2048*12;
+  assert(gles_held_bytes==(uint64_t)1024*1024*12);
+  gles_buffer_bytes=GLES_MAX_GPU_BYTES-big+1;
+  GLuint fbo=gh.fbo;
+  assert(gles_drawable_storage(2048,2048)<0 && gh.error==GL_OUT_OF_MEMORY);
+  assert(gh.fbo==fbo && gh.drawable_width==1024 && gles_held_bytes==(uint64_t)1024*1024*12);
+  gh.error=0;gles_buffer_bytes--;
+  assert(!gles_drawable_storage(2048,2048) && gh.drawable_width==2048 && gles_held_bytes==big);
+  gles_buffer_bytes=0;
+  assert(!gles_drawable_storage(320,480) && gles_held_bytes==(uint64_t)320*480*12);
+ }
  glDeleteTextures(1,&gh.tex);glDeleteRenderbuffersEXT(1,&gh.depth);glDeleteFramebuffersEXT(1,&gh.fbo);
  glDeleteTextures(1,&texture);glDeleteRenderbuffersEXT(1,&renderbuffer);glDeleteFramebuffersEXT(1,&offscreen);
  g_free(gh.readback);g_hash_table_destroy(gh.rb_sized);

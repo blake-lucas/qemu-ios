@@ -15,6 +15,8 @@
 typedef struct GLESEGLTexture {
     unsigned name, native_name, width, height, target, refs;
     bool deleted, hidden;
+    /* EXT_texture_filter_anisotropic's value where the host has no such state (gles_native_anisotropy_kept); 0: 1. */
+    GLfloat max_anisotropy;
     struct GLESEGLTexture *next;
 } GLESEGLTexture;
 typedef struct GLESEGLTextures {
@@ -32,6 +34,8 @@ typedef struct GLESEGLTextureUnit {
     bool enabled_2d, enabled_rectangle;
     /* The unit's native 2D binding holds its rectangle texture, not object_2d. */
     bool host_rectangle;
+    /* EXT_texture_lod_bias's value where the host has no such state (gles_native_lod_bias_kept). */
+    GLfloat lod_bias;
 } GLESEGLTextureUnit;
 
 typedef struct GLESEGLContext {

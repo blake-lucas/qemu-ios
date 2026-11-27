@@ -29,8 +29,18 @@ static void request(const char *header,const void *body,unsigned len) {
 }
 int main(void) {
     request("1 ping\n","",0);
-    assert(!result_status && result_len==strlen(AG_HELLO) && !memcmp(result,"it_agent v5\nops ",16));
-    assert(strstr(AG_HELLO," cadebug ") && strstr(AG_HELLO," statusbar ") && strstr(AG_HELLO," statusbarget\n"));
+    assert(!result_status && result_len==strlen(AG_HELLO) && !memcmp(result,"it_agent v6\nops ",16));
+    assert(strstr(AG_HELLO," cadebug ") && strstr(AG_HELLO," statusbar ") && strstr(AG_HELLO," statusbarget ") &&
+           strstr(AG_HELLO," signal\n"));
+    {
+        char sig[64];
+        snprintf(sig,sizeof(sig),"1s signal 0 %d\n",(int)getpid());
+        request(sig,"",0);assert(result_status==0);
+    }
+    request("1t signal 0 2147483000\n","",0);assert(result_status==-ESRCH);
+    request("1u signal 0 1\n","",0);assert(result_status==-EINVAL);
+    request("1v signal 40 100\n","",0);assert(result_status==-EINVAL);
+    request("1w signal 9\n","",0);assert(result_status==-EINVAL);
     /* malformed requests are refused before any framework is touched */
     request("1b cadebug 4\n","",0);assert(result_status==-EINVAL);
     request("1c cadebug x 4\n","",0);assert(result_status==-EINVAL);

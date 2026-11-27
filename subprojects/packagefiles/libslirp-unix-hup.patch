@@ -1,0 +1,23 @@
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -1160,8 +1160,18 @@
+              */
+             else
+ #endif
+-                if (revents &
+-                     (SLIRP_POLL_IN | SLIRP_POLL_HUP | SLIRP_POLL_ERR | SLIRP_POLL_PRI)) {
++                /*
++                 * A hangup once this side can't receive any more is not
++                 * something to read: soread would find the end of file again,
++                 * return -1 and skip the write below. A Unix socket (unix:
++                 * guestfwd) whose peer closed reports POLLHUP on every poll,
++                 * while this end is still asked to write the guest's queued
++                 * bytes, so the main loop spun on it at 100% until the guest
++                 * closed its end, which an idle or suspended app never does.
++                 * The write fails with EPIPE and closes the connection.
++                 */
++                if ((revents & (SLIRP_POLL_IN | SLIRP_POLL_ERR | SLIRP_POLL_PRI)) ||
++                    ((revents & SLIRP_POLL_HUP) && !(so->so_state & SS_FCANTRCVMORE))) {
+                 /*
+                  * Check for incoming connections
+                  */

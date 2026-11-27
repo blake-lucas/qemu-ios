@@ -20,6 +20,23 @@ behavior; an existing image may still contain its earlier shared-cache patch.
 The historical `imgtools/appsync_cachepatch.py` inspector is retired (see git
 history at 5508b504b8); preparation never invoked it for AppSync.
 
+## iOS 10 (the iPhone 5, 10.3.4 14G61)
+
+iOS 10's dyld ignores DYLD_INSERT_LIBRARIES in every code-signing-enforced process without get-task-allow, and its
+kernel honors no AMFI boot argument (only its trust table, or amfid's answer, lets code run). So on 14G61:
+
+- FirmwareKit appends a weak `LC_LOAD_DYLIB /usr/lib/libappsync.dylib` to installd and amfid (header padding only,
+  pages re-hashed, both re-registered in the kernel's trust table with the library itself).
+- Without insertion there is no `__interpose`: a constructor (Darwin 16+, installd and amfid only) points those
+  programs' own `MISValidateSignatureAndCopyInfo` imports (and installd's two Security ones) at the hooks.
+- installd: before validating, the app bundle's 32-bit ARM Mach-O pages are re-hashed into their existing code
+  directories (a decrypted store copy changed its first page). Nothing else in the signature changes; a file without
+  a code signature is left alone (and won't launch).
+- amfid: where libmis refuses a file, the hook answers with the file's code directory hash (SHA-256 over SHA-1, as
+  the kernel picks), which amfid hands to the kernel.
+
+Older iOS keep the insertion and interposition path above, unchanged.
+
 ## Hook behavior
 
 | Hook | Behavior |
@@ -69,3 +86,11 @@ The IPA executable must be decrypted (cryptid 0), match the device architecture,
 and use frameworks that its firmware actually provides. FairPlay decryption is
 outside this component. Kernel code-signing policy belongs to the emulator's
 boot recipe; the dylib does not modify the kernel or re-sign system binaries.
+
+Modern installation services can supply a bundle directory to the metadata
+reader. It resolves `CFBundleExecutable` from a bounded XML or binary Info.plist
+and reads the declared executable’s embedded signature. It rejects executable
+path traversal and preserves original non-null verifier metadata. This does not
+synthesize private entitlements. The iOS 8 test installed and launched a user app with its normal container
+and location authorization after preparation through FirmwareKit. Other modern
+guests still require independent qualification.

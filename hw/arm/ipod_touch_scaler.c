@@ -16,6 +16,7 @@
 #ifdef __aarch64__
 #include <arm_neon.h>
 #endif
+#include "trace.h"
 
 /* 7E18 AppleM2ScalerCSCDriver: 0xc0732388 programs formats, 0xc07323f0
  * source geometry, 0xc073246c destination geometry, 0xc0730288 acknowledges
@@ -545,7 +546,8 @@ static bool scaler_rgb(IPodScalerState *s)
  * decoded movie frame (VXD's 480x270 at stride 512) upright for the iPhone 4's portrait panel
  * (270x480 at stride 320), formats +0x10/+0x30 both 0, planes at +0x14/+0x18 and +0x34/+0x38, plane
  * strides in bytes at +0x1c and +0x3c (UV << 16 | Y). The camera's viewfinder takes the same path scaled
- * down: the ISP's 2592x1936 frame to 640x852, turned.
+ * down: the ISP's 2592x1936 frame to 640x852, turned. Each side's planes are tiled or linear as its format's
+ * bit 10 says (scaler_row), as for RGB: AppleM2ScalerCSCHal sets the bit whatever the format.
  * ponytail: nearest sampling where the hardware has polyphase taps, and one turning direction (the movie
  * came out upright with it); +0x58 (3 here) likely selects it.
  */
@@ -557,6 +559,7 @@ static bool scaler_nv12(IPodScalerState *s)
     unsigned sys = r[0x1c / 4] & 0xffff, suvs = r[0x1c / 4] >> 16;
     unsigned dys = r[0x3c / 4] & 0xffff, duvs = r[0x3c / 4] >> 16;
     bool rot = sw != sh && dw != dh && (sw > sh) != (dw > dh);
+    bool stiled = r[0x10 / 4] & 0x400, dtiled = r[0x30 / 4] & 0x400;
 
     if ((r[0x10 / 4] & 7) || (r[0x30 / 4] & 7) || !sw || !sh || sw > 4096 || sh > 4096 || (sw | sh) & 1 ||
         !dw || !dh || (dw | dh) & 1 || sys < sw || suvs < sw || dys < dw || duvs < dw) {
@@ -565,8 +568,9 @@ static bool scaler_nv12(IPodScalerState *s)
     uint8_t *y = scaler_scratch(s, 0, (size_t)sw * sh), *uv = scaler_scratch(s, 1, (size_t)sw * sh / 2);
     g_autofree uint8_t *row = g_malloc(dw);
     for (unsigned i = 0; i < sh; i++) {
-        if (!scaler_read_bus(s, r[0x14 / 4] + i * sys, y + (size_t)i * sw, sw) ||
-            (!(i & 1) && !scaler_read_bus(s, r[0x18 / 4] + i / 2 * suvs, uv + (size_t)i / 2 * sw, sw))) {
+        if (!scaler_read_bus(s, scaler_row(r[0x14 / 4], i, sys, ROUND_UP(sw, 256), stiled), y + (size_t)i * sw, sw) ||
+            (!(i & 1) && !scaler_read_bus(s, scaler_row(r[0x18 / 4], i / 2, suvs, ROUND_UP(sw, 256), stiled),
+                                          uv + (size_t)i / 2 * sw, sw))) {
             return false;
         }
     }
@@ -586,7 +590,7 @@ static bool scaler_nv12(IPodScalerState *s)
         for (unsigned x = 0; x < dw; x++) {
             row[x] = line[xo[x]];
         }
-        if (!scaler_write_bus(s, r[0x34 / 4] + j * dys, row, dw)) {
+        if (!scaler_write_bus(s, scaler_row(r[0x34 / 4], j, dys, ROUND_UP(dw, 256), dtiled), row, dw)) {
             return false;
         }
     }
@@ -602,7 +606,7 @@ static bool scaler_nv12(IPodScalerState *s)
             row[2 * x] = line[xo[x]];
             row[2 * x + 1] = line[xo[x] + 1];
         }
-        if (!scaler_write_bus(s, r[0x38 / 4] + j * duvs, row, dw)) {
+        if (!scaler_write_bus(s, scaler_row(r[0x38 / 4], j, duvs, ROUND_UP(dw, 256), dtiled), row, dw)) {
             return false;
         }
     }
@@ -620,25 +624,30 @@ static bool scaler_convert(IPodScalerState *s)
 {
     uint32_t *r = s->job;
     unsigned w = (r[0x24 / 4] >> 16) & 0x1fff, h = r[0x24 / 4] & 0x1fff;
+    unsigned dw = (r[0x40 / 4] >> 16) & 0x1fff, dh = r[0x40 / 4] & 0x1fff;
     unsigned ys = r[0x1c / 4] & 0xffff, uvs = r[0x1c / 4] >> 16;
     unsigned fmt = r[0x30 / 4] & 7, bpp = fmt == 4 ? 2 : 4;
     unsigned ds = (r[0x3c / 4] & 0xffff) * bpp;
     uint32_t ybase = r[0x14 / 4], uvbase = r[0x18 / 4], dest = r[0x34 / 4];
-    /* ponytail: implement the observed unscaled NV12-to-RGB movie path first;
-     * scaling needs the programmed polyphase filters, not guessed sampling. */
-    if (!w || !h || w > 2048 || h > 2048 || (w | h) & 1 ||
-        r[0x10 / 4] || (fmt != 4 && fmt != 6) || (r[0x30 / 4] & ~7u) ||
-        r[0x20 / 4] || r[0x24 / 4] != r[0x40 / 4] || ys < w || uvs < w || ds < w * bpp ||
+    bool stiled = r[0x10 / 4] & 0x400, dtiled = r[0x30 / 4] & 0x400;
+    /* Match the existing RGB/NV12 nearest-sample scaling approximation.
+     * Both planes retain their independent strides and tiling. Native Photos
+     * uses this path to fit decoded camera images to the screen. */
+    if (!w || !h || w > 4096 || h > 4096 || (w | h) & 1 ||
+        !dw || !dh || dw > 4096 || dh > 4096 ||
+        (r[0x10 / 4] & ~0x400u) || (fmt != 4 && fmt != 6) || (r[0x30 / 4] & ~0x407u) ||
+        r[0x20 / 4] || ((r[0x58 / 4] & 3) && (w != dw || h != dh)) || ys < w || uvs < w || ds < dw * bpp ||
         (!s->xlate && (!scaler_range(ybase, ys, h, w) ||
                        !scaler_range(uvbase, uvs, h / 2, w) ||
-                       !scaler_range(dest, ds, h, w * bpp)))) return false;
+                       !scaler_range(dest, ds, dh, dw * bpp)))) return false;
     uint8_t *yplane = scaler_scratch(s, 0, (size_t)w * h);
     uint8_t *uvplane = scaler_scratch(s, 1, (size_t)w * h / 2);
-    g_autofree uint8_t *row = g_malloc(w * bpp);
+    g_autofree uint8_t *row = g_malloc(dw * bpp);
     /* Snapshot sources before writing: IOSurface transfers may alias. Through the DART on the S5L8920 (3GS). */
     for (unsigned y = 0; y < h; y++) {
-        if (!scaler_read_bus(s, ybase + y * ys, yplane + y * w, w) ||
-            (!(y & 1) && !scaler_read_bus(s, uvbase + (y / 2) * uvs, uvplane + (y / 2) * w, w))) {
+        if (!scaler_read_bus(s, scaler_row(ybase, y, ys, ROUND_UP(w, 256), stiled), yplane + y * w, w) ||
+            (!(y & 1) && !scaler_read_bus(s, scaler_row(uvbase, y / 2, uvs, ROUND_UP(w, 256), stiled),
+                                          uvplane + (y / 2) * w, w))) {
             return false;
         }
     }
@@ -647,11 +656,18 @@ static bool scaler_convert(IPodScalerState *s)
         unsigned v = r[0x220 / 4 + i] & 0xfff;
         matrix[i] = (v ^ 0x800) - 0x800;
     }
-    for (unsigned y = 0; y < h; y++) {
-        for (unsigned x = 0; x < w; x++) {
-            int in[] = { yplane[y * w + x] - ((r[1] & 0x200) ? 16 : 0),
-                         uvplane[(y / 2) * w + (x & ~1u)] - 128,
-                         uvplane[(y / 2) * w + (x & ~1u) + 1] - 128 };
+    /* A scaled turn (+0x58 bits 0-1, which scaler_rgb honors) is refused above, as every scaled transfer was
+     * before scaling came in; a 1:1 one is converted unturned, as the movie path always did. An unscaled side
+     * steps by one whatever +0x50/+0x54 hold. */
+    uint32_t sx = w == dw ? 0x10000 : r[0x50 / 4] ? r[0x50 / 4] : ((uint64_t)w << 16) / dw;
+    uint32_t sy = h == dh ? 0x10000 : r[0x54 / 4] ? r[0x54 / 4] : ((uint64_t)h << 16) / dh;
+    for (unsigned y = 0; y < dh; y++) {
+        unsigned v = MIN(((uint64_t)y * sy) >> 16, h - 1);
+        for (unsigned x = 0; x < dw; x++) {
+            unsigned u = MIN(((uint64_t)x * sx) >> 16, w - 1);
+            int in[] = { yplane[v * w + u] - ((r[1] & 0x200) ? 16 : 0),
+                         uvplane[(v / 2) * w + (u & ~1u)] - 128,
+                         uvplane[(v / 2) * w + (u & ~1u) + 1] - 128 };
             unsigned rgb[3];
             for (unsigned c = 0; c < 3; c++) {
                 int v = (matrix[c * 3] * in[0] + matrix[c * 3 + 1] * in[1] +
@@ -666,7 +682,7 @@ static bool scaler_convert(IPodScalerState *s)
                 row[x * 4 + 2] = rgb[0]; row[x * 4 + 3] = 255;
             }
         }
-        if (!scaler_write_bus(s, dest + y * ds, row, w * bpp)) {
+        if (!scaler_write_bus(s, scaler_row(dest, y, ds, ROUND_UP(dw * bpp, 256), dtiled), row, dw * bpp)) {
             return false;
         }
     }
@@ -765,6 +781,7 @@ static void scaler_complete(void *opaque)
 static void scaler_write(void *opaque, hwaddr off, uint64_t value, unsigned size)
 {
     IPodScalerState *s = opaque;
+    trace_ipod_scaler_reg_write(s->iomem.addr, off, value);
     if (off == 0xc) s->regs[3] &= ~value;
     else s->regs[off / 4] = value;
     if (off == 4 && (value & 2)) {

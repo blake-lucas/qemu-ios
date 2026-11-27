@@ -86,7 +86,7 @@ void s5l8930_iop_trace_rings(DeviceState *iop);
 enum {
     IOPROF_PREAD, IOPROF_PWRITE, IOPROF_ZERO, IOPROF_PREAD_NS, IOPROF_PWRITE_NS, IOPROF_ZERO_NS,
     IOPROF_PG_READ, IOPROF_PG_PROG, IOPROF_ERASE, IOPROF_FMI_IRQ, IOPROF_CDMA_IRQ,
-    IOPROF_DB_AP2IOP, IOPROF_DB_IOP2AP, IOPROF_CACHECTL, IOPROF_CDMA_GO, IOPROF_IOP_NS, IOPROF_AP_NS, IOPROF_N
+    IOPROF_DB_AP2IOP, IOPROF_DB_IOP2AP, IOPROF_CACHECTL, IOPROF_CDMA_GO, IOPROF_IOP_NS, IOPROF_AP_NS, IOPROF_PWRITE_MAX_NS, IOPROF_N
 };
 extern bool s5l8930_ioprof_on;
 extern uint64_t s5l8930_ioprof[IOPROF_N];
@@ -222,6 +222,8 @@ void s5l8930_ltc4099_set_charging(DeviceState *dev, bool charging);
 #define TYPE_S5L8930_AK8973 "s5l8930.ak8973"
 /* AK8975B at 0x0c on i2c0 (the iPhone 4's): the same "heading" and pose. */
 #define TYPE_S5L8930_AK8975 "s5l8930.ak8975"
+/* AK8963C at 0x0c on i2c1 (the iPhone 5's, "compass,akm8963"): the AK8975's with a 14/16-bit output and continuous modes. */
+#define TYPE_S5L8930_AK8963 "s5l8930.ak8963"
 /* L3G4200D gyroscope at 0x68 on i2c2 ("gyro,ap3gdl"); gpio-out 0/1 = INT1/INT2 pin levels. */
 #define TYPE_S5L8930_L3G4200D "s5l8930.l3g4200d"
 /* The accelerometer whose gravity vector gives the compass its pose. */
@@ -324,6 +326,9 @@ unsigned s5l8930_i2s_rate(unsigned port);
 unsigned s5l8930_i2s_sync_rate(unsigned port);
 /* A paced CDMA chain's bytes for a TX FIFO in one go; 0 if fifo is no port's TX FIFO. */
 uint32_t s5l8930_i2s_tx_bulk(hwaddr fifo, const uint8_t *buf, uint32_t len);
+/* A codec outside the CS42L58 family whose output volume the host hears on this port (the iPhone 5's CS42L65). */
+void s5l8930_i2s_set_gain_source(DeviceState *port, double (*gain)(void *opaque), void *opaque);
+unsigned s5l8930_i2s_frame_bytes(unsigned port, bool input);
 #define S5L8930_CDMA_CHANNELS    0x26
 
 /*

@@ -9,12 +9,19 @@ Install `/usr/local/bin/it_agent` (root:wheel 0755) and the launch job in
 `com.qemu.it-pbd` job so two clipboard daemons never compete. The bake script
 performs the file changes; its documented ownership step is required.
 
+iOS 8 and later also need `ProcessType = Interactive` on this command-service
+job. The default background policy throttles the daemon and its children to
+priority 4, delaying RPCs and helper execution. Native qualification of the
+Interactive job shows priority 31 and subsecond polling. FirmwareKit's
+`SideloadTools.install` applies this setting for iOS 8+, including the cached
+launchd definition; older guest job definitions retain their existing policy.
+
 Requests are `id operation arguments\n<binary body>` on the guest wire, with a
 base64 body in QOM's `agent-request` string. `agent-result` returns
 `id status\n<base64 body>`. `agent-cancel` accepts an id. `agent-status` is
 absent/alive/stale.
 
-`ping` answers `it_agent v5\nops <space-separated op list>\n` (v4 the same without
+`ping` answers `it_agent v6\nops <space-separated op list>\n` (v5 the same without `signal`, v4 also without
 `statusbarget`, v3 also without `cadebug` and `statusbar`, v2 also without `putpart`); a v1 agent answers only `it_agent v1\n` and returns -ENOSYS (-78) for
 every op it lacks, so a host detects capabilities from the ping reply. Statuses are 0, a child's exit status,
 or a negative errno.
@@ -40,6 +47,7 @@ or a negative errno.
 | cadebug | `mask value` | | flags now, `0x…\n` | Core Animation's debug colors: QuartzCore's `CARenderServerSetDebugFlags(0, mask, value)` (the render server's flags become `flags & ~mask \| value & mask`; 0x4 blended layers, 0x2 copied images, 0x4000 misaligned, 0x20000 offscreen, 0x1 flash updates, 3.1.3 to 7.1.2). v4 |
 | statusbar | | UIKit's status bar override data, laid out by the host for the firmware | | `+[UIStatusBarServer postStatusBarOverrideData:]` (4.2 to 7.1.2); SpringBoard takes it only from a process with `com.apple.UIKit.status-bar-override-allow` (`it_agent-entitlements.xml`). Each post replaces the last; zeros clear it. v4 |
 | statusbarget | `override SIZE` or `data SIZE` | | SIZE bytes (at most 4096) | what SpringBoard's status bar server holds: `+[UIStatusBarServer getStatusBarOverrideData]`, the overrides last posted (zeros once SpringBoard restarts), or `getStatusBarData`, the data it publishes with them merged in (4.2 to 7.1.2). v5 |
+| signal | `SIG PID` | | | kill(2): stock iOS has no kill command (SIG 0 checks the pid). v6 |
 | type, backspace, uidump | | UTF-8 text (type) | | routed to it_typein in the foreground app |
 | exec | shell command | stdin | stdout+stderr | **deprecated**: needs `/bin/sh`, which a no-shell image lacks; kept only for old hosts |
 
@@ -55,7 +63,10 @@ Files of any size still move: `itqmp.agent` sends a put over one request as
 and reads a get the agent refuses with -EFBIG back by `getrange`. The QOM setter
 reports an over-limit request as such, not as a queue error.
 Execution runs in a child process group with a roughly 60-second tick budget.
-The daemon keeps polling and servicing clipboard during child execution.
+The daemon keeps polling during child execution. Clipboard IPC runs in a separate
+`--clipboard-worker` instance of the same executable, supervised by the daemon.
+A blocked pasteboard server cannot block RPC polling or command-child reaping.
+The worker inherits the launchd process group; no second launch job is needed.
 
 Tokens correlate daemon sessions; they are **not a privilege boundary** against
 other guest processes that can issue cp15 calls. Keep QMP local and never expose
@@ -65,8 +76,15 @@ request returns `-ECONNRESET`, never automatic replay. Host cancellation revokes
 the old session; its next poll kills the child group. Cancellation cannot undo an
 already executed command. Reset clears transient requests/results.
 
-Command service starts immediately; only the clipboard waits 40 seconds for
-UIKit readiness. The agent corrects the guest wall clock when drift exceeds two seconds. It touches receive-buffer pages before host
+GL process exits (`agent-glexit.h`): every 2 s the daemon asks the GL bridge for the processes that own GL
+sharegroups (`GLES_OP_OWNERS`, only when they changed) and reports one the kernel says has exited (no process with
+its pid, a zombie, or a later process with its pid: the start time differs), so the host frees its contexts and
+objects. Anything uncertain keeps them. After three refusals in a row (an engine without the list) it asks once a
+minute.
+
+Command service starts immediately; the clipboard worker waits 40 seconds for
+UIKit readiness. The launch job uses an absolute executable path so the daemon
+can re-exec that worker. A worker that exits is retried after five seconds. The agent corrects the guest wall clock when drift exceeds two seconds. It touches receive-buffer pages before host
 copies, because debug memory writes cannot fault in iOS demand-zero pages.
 
 Tests: `tests/slice/ipod-agent-proto.c` and `ipod-agent-ops.c` exercise production C under

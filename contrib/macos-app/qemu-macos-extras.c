@@ -38,6 +38,7 @@
 
 #include "qemu-macos-extras.h"
 #include "hw/misc/ios_vibrator.h"
+#include "hw/arm/host-mic.h"
 
 /*
  * system/main.c (replaced by qemu-ios-entry.c) defined this; ui/cocoa.m still
@@ -1068,4 +1069,45 @@ void qemu_ios_audio_capture_stop(uint64_t generation)
     uint64_t *request = g_new(uint64_t, 1);
     *request = generation;
     aio_bh_schedule_oneshot(qemu_get_aio_context(), recording_audio_stop_bh, request);
+}
+
+/*
+ * The microphone is the one entry point here that is not a bottom half. The
+ * capture tap below has to schedule its work on the QEMU thread because it
+ * registers a voice with the audio backend; this is a bounded ring the app
+ * writes and a capture port reads on the vCPU thread, so a recorder thread can
+ * push from where it already is. Pushing before a machine exists is harmless:
+ * the frames wait, and a port that never starts lets them drop.
+ */
+int qemu_ios_microphone_write(const void *frames, int bytes)
+{
+    if (!frames || bytes < 4) {
+        return 0;
+    }
+    return (int)host_mic_push(frames, (size_t)(bytes / 4) * 4);
+}
+
+void qemu_ios_microphone_flush(void)
+{
+    host_mic_flush();
+}
+
+int qemu_ios_microphone_state(uint32_t *rate, uint32_t *queued, uint64_t *pushed, uint64_t *dropped)
+{
+    HostMicState state;
+
+    host_mic_state(&state);
+    if (rate) {
+        *rate = state.rate;
+    }
+    if (queued) {
+        *queued = state.queued;
+    }
+    if (pushed) {
+        *pushed = state.pushed;
+    }
+    if (dropped) {
+        *dropped = state.dropped;
+    }
+    return state.capturing ? 1 : 0;
 }

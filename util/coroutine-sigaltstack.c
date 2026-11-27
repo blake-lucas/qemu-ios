@@ -33,11 +33,80 @@
 #error "SafeStack is not compatible with code run in alternate signal stacks"
 #endif
 
+#if defined(__ANDROID__) && defined(__aarch64__)
+/*
+ * Android arm64 switches coroutines with a context switch of its own, not bionic's sigsetjmp/siglongjmp. A
+ * coroutine can resume on another thread than the one it last ran on (a thread-pool completion re-enters it in the
+ * main loop after a vCPU thread started it), and bionic's jmp_buf carries the thread it was made on: it keeps x18
+ * (the shadow call stack) and authenticates the saved return address with pointer authentication, so on Android 17 a
+ * Pixel 10's longjmp into a buffer another thread made fails its check (SIGILL, PAC exception in _longjmp). This saves
+ * only what the AAPCS64 says a call keeps (x19-x30, sp, d8-d15); x18 stays the running thread's. No signal mask is
+ * saved, as with sigsetjmp(env, 0).
+ */
+typedef uint64_t co_jmp_buf[21];
+
+int lt_co_setjmp(co_jmp_buf env) __attribute__((returns_twice));
+void lt_co_longjmp(co_jmp_buf env, int value) __attribute__((noreturn));
+
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".globl lt_co_setjmp\n"
+    ".hidden lt_co_setjmp\n"
+    ".type lt_co_setjmp, %function\n"
+    "lt_co_setjmp:\n"
+    "    hint #34\n" /* bti c */
+    "    stp x19, x20, [x0, #0]\n"
+    "    stp x21, x22, [x0, #16]\n"
+    "    stp x23, x24, [x0, #32]\n"
+    "    stp x25, x26, [x0, #48]\n"
+    "    stp x27, x28, [x0, #64]\n"
+    "    stp x29, x30, [x0, #80]\n"
+    "    mov x9, sp\n"
+    "    str x9, [x0, #96]\n"
+    "    stp d8, d9, [x0, #104]\n"
+    "    stp d10, d11, [x0, #120]\n"
+    "    stp d12, d13, [x0, #136]\n"
+    "    stp d14, d15, [x0, #152]\n"
+    "    mov w0, #0\n"
+    "    ret\n"
+    ".size lt_co_setjmp, . - lt_co_setjmp\n"
+    ".p2align 2\n"
+    ".globl lt_co_longjmp\n"
+    ".hidden lt_co_longjmp\n"
+    ".type lt_co_longjmp, %function\n"
+    "lt_co_longjmp:\n"
+    "    hint #34\n" /* bti c */
+    "    ldp x19, x20, [x0, #0]\n"
+    "    ldp x21, x22, [x0, #16]\n"
+    "    ldp x23, x24, [x0, #32]\n"
+    "    ldp x25, x26, [x0, #48]\n"
+    "    ldp x27, x28, [x0, #64]\n"
+    "    ldp x29, x30, [x0, #80]\n"
+    "    ldr x9, [x0, #96]\n"
+    "    mov sp, x9\n"
+    "    ldp d8, d9, [x0, #104]\n"
+    "    ldp d10, d11, [x0, #120]\n"
+    "    ldp d12, d13, [x0, #136]\n"
+    "    ldp d14, d15, [x0, #152]\n"
+    "    cmp w1, #0\n"
+    "    csinc w0, w1, wzr, ne\n" /* longjmp(env, 0) returns 1 */
+    "    ret\n"
+    ".size lt_co_longjmp, . - lt_co_longjmp\n");
+
+#define co_setjmp(env) lt_co_setjmp(env)
+#define co_longjmp(env, value) lt_co_longjmp(env, value)
+#else
+typedef sigjmp_buf co_jmp_buf;
+#define co_setjmp(env) sigsetjmp(env, 0)
+#define co_longjmp(env, value) siglongjmp(env, value)
+#endif
+
 typedef struct {
     Coroutine base;
     void *stack;
     size_t stack_size;
-    sigjmp_buf env;
+    co_jmp_buf env;
 } CoroutineSigAltStack;
 
 /**
@@ -51,7 +120,7 @@ typedef struct {
     CoroutineSigAltStack leader;
 
     /** Information for the signal handler (trampoline) */
-    sigjmp_buf tr_reenter;
+    co_jmp_buf tr_reenter;
     volatile sig_atomic_t tr_called;
     void *tr_handler;
 } CoroutineThreadState;
@@ -96,8 +165,8 @@ static void __attribute__((constructor)) coroutine_init(void)
 static void coroutine_bootstrap(CoroutineSigAltStack *self, Coroutine *co)
 {
     /* Initialize longjmp environment and switch back the caller */
-    if (!sigsetjmp(self->env, 0)) {
-        siglongjmp(*(sigjmp_buf *)co->entry_arg, 1);
+    if (!co_setjmp(self->env)) {
+        co_longjmp(*(co_jmp_buf *)co->entry_arg, 1);
     }
 
     while (true) {
@@ -128,7 +197,7 @@ static void coroutine_trampoline(int signal)
      * this is a signal handler and we have to do a return "soon". Then the
      * caller can reestablish everything and do a siglongjmp here again.
      */
-    if (!sigsetjmp(coTS->tr_reenter, 0)) {
+    if (!co_setjmp(coTS->tr_reenter)) {
         return;
     }
 
@@ -155,7 +224,7 @@ Coroutine *qemu_coroutine_new(void)
     stack_t oss;
     sigset_t sigs;
     sigset_t osigs;
-    sigjmp_buf old_env;
+    co_jmp_buf old_env;
     static pthread_mutex_t sigusr2_mutex = PTHREAD_MUTEX_INITIALIZER;
 
     /* The way to manipulate stack is with the sigaltstack function. We
@@ -251,8 +320,8 @@ Coroutine *qemu_coroutine_new(void)
      * type-conversion warnings related to the `volatile' qualifier and
      * the fact that `jmp_buf' usually is an array type.
      */
-    if (!sigsetjmp(old_env, 0)) {
-        siglongjmp(coTS->tr_reenter, 1);
+    if (!co_setjmp(old_env)) {
+        co_longjmp(coTS->tr_reenter, 1);
     }
 
     /*
@@ -280,9 +349,9 @@ CoroutineAction qemu_coroutine_switch(Coroutine *from_, Coroutine *to_,
 
     s->current = to_;
 
-    ret = sigsetjmp(from->env, 0);
+    ret = co_setjmp(from->env);
     if (ret == 0) {
-        siglongjmp(to->env, action);
+        co_longjmp(to->env, action);
     }
     return ret;
 }

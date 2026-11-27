@@ -31,6 +31,7 @@ static int surface_stride(DisplaySurface *s) { return s->stride; }
 static void *surface_data(DisplaySurface *s) { return s->data; }
 #include "frame-counter-state.h"
 static IosFrameCounters ios_frame_counters;
+static int surface_bits_per_pixel(DisplaySurface *s) { return 32; }
 #include "slice.h"
 int main(void) {
  enum { W = 4, H = 3, STRIDE = 20 };   /* padded rows: only W*4 bytes count */

@@ -2,8 +2,8 @@
 @ (at 0, SVC mode, MMU off) on a board whose RAM starts at RAM (-DRAM=). It maps four test pages at 0x70000000 (two
 @ whose physical pages are in the opposite order, a hole, one privileged read-only, one for the reference block),
 @ issues QEMU_CALL (mcr p15, 3, rX, c15, c15, 0) with a QC_GLES_PING block in each place and compares each reply with
-@ the reference's. One character per check on the semihosting console: its letter in lowercase if it passed,
-@ uppercase if not; then 'E', and it exits.
+@ the reference's (from User mode, the read-only page gets none). One character per check on the semihosting
+@ console: its letter in lowercase if it passed, uppercase if not; then 'E', and it exits.
         .syntax unified
         .arch armv6k
         .arm
@@ -137,6 +137,19 @@ _start:
         ldr     r0, =RO
         mov     r2, #'e'
         bl      .Lsame
+
+        @ f: the same block from User mode, which may not touch the page: no reply
+        ldr     r0, =RO - VA + RAM + 0x30000
+        bl      .Lfill
+        ldr     r0, =RO
+        msr     cpsr_c, #0xd0
+        mcr     p15, 3, r0, c15, c15, 0
+        svc     #0
+        ldr     r1, =RO - VA + RAM + 0x30000
+        ldr     r0, [r1, #36]
+        ldr     r1, =SENT
+        mov     r2, #'f'
+        bl      .Lcheck
 
         mov     r0, #'E'
         bl      .Lputc

@@ -15,6 +15,7 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
 #ifdef GLES_HOST_AHB
     GLESAhb ahb = { .image = EGL_NO_IMAGE_KHR };
 #endif
+    uint64_t charged;
 
     if (!width || !height || width > 2048 || height > 2048) {
         gles_refuse("drawable:size:%ux%u", width, height);
@@ -22,8 +23,12 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
     }
     gh.drawable_announced = true;
     if (width == gh.drawable_width && height == gh.drawable_height) return 0;
+    if (!gles_charge_drawable(width, height, &charged)) {
+        return gles_reject(GL_OUT_OF_MEMORY);
+    }
     readback = g_try_malloc0_n((size_t)width * height, 4);
     if (!readback) {
+        gles_charge(gles_charge_table(true), gles_charge_key(GLES_CHARGE_DRAWABLE, 0, 0, 0), charged, NULL);
         gles_refuse("drawable:memory");
         return gles_reject(GL_OUT_OF_MEMORY);
     }
@@ -67,16 +72,23 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
         error = GL_OUT_OF_MEMORY;
     if (error != GL_NO_ERROR) gles_refuse("drawable:storage:0x%x", error);
     if (error == GL_NO_ERROR) {
+        GLuint fbo_color = gles_drawable_color_fbo(color);
+
         if ((GLuint)texture == gh.tex) texture = color;
         renderbuffer = gles_drawable_depth_remap(renderbuffer, gh.depth, gh.stencil,
                                                  depth, stencil);
         if ((GLuint)framebuffer == gh.fbo) framebuffer = fbo;
+        /* No color-only one (switched off or refused): its guests fall back to fbo. */
+        if (gh.fbo_color && (GLuint)framebuffer == gh.fbo_color) framebuffer = fbo_color ? fbo_color : fbo;
         glDeleteTextures(1, &gh.tex);
         gles_drawable_depth_delete(gh.depth, gh.stencil);
         glDeleteFramebuffersEXT(1, &gh.fbo);
+        if (gh.fbo_color) glDeleteFramebuffersEXT(1, &gh.fbo_color);
+        gh.fbo_color = fbo_color;
         g_free(gh.readback);
         gh.tex = color; gh.depth = depth; gh.stencil = stencil; gh.fbo = fbo;
         gh.readback = readback;
+        gh.readback_size = (size_t)width * height * 4;
         gh.drawable_width = width; gh.drawable_height = height;
         /* The portable readback path handles resized layers on both hosts.
          * The platform's original IOSurface remains owned by its context;
@@ -96,6 +108,7 @@ static int64_t gles_drawable_storage(uint32_t width, uint32_t height)
         gles_drawable_depth_delete(depth, stencil);
         glDeleteFramebuffersEXT(1, &fbo);
         g_free(readback);
+        gles_charge(gles_charge_table(true), gles_charge_key(GLES_CHARGE_DRAWABLE, 0, 0, 0), charged, NULL);
     }
     glBindTexture(GL_TEXTURE_2D, texture);
     glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, renderbuffer);

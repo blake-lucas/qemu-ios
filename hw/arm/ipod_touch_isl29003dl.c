@@ -195,10 +195,17 @@ static const Property isl29003dl_properties[] = {
     DEFINE_PROP_UINT32("rext", ISL29003DLState, rext, 499000),
 };
 
+static int isl29003dl_post_load(void *opaque, int version_id)
+{
+    ISL29003DLState *s = opaque;
+    return s->reg < LIGHTSENSOR_NUM_REGS ? 0 : -EINVAL;   /* reads index regs[] by it */
+}
+
 static const VMStateDescription vmstate_isl29003dl = {
     .name = "isl29003dl",
     .version_id = 2,
     .minimum_version_id = 2,
+    .post_load = isl29003dl_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_I2C_SLAVE(i2c, ISL29003DLState),
         VMSTATE_UINT8(reg, ISL29003DLState),

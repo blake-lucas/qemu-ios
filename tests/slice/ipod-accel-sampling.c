@@ -1,4 +1,4 @@
-/* Production sensor sampling: rate limits, bounded noise, shake and restore.
+/* Production sensor sampling: rate limits, bounded noise, shake and restore, held host samples.
  *
  * SLICE include/hw/arm/ipod_touch_lis302dl.h define ACCEL_WHOAMI_VALUE|ACCEL_CTRL_REG1_FS
  * SLICE include/hw/arm/ipod_touch_lis302dl.h typedef LIS302DLState
@@ -65,8 +65,10 @@ int main(void) {
  part.ctrl_reg1=0;part.shake_start_ns=0;part.last_sample_ns=-1;
  lis302dl_sample(&part,0);assert(part.out_x==110&&part.out_y==-110&&part.out_z==55);
  /* Direct Android/Linux samples use SI units, preserve board mount, and
-  * expire without confusing acceleration with angular velocity. */
- LIS302DLState live={.whoami=0x3B,.last_sample_ns=-1,.shake_start_ns=-1,.motion_start_ns=-1,.mount="-2,-1,3"};
+  * the acceleration holds while the host is quiet (a gap between samples is not the device turning back to
+  * its resting pose), the rotation rate lapses to zero, and letting go returns the resting pose. */
+ LIS302DLState live={.whoami=0x3B,.last_sample_ns=-1,.shake_start_ns=-1,.motion_start_ns=-1,
+                     .dt_orientation=(char *)"0b000000"};
  double a[3]={0,9.80665,0},w[3]={.5,-.25,1.25},got[3];
  sensor_now=1000000000;lis302dl_set_host_motion(&live,3,a,w);
  lis302dl_sample(&live,sensor_now);
@@ -75,9 +77,14 @@ int main(void) {
  for(int i=0;i<3;i++)assert(got[i]==w[i]);
  assert(!lis302dl_motion_rate(&live,sensor_now+250000000,got));
  for(int i=0;i<3;i++)assert(got[i]==0);
- live.last_sample_ns=-1;lis302dl_sample(&live,sensor_now+250000000);
+ for(int64_t later=250000000;later<=10000000000LL;later+=250000000){
+  live.last_sample_ns=-1;lis302dl_sample(&live,sensor_now+later);
+  assert(abs(live.out_x-56)<=1 && abs(live.out_y)<=1 && abs(live.out_z)<=1);
+ }
+ lis302dl_clear_host_motion(&live);
+ live.last_sample_ns=-1;lis302dl_sample(&live,sensor_now+10000000000LL);
  assert(!live.out_x&&!live.out_y&&!live.out_z);
  lis302dl_set_host_motion(&live,3,a,w);assert(live.host_fields==3);
  lis302dl_post_load(&live,3);assert(!live.host_fields);
- puts("PASS: 100/400 Hz DR, explicit rate, stable triplets, bounded noise, three-axis 200 ms shake, snapshot restore, LIS302DL 18/72 mg per count");
+ puts("PASS: 100/400 Hz DR, explicit rate, stable triplets, bounded noise, three-axis 200 ms shake, snapshot restore, LIS302DL 18/72 mg per count, host acceleration held between samples, rotation rate lapses");
 }

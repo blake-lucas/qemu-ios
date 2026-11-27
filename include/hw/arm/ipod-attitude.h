@@ -32,11 +32,15 @@ static inline bool ipod_attitude_gravity(double pitch, double roll, bool flat, d
  *     1 and 2 negate x, y and z (1.1 0xc036ca78, N72 2.x 0xc03d3b64, N18 3.1.1 0xc0322b16, N18 4.2.1 0x8060d19e).
  *   12 bytes, AppleLIS331DLH and the L3G4200D's driver (4.x to 7.x): D's rows, three int8 each in a 4-byte slot.
  * A gyro reads D's inverse (its transpose). An accelerometer reads the device's gravity g as D^T C g, so the OS
- * gets C g: C is diag(1, 1, -1) where D is a mirror (det -1: every DT seen from 3.0 on) and its negative where D
+ * gets C g: C is the identity where D is a mirror (det -1: every DT seen from 3.0 on), and diag(-1, -1, 1) where D
  * turns (det +1: the M68's absent 0 and the N45's 3 on 1.x, the iPod touch 2G's 5 on 2.x), as the 1.x OS reads its
- * accelerometer the other way round. Every mount found by hand on hardware-checked rotation (and the iPhone 4's z by
- * its compass) is this rule, except the iPod touch 4G's z: checked with a CoreMotion probe on 6.1.6 (face up, and
- * the gyro's fusion), it reads z, so its board sets the LIS model's flip-z.
+ * accelerometer the other way round. Every mount found by hand on hardware-checked rotation is this rule in x and y;
+ * rotation never checks z. z was measured on the iPod touch 4G (a CoreMotion probe on 6.1.6: face up, and the gyro's
+ * fusion) and the iPhone 4 (Safari's devicemotion on 6.1.3, face up against the long and short edges up), and both
+ * read face up as face down while 3.0's C was diag(1, 1, -1). That C cannot be right on any 3.0 board: a real part
+ * is right-handed and reads the reaction to gravity, so the map from g to its registers has det -1 however it is
+ * mounted (D^T C has det -1 only with C's det +1). The 1.x C has det +1 too, so the same argument says its z is
+ * the other way as well; nothing on 1.x was measured, and it is left as found.
  * Fills axis[i] = +/-(j + 1): sensor axis i reads device axis j. False if hex is neither form.
  */
 static inline bool ios_dt_mount(const char *hex, bool accelerometer, int8_t axis[3])
@@ -69,7 +73,7 @@ static inline bool ios_dt_mount(const char *hex, bool accelerometer, int8_t axis
     for (int i = 0; i < 3; i++) {
         axis[i] = 0;
         for (int j = 0; j < 3; j++) {
-            int c = !accelerometer ? 1 : (j == 2 ? det : -det);   /* C's (or 1's) j-th entry */
+            int c = !accelerometer || det < 0 ? 1 : (j == 2 ? 1 : -1);   /* C's (or 1's) j-th entry */
             if (d[j][i] == 1 || d[j][i] == -1) {
                 axis[i] = d[j][i] * c * (j + 1);
             }

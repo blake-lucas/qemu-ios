@@ -60,6 +60,24 @@ extern void *dlsym(void *, const char *);
 #ifndef RTLD_DEFAULT
 #define RTLD_DEFAULT ((void *)-2L)
 #endif
+extern void *dlopen(const char *, int);
+
+// The original of a hooked function. Every iOS before 10 inserts this library and interposes: the next definition
+// is the original. On iOS 10 (loaded by installd's and amfid's own load command) dyld answered these lookups with the
+// hook itself (installd recursed until its stack ran out), so the original comes from this library's interposition
+// table: dyld binds each entry's original to the real function and never interposes the table itself.
+static const void *as_interposed_original(const void *hook);
+static void *as_original(const char *library, const char *name, const void *hook) {
+    void *p = dlsym(RTLD_NEXT, name);
+    if (p && p != hook) return p;
+    const void *o = as_interposed_original(hook);
+    if (o && o != hook) return (void *)o;
+    void *h = dlopen(library, 0x10 | 0x1); // RTLD_NOLOAD | RTLD_LAZY: only if the program has it already
+    p = h ? dlsym(h, name) : 0;
+    return p != hook ? p : 0;
+}
+#define AS_LIBMIS "/usr/lib/libmis.dylib"
+#define AS_SECURITY "/System/Library/Frameworks/Security.framework/Security"
 
 // iOS 6 installd also requires the code-signing identifier and entitlements.
 // Those keys are absent before iOS 6, so they are resolved at runtime.
@@ -98,22 +116,87 @@ static unsigned be32(const unsigned char *p) {
     return (unsigned)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
 }
 
+/* Fat apps may put ARM64 first (Pages 2.0 does). This emulator's installd
+ * needs the supported 32-bit ARM slice's signing metadata. */
+static long appsync_arm32_slice(const unsigned char *header, unsigned size) {
+    if (size < 8) return -1;
+    if (be32(header) != 0xcafebabe) return 0;
+    unsigned count = be32(header + 4);
+    if (!count || count > (size - 8) / 20) return -1;
+    for (unsigned i = 0; i < count; i++) {
+        const unsigned char *arch = header + 8 + 20 * i;
+        if (be32(arch) == 12) {
+            unsigned offset = be32(arch + 8);
+            return offset && offset <= 0x7fffffff ? (long)offset : -1;
+        }
+    }
+    return -1;
+}
+
 // Read the first Mach-O slice's identifier and entitlements from its embedded
 // signature. A missing or malformed signature leaves both outputs untouched.
 // The load commands are read whole: Chrome 21's take 4556 bytes, and with the
 // first 4 KiB only its LC_CODE_SIGNATURE (the last) was never found, so 6.x
 // installd refused it (code_info_identifier=n, InstallMapUpdateFailed).
 #define HEADER_BYTES 65536
-static void signature_info(CFStringRef path, CFStringRef *ident, CFTypeRef *ents) {
+extern CFTypeRef CFDictionaryGetValue(CFDictionaryRef, const void *);
+extern unsigned long CFStringGetTypeID(void);
+extern int snprintf(char *, unsigned long, const char *, ...);
+static void executable_signature_info(CFStringRef, CFStringRef *, CFTypeRef *);
+
+/* Modern installation services pass a bundle directory. Resolve only its
+ * declared executable; the embedded signature remains the metadata source. */
+static int bundle_signature_info(const char *bundle, CFStringRef *ident, CFTypeRef *ents) {
+    char file[1400], executable[256];
+    int length = snprintf(file, sizeof file, "%s/Info.plist", bundle);
+    if (length < 0 || (unsigned)length >= sizeof file) return 0;
+    int fd = open(file, 0);
+    if (fd < 0) return 0;
+    unsigned char *bytes = malloc(HEADER_BYTES);
+    long n = bytes ? pread(fd, bytes, HEADER_BYTES, 0) : -1;
+    close(fd);
+    if (n <= 0 || n == HEADER_BYTES) { free(bytes); return 0; }
+    CFDataRef data = CFDataCreate(0, bytes, n);
+    free(bytes);
+    CFTypeRef plist = data ? CFPropertyListCreateFromXMLData(0, data, 0, 0) : 0;
+    if (data) CFRelease((CFTypeRef)data);
+    if (!plist || CFGetTypeID(plist) != CFDictionaryGetTypeID()) {
+        if (plist) CFRelease(plist);
+        return 0;
+    }
+    CFStringRef key = CFStringCreateWithCString(0, "CFBundleExecutable", 0x08000100);
+    CFTypeRef value = CFDictionaryGetValue((CFDictionaryRef)plist, key);
+    CFRelease((CFTypeRef)key);
+    if (!value || CFGetTypeID(value) != CFStringGetTypeID() ||
+        !CFStringGetCString((CFStringRef)value, executable, sizeof executable, 0x08000100) ||
+        !executable[0] || !strcmp(executable, ".") || !strcmp(executable, "..")) {
+        CFRelease(plist);
+        return 0;
+    }
+    for (unsigned i = 0; executable[i]; i++) {
+        if (executable[i] == '/') { CFRelease(plist); return 0; }
+    }
+    length = snprintf(file, sizeof file, "%s/%s", bundle, executable);
+    if (length > 0 && (unsigned)length < sizeof file) {
+        CFStringRef path = CFStringCreateWithCString(0, file, 0x08000100);
+        executable_signature_info(path, ident, ents);
+        CFRelease((CFTypeRef)path);
+    }
+    CFRelease(plist);
+    return 1;
+}
+
+static void executable_signature_info(CFStringRef path, CFStringRef *ident, CFTypeRef *ents) {
     char file[1024];
     if (!path || !CFStringGetCString(path, file, sizeof file, 0x08000100)) return;
     int fd = open(file, 0);
     if (fd < 0) return;
     unsigned char *h = malloc(HEADER_BYTES);
     if (!h) { close(fd); return; }
-    long base = 0, n = pread(fd, h, HEADER_BYTES, 0);
-    if (n >= 28 && be32(h) == 0xcafebabe && be32(h + 4)) {
-        base = be32(h + 16);
+    long n = pread(fd, h, HEADER_BYTES, 0);
+    long base = n > 0 ? appsync_arm32_slice(h, n) : -1;
+    if (base < 0) { free(h); close(fd); return; }
+    if (base) {
         n = pread(fd, h, HEADER_BYTES, base);
     }
     unsigned sigoff = 0, siglen = 0;
@@ -122,7 +205,7 @@ static void signature_info(CFStringRef path, CFStringRef *ident, CFTypeRef *ents
         for (unsigned i = 0; i < ncmds && off + 16 <= (unsigned)n; i++) {
             unsigned *lc = (unsigned *)(h + off);
             if (lc[0] == 0x1d) { sigoff = lc[2]; siglen = lc[3]; break; }
-            if (lc[1] < 8) break;
+            if (lc[1] < 8 || lc[1] > (unsigned)n - off) break;   /* no wrap past the header read */
             off += lc[1];
         }
     }
@@ -131,9 +214,9 @@ static void signature_info(CFStringRef path, CFStringRef *ident, CFTypeRef *ents
         unsigned count = be32(b + 8);
         for (unsigned i = 0; i < count && 12 + 8 * i + 8 <= siglen; i++) {
             unsigned o = be32(b + 12 + 8 * i + 4);
-            if (o + 24 > siglen) continue;
+            if (siglen < 24 || o > siglen - 24) continue;   /* o + 24 could wrap */
             unsigned magic = be32(b + o), len = be32(b + o + 4);
-            if (len > siglen - o) continue;
+            if (len < 8 || len > siglen - o) continue;   /* the entitlements' len - 8 must not wrap */
             if (magic == 0xfade0c02 && !*ident) {
                 unsigned io = be32(b + o + 20);
                 if (io < len && memchr(b + o + io, 0, len - io))
@@ -152,13 +235,25 @@ static void signature_info(CFStringRef path, CFStringRef *ident, CFTypeRef *ents
     close(fd);
 }
 
+static void signature_info(CFStringRef path, CFStringRef *ident, CFTypeRef *ents) {
+    char file[1024];
+    if (!path || !CFStringGetCString(path, file, sizeof file, 0x08000100)) return;
+    if (!bundle_signature_info(file, ident, ents)) executable_signature_info(path, ident, ents);
+}
+
+#include "appsync_ios10.h"
+
 static int as_MISValidateSignatureAndCopyInfo(void *path, void *options,
                                              CFDictionaryRef *info) {
-    int (*real)(void *, void *, CFDictionaryRef *) =
-        dlsym(RTLD_NEXT, "MISValidateSignatureAndCopyInfo");
+    int (*real)(void *, void *, CFDictionaryRef *) = as_original(AS_LIBMIS, "MISValidateSignatureAndCopyInfo",
+        (const void *)as_MISValidateSignatureAndCopyInfo);
+    int ios10 = as_ios10();
+    if (ios10 && in_installd()) as_rehash_bundle((CFStringRef)path);
     // Copy APIs may leave the out parameter untouched on failure.
     if (info) *info = 0;
     int result = real ? real(path, options, info) : -1;
+    if (ios10 && in_amfid()) return as_ios10_amfid(path, options, info, result);
+    if (ios10 && in_installd()) AS_LOG("installd: libmis says %#x%s", result, result ? "; supplying signing info" : "");
     if (!in_installd()) return result;
     if (info && !*info) {
         CFMutableDictionaryRef d = CFDictionaryCreateMutable(
@@ -198,8 +293,8 @@ static int is_appsync_certificate(CFTypeRef value) {
 // Keep real certificates and errors intact. Only our synthetic signing-info
 // certificate may use CFData as a stand-in when legacy Security rejects it.
 static SecCertificateRef as_SecCertificateCreateWithData(CFAllocatorRef a, CFDataRef d) {
-    SecCertificateRef (*real)(CFAllocatorRef, CFDataRef) =
-        dlsym(RTLD_NEXT, "SecCertificateCreateWithData");
+    SecCertificateRef (*real)(CFAllocatorRef, CFDataRef) = as_original(AS_SECURITY, "SecCertificateCreateWithData",
+        (const void *)as_SecCertificateCreateWithData);
     SecCertificateRef result = real ? real(a, d) : 0;
     if (!result && in_installd() && is_appsync_certificate((CFTypeRef)d))
         result = (SecCertificateRef)CFRetain((CFTypeRef)d);
@@ -209,10 +304,35 @@ static SecCertificateRef as_SecCertificateCreateWithData(CFAllocatorRef a, CFDat
 static CFStringRef as_SecCertificateCopySubjectSummary(SecCertificateRef c) {
     if (in_installd() && is_appsync_certificate((CFTypeRef)c))
         return CFStringCreateWithCString(kCFAllocatorDefault, "AppSync", 0x0600);
-    CFStringRef (*real)(SecCertificateRef) =
-        dlsym(RTLD_NEXT, "SecCertificateCopySubjectSummary");
+    CFStringRef (*real)(SecCertificateRef) = as_original(AS_SECURITY, "SecCertificateCopySubjectSummary",
+        (const void *)as_SecCertificateCopySubjectSummary);
     return real ? real(c) : 0;
 }
+
+// iOS 10's installd also asks for the signer's organization: none for the stand-in (it isn't a certificate).
+// Rebound on iOS 10 only, never interposed: older Security may not export it, and an interposition entry's
+// original must bind.
+static CFTypeRef as_SecCertificateCopyOrganization(SecCertificateRef c) {
+    if (in_installd() && is_appsync_certificate((CFTypeRef)c)) return 0;
+    CFTypeRef (*real)(SecCertificateRef) = as_original(AS_SECURITY, "SecCertificateCopyOrganization",
+        (const void *)as_SecCertificateCopyOrganization);
+    return real ? real(c) : 0;
+}
+
+// iOS 10: the weak LC_LOAD_DYLIB FirmwareKit gives installd and amfid; their own imports are pointed here.
+#ifndef APPSYNC_TEST
+__attribute__((constructor)) static void as_ios10_bind(void) {
+    if (!as_ios10() || !(in_installd() || in_amfid())) return;
+    int mis = as_rebind("_MISValidateSignatureAndCopyInfo", (const void *)as_MISValidateSignatureAndCopyInfo);
+    int sec = 0;
+    if (in_installd()) {
+        sec += as_rebind("_SecCertificateCreateWithData", (const void *)as_SecCertificateCreateWithData);
+        sec += as_rebind("_SecCertificateCopySubjectSummary", (const void *)as_SecCertificateCopySubjectSummary);
+        sec += as_rebind("_SecCertificateCopyOrganization", (const void *)as_SecCertificateCopyOrganization);
+    }
+    AS_LOG("loaded in %s; MIS imports rebound %d, Security %d", getprogname(), mis, sec);
+}
+#endif
 
 // dyld interposition: replace/original pairs in __DATA,__interpose.
 #ifndef APPSYNC_TEST
@@ -225,4 +345,11 @@ __attribute__((used)) static const interpose_t as_interposers[]
     { (const void *)as_SecCertificateCopySubjectSummary, (const void *)SecCertificateCopySubjectSummary },
 };
 
+static const void *as_interposed_original(const void *hook) {
+    for (unsigned i = 0; i < sizeof as_interposers / sizeof as_interposers[0]; i++)
+        if (as_interposers[i].replacement == hook) return as_interposers[i].original;
+    return 0;
+}
+#else
+static const void *as_interposed_original(const void *hook) { (void)hook; return 0; }
 #endif

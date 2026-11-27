@@ -60,9 +60,12 @@ const MemoryRegionOps s5l8930_dart_ops = {
 
 hwaddr s5l8930_dart_xlate(S5L8930Dart *d, unsigned sid, uint32_t va)
 {
-    uint32_t ste = d->ste[sid][(va >> 22) & 0x3f] & ~0xfffu;
-    uint32_t pte;
+    uint32_t ste, pte;
 
+    if (sid >= S5L8930_DART_SIDS) {
+        return -1;
+    }
+    ste = d->ste[sid][(va >> 22) % S5L8930_DART_SEGS] & ~0xfffu;
     if (!ste) {
         return va;
     }

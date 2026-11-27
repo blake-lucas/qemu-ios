@@ -13,7 +13,8 @@ trap 'rm -rf "$TMP"' EXIT
 image() {
     clang --target=armv6k-none-eabi -c -DRAM="$1" -x assembler-with-cpp "$SRC" -o "$TMP/rom.o" ||
         return 1
-    # .text, with the branches to its own labels resolved (clang leaves R_ARM_CALL/JUMP24 for a linker)
+    # .text, with what clang leaves for a linker resolved: branches to its own labels (R_ARM_CALL/JUMP24, and Thumb
+    # BL/BLX, R_ARM_THM_CALL) and literal words holding their addresses (R_ARM_ABS32; the bootrom runs at 0)
     python3 -I - "$TMP/rom.o" "$3" <<'PY' || return 1
 import struct, sys
 d = open(sys.argv[1], 'rb').read()
@@ -29,10 +30,28 @@ for s in secs:
         for k in range(s[5] // 8):
             off, info = struct.unpack_from('<II', d, s[4] + k * 8)
             _, value, _, _, _, shndx = struct.unpack_from('<IIIBBH', d, symtab[4] + (info >> 8) * 16)
-            assert info & 0xff in (0x1c, 0x1d) and shndx == ti, 'unexpected relocation'
-            insn, = struct.unpack_from('<I', text, off)
-            addend = ((insn & 0xffffff) ^ 0x800000) - 0x800000
-            struct.pack_into('<I', text, off, (insn & 0xff000000) | (((value - off >> 2) + addend) & 0xffffff))
+            kind = info & 0xff
+            assert kind in (0x02, 0x0a, 0x1c, 0x1d) and shndx == ti, f'unexpected relocation {kind:#x}'
+            if kind == 0x02:  # R_ARM_ABS32: the word holds the addend
+                word, = struct.unpack_from('<I', text, off)
+                struct.pack_into('<I', text, off, (word + value) & 0xffffffff)
+            elif kind == 0x0a:  # R_ARM_THM_CALL: BL to Thumb code, BLX to ARM code
+                hi, lo = struct.unpack_from('<HH', text, off)
+                sign, j1, j2 = hi >> 10 & 1, lo >> 13 & 1, lo >> 11 & 1
+                addend = (sign << 24 | (1 ^ j1 ^ sign) << 23 | (1 ^ j2 ^ sign) << 22 | (hi & 0x3ff) << 12
+                          | (lo & 0x7ff) << 1)
+                addend -= sign << 25
+                thumb = value & 1
+                r = (value & ~1) + addend - (off if thumb else off & ~3)
+                assert -(1 << 24) <= r < 1 << 24 and (thumb or r % 4 == 0), 'Thumb call out of range'
+                sign, i1, i2 = r >> 24 & 1, r >> 23 & 1, r >> 22 & 1
+                hi = 0xf000 | sign << 10 | r >> 12 & 0x3ff
+                lo = 0xc000 | thumb << 12 | (1 ^ i1 ^ sign) << 13 | (1 ^ i2 ^ sign) << 11 | r >> 1 & 0x7ff
+                struct.pack_into('<HH', text, off, hi, lo)
+            else:
+                insn, = struct.unpack_from('<I', text, off)
+                addend = ((insn & 0xffffff) ^ 0x800000) - 0x800000
+                struct.pack_into('<I', text, off, (insn & 0xff000000) | (((value - off >> 2) + addend) & 0xffffff))
 open(sys.argv[2], 'wb').write(text)
 PY
     truncate -s "$2" "$3"

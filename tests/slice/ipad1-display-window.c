@@ -8,7 +8,7 @@
  *
  * Mutation (named, must fail this test): drop the UNSCALED check in scanout_layer.
  *
- * SLICE:types hw/arm/s5l8930_display.c define (DP_LAYERS|DP_UI_BASE|DP_UI_FORMAT|DP_UI_ADDR|DP_UI_STRIDE|DP_UI_UNSCALED|DP_UI_DST_ORIGIN|DP_UI_SRC_SIZE|DP_UI_DST_END)[[:space:](]
+ * SLICE:types hw/arm/s5l8930_display.c define (DP_LAYERS|DP_UI_BASE|DP_UI_FORMAT|DP_UI_ADDR|DP_UI_STRIDE|DP_UI_UNSCALED|DP_UI_DST_ORIGIN|DP_UI_SRC_END|DP_UI_DST_END|DP_UI_FORMAT_LINEAR|DP_UI_SRC_ORIGIN)[[:space:](]
  * SLICE:types hw/arm/s5l8930_display.c typedef UILayer
  * SLICE hw/arm/s5l8930_display.c fn scanout_layer layer_row_bytes layer_fetch layers_fetch layer_row layers video_compose blend front_latch
  * PKG glib-2.0
@@ -32,6 +32,7 @@ typedef struct { uint32_t regs[0x6000 / 4]; uint32_t swap_id; } DisplayPipe;
 #include "types.h"
 
 typedef struct S5L8930DisplayState {
+    bool h5p;
     DisplayPipe pipe[1];
     uint8_t *front, *front_next;
     size_t front_size;
@@ -46,7 +47,7 @@ typedef struct S5L8930DisplayState {
 static uint8_t ram[0x10000];
 
 static void panel_size(S5L8930DisplayState *s, unsigned *w, unsigned *h) { *w = W; *h = H; }
-static void fb_read(S5L8930DisplayState *s, uint32_t va, uint8_t *dst, unsigned len)
+static void fb_read(S5L8930DisplayState *s, uint32_t va, uint8_t *dst, unsigned len, const uint32_t *tables)
 {
     assert(va + len <= sizeof(ram));
     memcpy(dst, ram + va, len);
@@ -62,7 +63,8 @@ static void swap(uint32_t base, unsigned sw, unsigned sh, bool unscaled, uint32_
 {
     ui[DP_UI_ADDR / 4] = base;
     ui[DP_UI_STRIDE / 4] = sw * 4;
-    ui[DP_UI_SRC_SIZE / 4] = sw << 16 | sh;
+    ui[DP_UI_FORMAT / 4] = DP_UI_FORMAT_LINEAR;
+    ui[DP_UI_SRC_END / 4] = sw << 16 | sh;
     ui[DP_UI_UNSCALED / 4] = unscaled;
     if (!unscaled) {
         ui[DP_UI_DST_ORIGIN / 4] = org;
@@ -110,5 +112,31 @@ int main(void)
     front_latch(s);
     swap(HOME, W, H, false, 0, W << 16 | H);
     home_shown(s);
+
+    /* H5P uses +60/+70 for source corners, +54/+58 for destination, and
+     * seven stride flag bits. +4c bit0 is no longer H3's UNSCALED switch. */
+    s->h5p = true;
+    memset(ui, 0, 0x100);
+    ui[DP_UI_ADDR / 4] = HOME;
+    ui[DP_UI_FORMAT / 4] = 0x1001;
+    ui[DP_UI_STRIDE / 4] = W * 4 | 0x43;
+    ui[0x4c / 4] = 1;
+    ui[0x60 / 4] = 8 << 16 | 4;
+    ui[0x70 / 4] = 24 << 16 | 16;
+    ui[0x54 / 4] = 16 << 16 | 12;
+    ui[0x58 / 4] = 48 << 16 | 36;
+    front_latch(s);
+    for (unsigned y = 0; y < H; y++) {
+        for (unsigned x = 0; x < W; x++) {
+            bool in = x >= 16 && x < 48 && y >= 12 && y < 36;
+            const uint8_t *pixel = s->front + (y * W + x) * 4;
+            uint32_t want = HOME + ((4 + (y - 12) / 2) * W + 8 + (x - 16) / 2) * 4;
+            assert(in ? !memcmp(pixel, ram + want, 4) : !memcmp(pixel, "\0\0\0\0", 4));
+        }
+    }
+    ui[0x60 / 4] = 0x1000 << 16;
+    ui[0x70 / 4] = 0x1010 << 16 | 12;
+    UILayer layer;
+    assert(scanout_layer(s, 0, W, H, &layer) && layer.sx == 0x1000 && layer.sw == 16);
     return 0;
 }

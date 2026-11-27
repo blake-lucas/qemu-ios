@@ -47,6 +47,7 @@
 #ifdef QEMU_EXPERIMENTAL_TB_CACHE_STATS
 #include "tb-jmp-cache.h"
 #endif
+#include "system/cpu-timers.h"
 
 #ifdef CONFIG_DARWIN
 #include <pthread/qos.h>
@@ -132,9 +133,10 @@ extern uint64_t it_acct_lookups, it_acct_jc_misses, it_acct_jc_empty, it_acct_jc
 extern uint64_t it_acct_flagbit[3][32];
 extern uint64_t it_acct_pcrel_invals, it_acct_jc_flushes;
 extern uint64_t it_acct_vcpu_bql_n, it_acct_vcpu_bql_ns, it_acct_vcpu_bql_slow;
-extern struct it_acct_mr { void *mr; uint64_t n, ns; char *name; } it_acct_mrs[256];
+extern struct it_acct_mr { void *mr; uint64_t n, ns; char *name; uint64_t hold_n, hold_ns, hold_long_n, hold_max; } it_acct_mrs[256];
 extern uint64_t it_acct_wait_hist[5][2], it_acct_hold_hist[5][2];
 extern uint64_t it_acct_ctxsw, it_acct_fills[32][2];
+extern uint64_t it_acct_tlbi_is[4];
 extern uint64_t it_acct_el0_sync, it_acct_el0_used, it_acct_tlbiasid, it_acct_pflush, it_acct_rflush,
     it_acct_reset_dirty;
 extern struct it_acct_holder { const char *file; int line; uint64_t n, ns, long_n, long_ns; } it_acct_holders[64];
@@ -209,6 +211,7 @@ static void mttcg_acct_init(CPUState *cpu)
     acct_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     acct_next_dump = acct_t0 + acct_interval_ns;
     it_acct_cb_enable();
+    it_acct_excl_on = true;
     fprintf(stderr, "[acct-mode] full=%s bql=on begin-ns %" PRId64
             " interval-ns %" PRId64 "\n", it_acct_on ? "on" : "off",
             acct_t0, acct_interval_ns);
@@ -343,6 +346,20 @@ static void mttcg_acct_dump(int64_t now)
                 c->n, c->ns, c->long_n, c->long_ns, c->max);
 #endif
     }
+    for (int i = 0; i < ARRAY_SIZE(it_acct_excl) && it_acct_excl[i].fn; i++) {
+#ifndef _WIN32
+        struct it_acct_excl *e = &it_acct_excl[i];
+        Dl_info di = { 0 };
+
+        dladdr(e->fn, &di);
+        fprintf(stderr, "[acct]   exclusive %s+0x%" PRIxPTR " n %" PRIu64 " wait-ns %" PRIu64 " work-ns %" PRIu64
+                " max-wait %" PRIu64 "\n", di.dli_sname ? di.dli_sname : "lib",
+                (uintptr_t)e->fn - (uintptr_t)(di.dli_sname ? di.dli_saddr : di.dli_fbase), e->n, e->wait_ns,
+                e->work_ns, e->max_wait);
+#endif
+    }
+    fprintf(stderr, "[acct]   tlbi-is all %" PRIu64 " asid %" PRIu64 " mva %" PRIu64 " mvaa %" PRIu64 "\n",
+            it_acct_tlbi_is[0], it_acct_tlbi_is[1], it_acct_tlbi_is[2], it_acct_tlbi_is[3]);
     fprintf(stderr, "[acct]   ctxsw %" PRIu64 " el0-sync %" PRIu64 " el0-used %" PRIu64 " tlbiasid %" PRIu64
             " pflush %" PRIu64 " rflush %" PRIu64 " reset-dirty %" PRIu64 " tlb-fills", it_acct_ctxsw, it_acct_el0_sync,
             it_acct_el0_used, it_acct_tlbiasid, it_acct_pflush, it_acct_rflush, it_acct_reset_dirty);
@@ -367,8 +384,10 @@ static void mttcg_acct_dump(int64_t now)
                 it_acct_holders[i].ns, it_acct_holders[i].long_n, it_acct_holders[i].long_ns);
     }
     for (int i = 0; i < 256 && it_acct_mrs[i].mr; i++) {
-        fprintf(stderr, "[acct]   bql-by-mr %s n %" PRIu64 " wait-ns %" PRIu64 "\n",
-                it_acct_mrs[i].name, it_acct_mrs[i].n, it_acct_mrs[i].ns);
+        fprintf(stderr, "[acct]   bql-by-mr %s n %" PRIu64 " wait-ns %" PRIu64 " hold-n %" PRIu64 " hold-ns %" PRIu64
+                " hold-long %" PRIu64 " hold-max %" PRIu64 "\n",
+                it_acct_mrs[i].name, it_acct_mrs[i].n, it_acct_mrs[i].ns, it_acct_mrs[i].hold_n,
+                it_acct_mrs[i].hold_ns, it_acct_mrs[i].hold_long_n, it_acct_mrs[i].hold_max);
     }
     for (int k = 0; k < 3; k++) {
         for (int b = 0; b < 32; b++) {
@@ -379,7 +398,100 @@ static void mttcg_acct_dump(int64_t now)
             }
         }
     }
+    {
+        extern struct it_mmio_hist { void *mr; uint32_t off; uint64_t n; char *name; } it_mmio_hist[4096];
+        extern int it_mmio_hist_on;
+
+        for (int i = 0; it_mmio_hist_on > 0 && i < 4096; i++) {
+            struct it_mmio_hist *e = &it_mmio_hist[i];
+            if (qatomic_load_acquire(&e->mr) && e->n >= 64) {
+                fprintf(stderr, "[acct]   mmio %s+0x%x %c n %" PRIu64 "\n", e->name, e->off & ~1u,
+                        e->off & 1 ? 'w' : 'r', e->n);
+            }
+        }
+    }
     fprintf(stderr, "[acct]   end-ns %" PRId64 "\n", now);
+}
+
+/*
+ * The guest's clock waits for a vCPU the host isn't running (MachineClass clock_waits_for_vcpus).
+ *
+ * A board's cores never stop while its timebase runs. A vCPU thread stops whenever the host deschedules it or it
+ * waits for the BQL or for the other vCPUs (a broadcast TLB flush is exclusive work), and the VM clock, which is host
+ * time, runs on. A core spinning on a lock against the timebase then counts the holder's stall as time: iOS 10's
+ * hw_lock_bit (14G61, 800da1ee) panics "hw_lock_bit(): timed out" after 0xc00000 ticks, 0.52 s at 24 MHz.
+ *
+ * Every STALL_TICK_US this thread looks for a vCPU that is neither asleep idle nor has reached a TB boundary since the
+ * last look, and kicks each awake one, so that one the host runs reaches a TB boundary within a TB; while there is a
+ * stalled one, the VM clock runs at 1/16 (cpu_clock_set_slow), and afterwards at 1.25 times host time until it has
+ * caught up, so the guest's date doesn't fall behind the host's; a holder that runs is nowhere near a lock timeout,
+ * and a stall during the catch-up slows the clock again. It looks every STALL_IDLE_TICK_US while every vCPU is idle
+ * and the clock is at host rate, as none can stall then (one that wakes counts as seen).
+ */
+#define STALL_TICK_US 2000
+#define STALL_IDLE_TICK_US 20000
+
+/* One look at the vCPUs: whether one stalled since the last; *awake, whether one is awake now. */
+static bool mttcg_stall_check(bool *awake)
+{
+    CPUState *cpu;
+    bool stalled = false;
+
+    *awake = false;
+    CPU_FOREACH(cpu) {
+        bool seen = qatomic_xchg(&cpu->exec_seen, false);
+
+        if (!qatomic_read(&cpu->created) || qatomic_read(&cpu->idle)) {
+            continue;
+        }
+        *awake = true;
+        stalled |= !seen;
+        /* cpu_exit without its exit_request: out of the TB chain into cpu_handle_interrupt, not out of cpu_exec */
+        qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
+    }
+    return stalled;
+}
+
+/*
+ * A look, and the VM clock's rate after it; *awake as mttcg_stall_check's. Returns whether the clock is off host rate.
+ * While it catches up, the main loop's timer deadlines, which assume host rate, come due early: each look wakes it.
+ */
+static bool mttcg_stall_look(bool *awake)
+{
+    bool stalled, off_rate;
+
+    WITH_RCU_READ_LOCK_GUARD() {
+        stalled = mttcg_stall_check(awake);
+    }
+    off_rate = cpu_clock_set_slow(stalled);
+    if (off_rate && !stalled) {
+        qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    }
+    return off_rate;
+}
+
+static void *mttcg_stall_thread(void *arg)
+{
+    bool awake = true, off_rate = false;
+
+    rcu_register_thread();
+    mttcg_request_performance_core();   /* the vCPUs' QoS: a look the host delays is time the guest sees */
+    for (;;) {
+        g_usleep(awake || off_rate ? STALL_TICK_US : STALL_IDLE_TICK_US);
+        off_rate = mttcg_stall_look(&awake);
+    }
+    return NULL;
+}
+
+static void mttcg_stall_start(void)
+{
+    static QemuThread thread;
+    static bool started;
+
+    if (!started && MACHINE_GET_CLASS(current_machine)->clock_waits_for_vcpus) {
+        started = true;
+        qemu_thread_create(&thread, "vCPU stall check", mttcg_stall_thread, NULL, QEMU_THREAD_DETACHED);
+    }
 }
 
 static void *mttcg_cpu_thread_fn(void *arg)
@@ -414,7 +526,16 @@ static void *mttcg_cpu_thread_fn(void *arg)
         if (!timing) {
             qatomic_set(&acct_io_mark, 0);
         }
+        bool idle = cpu_thread_is_idle(cpu);
+
+        if (idle) {
+            qatomic_set(&cpu->idle, true);
+        }
         qemu_process_cpu_events(cpu);
+        if (idle) {
+            qatomic_set(&cpu->exec_seen, true);
+            qatomic_set(&cpu->idle, false);
+        }
 
         if (timing) {
             int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -521,6 +642,7 @@ void mttcg_start_vcpu_thread(CPUState *cpu)
     char thread_name[VCPU_THREAD_NAME_SIZE];
 
     g_assert(tcg_enabled());
+    mttcg_stall_start();
     /*
      * CF_PARALLEL makes guest atomics host atomics and guest barriers host fences, and it turns
      * off the per-site indirect branch cache, whose slots the executing vCPU writes. A CPU its

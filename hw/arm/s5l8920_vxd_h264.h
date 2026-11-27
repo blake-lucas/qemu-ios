@@ -24,11 +24,13 @@ typedef struct VXDPicture {
 VXDH264 *vxd_h264_new(void);
 void vxd_h264_free(VXDH264 *h);
 /*
- * 1: a picture is complete in *pic (valid until the next call); 0: not yet; -1: the slice failed. Pictures come
- * in display order, not the slices' (a stream with B pictures holds a reference picture back until the next one).
+ * 1: a picture is complete in *pic (valid until the next call); 0: not yet; -1: the slice failed. The picture is the
+ * one the slice completes, in decode order, as the hardware writes it (LT_VXD_PICTURE_ORDER=output: pictures as the
+ * host decoder outputs them, in display order, a stream with B pictures holding a reference picture back until the
+ * next one, so a picture reaches its buffer renders after its fence was answered).
  */
 int vxd_h264_decode(VXDH264 *h, const VXDSlice *sl, VXDPicture *pic);
-/* After a 1: the next complete picture, if another is (1), as vxd_h264_decode. */
+/* After a 1: the next complete picture, if another is (1), as vxd_h264_decode (output order only). */
 int vxd_h264_next(VXDH264 *h, VXDPicture *pic);
 
 #endif

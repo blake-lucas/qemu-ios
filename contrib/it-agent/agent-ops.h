@@ -234,8 +234,22 @@ static int agent_statusbarget(const char *args)
     return 0;
 }
 
-#define AG_HELLO "it_agent v5\nops ping exec spawn sync put putpart get getrange chown unlink settime " \
-    "launch frontmost lockstatus orientation dlicon halt type backspace uidump cadebug statusbar statusbarget\n"
+/* `signal SIG PID`: kill(2), no shell. Stock iOS has no kill command, and an app that dies (rather than one
+ * SpringBoard suspends) is what the GL bridge's process-exit cleanup (agent-glexit.h) is tested with. v6 */
+static int agent_signal(const char *args)
+{
+    char *end;
+    errno = 0;
+    long sig = strtol(args, &end, 10), pid;
+    if (errno || end == args || *end != ' ' || sig < 0 || sig > 31) return -EINVAL;
+    const char *p = end + 1;
+    pid = strtol(p, &end, 10);
+    if (errno || end == p || *end || pid <= 1) return -EINVAL;
+    return kill((pid_t)pid, (int)sig) ? -errno : 0;
+}
+
+#define AG_HELLO "it_agent v6\nops ping exec spawn sync put putpart get getrange chown unlink settime " \
+    "launch frontmost lockstatus orientation dlicon halt type backspace uidump cadebug statusbar statusbarget signal\n"
 
 static void agent_dispatch(unsigned size)
 {
@@ -277,6 +291,8 @@ static void agent_dispatch(unsigned size)
         status = agent_statusbar(body, body_len);
     } else if (!strcmp(op, "statusbarget")) {
         status = agent_statusbarget(args);
+    } else if (!strcmp(op, "signal")) {
+        status = agent_signal(args);
     } else if (!strcmp(op, "halt")) {
         extern int reboot2(int, const char *);
         if (reboot2(8, 0)) status = -errno;

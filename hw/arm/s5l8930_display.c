@@ -18,6 +18,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/arm/s5l8930.h"
+#include "hw/arm/ipod_touch_lcd.h"
 #include "hw/arm/frame-timeline.h"
 #include "hw/arm/panel-gamma.h"
 #include "hw/arm/gles-present.h"
@@ -44,12 +45,14 @@
 #define DP_FIFO_COUNT       0x1044    /* polled to 0 */
 #define DP_SWAP_DONE        0x1048    /* low 16 bits: last completed swap ID */
 #define DP_UI_BASE(l)       (0x4000 + (l) * 0x1000)
-#define DP_UI_FORMAT        0x40
+#define DP_UI_FORMAT        0x40      /* bits 8-10 the pixel format, bit 0 linear (clear: tiled) */
+#define DP_UI_FORMAT_LINEAR 1u
 #define DP_UI_ADDR          0x44
 #define DP_UI_STRIDE        0x48
 #define DP_UI_UNSCALED      0x4c      /* bit0: placed at 0,0 at its source size; DST_ORIGIN and DST_END unused */
+#define DP_UI_SRC_ORIGIN    0x50      /* x << 16 | y in the source buffer */
 #define DP_UI_DST_ORIGIN    0x54      /* x << 16 | y on the panel */
-#define DP_UI_SRC_SIZE      0x60      /* w << 16 | h of the source buffer */
+#define DP_UI_SRC_END       0x60      /* x1 << 16 | y1, the source rectangle's far corner */
 #define DP_UI_DST_END       0x64      /* x1 << 16 | y1, the destination's far corner */
 
 #define DP_IRQ_VBL          0x001
@@ -58,6 +61,7 @@
 #define CLCD_CTRL           0x00      /* bit8 = soft reset, self-clearing */
 #define CLCD_IRQ_ENABLE     0x08      /* bit0: the CLCD's interrupt on */
 #define CLCD_GAMMA_CTRL     0x2c      /* bit0: the output gamma on (AppleCLCD's "Gamma Correction") */
+#define CLCD_GAMMA_UPDATE   0x40      /* H5P: table update request, cleared at frame completion */
 #define CLCD_LUT_CTRL       0x34      /* bit16 write, bits 12-14 table, bits 0-7 entry */
 #define CLCD_LUT_WDATA      0x38      /* an entry, then the next (the index steps) */
 #define CLCD_LUT_RDATA      0x3c
@@ -85,13 +89,18 @@ typedef struct {
     bool swap_pending;       /* a swap arrived since the last VBL */
     uint32_t panel;          /* pipe0: w << 16 | h of a panel= override (issue #21), 0 = none */
     uint32_t native;         /* pipe0: w << 16 | h of the board's panel, the geometry iBoot programs */
+    bool h5p;               /* configured register generation, not guest runtime state */
 } DisplayPipe;
 
 /* A UI layer's scanout: its buffer and where it lands on the panel. */
 typedef struct UILayer {
-    uint32_t fmt, base, stride;
-    unsigned sw, sh;                 /* source size */
+    uint32_t fmt, base, stride;      /* stride: bytes from one source row to the next */
+    unsigned sx, sy, sw, sh;         /* source rectangle */
     unsigned x0, y0, x1, y1;         /* destination rectangle, clipped to the panel */
+    unsigned regions;               /* H5P multi-region source coverage */
+    uint32_t region_start[4], region_end[4];
+    bool translated;
+    uint32_t page_tables[64];       /* H5P: one 4 KiB PTE table per 4 MiB segment */
 } UILayer;
 
 struct S5L8930DisplayState {
@@ -106,6 +115,7 @@ struct S5L8930DisplayState {
     uint16_t width, height;  /* properties: the board's panel, as iBoot programs it */
     uint32_t pw, ph;         /* "panel-width"/"panel-height": panel= override (issue #21), 0 = the board's */
     uint32_t refresh_hz;     /* "refresh-hz": the VBL's rate, 60 as on the devices */
+    bool h5p;
 
     DisplayPipe pipe[2];     /* 0 = DisplayPipe0 (scanned out), 1 = RGBOUT */
     uint32_t clcd[2][CLCD_WORDS];
@@ -210,10 +220,17 @@ static uint32_t panel_word(const DisplayPipe *p, hwaddr addr, uint32_t v)
     if (!panel) {
         return v;
     }
+    if (p->h5p) {
+        if (addr == 0x4070 || addr == 0x4058 || addr == 0x5070 || addr == 0x5058)
+            return v == native ? panel : v;
+        if (addr == 0x4048 || addr == 0x5048)
+            return (v & ~0x7fu) == nw * 4 ? w * 4 | (v & 0x7f) : v;
+        if (addr >= 0x4000 && addr < 0x6000) return v;
+    }
     switch (addr) {
     case DP_SIZE:
-    case DP_UI_BASE(0) + DP_UI_SRC_SIZE: case DP_UI_BASE(0) + DP_UI_DST_END:
-    case DP_UI_BASE(1) + DP_UI_SRC_SIZE: case DP_UI_BASE(1) + DP_UI_DST_END:
+    case DP_UI_BASE(0) + DP_UI_SRC_END: case DP_UI_BASE(0) + DP_UI_DST_END:
+    case DP_UI_BASE(1) + DP_UI_SRC_END: case DP_UI_BASE(1) + DP_UI_DST_END:
         return v == native ? panel : v;
     case DP_UI_BASE(0) + DP_UI_STRIDE: case DP_UI_BASE(1) + DP_UI_STRIDE:
         return (v & ~0x3fu) == nw * 4 ? w * 4 | (v & 0x3f) : v;
@@ -383,10 +400,65 @@ static bool frame_copy_unlocked(void)
     return on;
 }
 
+static void clcd_frame_end(S5L8930DisplayState *s)
+{
+    /* 11A465 AppleMobileCLCD 80e5bca0 waits for +0x2c bit 6 before
+     * uploading the next gamma table, then sets it to request the update.
+     * Retaining that request forever blocks subsequent gamma RPCs. */
+    if (s->h5p) {
+        s->clcd[0][CLCD_GAMMA_CTRL / 4] &= ~CLCD_GAMMA_UPDATE;
+    }
+    s->clcd_status |= CLCD_IRQ_FRAME;
+    clcd_update_irq(s);
+}
+
+/*
+ * On the iPhone 5, after a second without swaps the re-latch runs every LT_QUIET_RELATCH_EVERY-th vsync (default 4,
+ * 1 = every vsync as before): a still screen's re-latch reads and compares both 640x1136 layers, the main loop's
+ * largest cost on a phone. Only content written into the scanned-out buffer without a swap (Accessibility Zoom)
+ * reaches the screen up to three vsyncs later; swaps are latched at their vsync as always.
+ */
+static bool quiet_relatch_due(S5L8930DisplayState *s)
+{
+    static int every = -1;
+
+    if (every < 0) {
+        const char *v = getenv("LT_QUIET_RELATCH_EVERY");
+        every = v && atoi(v) > 0 ? atoi(v) : 4;
+    }
+    return !s->h5p || every <= 1 || s->quiet_vbls < 60 || s->quiet_vbls % every == 0;
+}
+
+/*
+ * Tell the front end when this VBL was due (ipod_lcd_vsync_due), so the frame it latches is stamped on the panel's
+ * exact 60 Hz grid instead of when the main loop got round to the tick (+/-2 ms on a phone); the Android presenter
+ * posts frames on that grid. The virtual clock is the host's less time spent paused, so the deadline maps across by
+ * how late the tick runs. LT_VBL_STAMP=off stamps frames when they are captured, as before.
+ */
+static void vbl_note_due(S5L8930DisplayState *s)
+{
+    static int on = -1;
+    int64_t now;
+
+    if (on < 0) {
+        const char *v = getenv("LT_VBL_STAMP");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
+    }
+    if (!on || !ipod_lcd_vsync_due) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->next_vbl <= now) {
+        ipod_lcd_vsync_due(qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - (now - s->next_vbl));
+    }
+}
+
 /* One frame: the queued swaps complete and the VBLs fire. */
 static void vbl_tick(void *opaque)
 {
     S5L8930DisplayState *s = opaque;
+
+    vbl_note_due(s);
 
     /* stop-after-vsyncs: the jank harness steps the machine one input sample per N vsyncs, so a gesture's
      * touch timing is fixed in virtual time instead of following the host's wall clock (docs/perf-jank.md). */
@@ -452,7 +524,7 @@ static void vbl_tick(void *opaque)
         s->quiet_vbls = 0;
         s->swaps++;
         latch = true;
-    } else if (++s->quiet_vbls >= QUIET_RELATCH_VBLS) {
+    } else if (++s->quiet_vbls >= QUIET_RELATCH_VBLS && quiet_relatch_due(s)) {
         /*
          * No swap for a quarter second, yet the buffer can still change:
          * with Accessibility > Zoom on, CA stops swapping and the scaler
@@ -491,8 +563,7 @@ static void vbl_tick(void *opaque)
         graphic_hw_update(s->con);
     }
     /* ponytail: the frame is the only CLCD source raised, the one AppleCLCD enables (its LUT and dither updates). */
-    s->clcd_status |= CLCD_IRQ_FRAME;
-    clcd_update_irq(s);
+    clcd_frame_end(s);
     vbl_rearm(s);
 }
 
@@ -639,11 +710,15 @@ typedef struct FbSeg {
     size_t off, len;
 } FbSeg;
 
-static void fb_plan_into(S5L8930DisplayState *s, GArray *plan, uint32_t va, size_t off, size_t len)
+static hwaddr h5p_ui_xlate(const uint32_t tables[64], uint32_t va);
+
+/* tables: the A6's per-layer page tables (H5P), or NULL for the display's DART */
+static void fb_plan_into(S5L8930DisplayState *s, GArray *plan, uint32_t va, size_t off, size_t len,
+                         const uint32_t *tables)
 {
     while (len) {
         size_t n = MIN(len, 0x1000 - (va & 0xfff));
-        hwaddr pa = dart_xlate(s, va);
+        hwaddr pa = tables ? h5p_ui_xlate(tables, va) : dart_xlate(s, va);
         FbSeg *last = plan->len ? &g_array_index(plan, FbSeg, plan->len - 1) : NULL;
 
         /* Pages contiguous in both: one read (an IOSurface is mostly physically contiguous). */
@@ -660,9 +735,9 @@ static void fb_plan_into(S5L8930DisplayState *s, GArray *plan, uint32_t va, size
     }
 }
 
-static void fb_plan(S5L8930DisplayState *s, uint32_t va, size_t off, size_t len)
+static void fb_plan(S5L8930DisplayState *s, uint32_t va, size_t off, size_t len, const uint32_t *tables)
 {
-    fb_plan_into(s, s->fetch, va, off, len);
+    fb_plan_into(s, s->fetch, va, off, len, tables);
 }
 
 /* Run the planned reads into `dst`. RAM reads need no BQL; MMIO takes it in the dispatch. */
@@ -685,22 +760,67 @@ static void fetch_run(S5L8930DisplayState *s, uint8_t *dst)
     plan_run(s->fetch, dst);
 }
 
-/* Read `len` bytes of framebuffer at IOVA `va`, page by page. */
-static void fb_read(S5L8930DisplayState *s, uint32_t va, uint8_t *dst, unsigned len)
+/*
+ * Whether the planned reads would bring exactly `ref`'s bytes, compared in guest RAM without copying them; false
+ * when a segment isn't plain RAM. A still screen re-latches every vsync (QUIET_RELATCH_VBLS) and almost always
+ * finds the same pixels: copying both 640x1136 layers out first was ~6 MB of memmove a vsync on the main loop,
+ * most of the latch's 0.5-0.8 ms. LT_LATCH_COMPARE_IN_PLACE=off copies first again (A/B).
+ */
+static bool latch_compare_in_place(void)
 {
-    while (len) {
-        unsigned n = MIN(len, 0x1000 - (va & 0xfff));
-        hwaddr pa = dart_xlate(s, va);
+    static int on = -1;
 
-        if (pa == (hwaddr)-1) {
-            memset(dst, 0, n);
-        } else {
-            address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED, dst, n);
-        }
-        va += n;
-        dst += n;
-        len -= n;
+    if (on < 0) {
+        const char *v = getenv("LT_LATCH_COMPARE_IN_PLACE");
+        on = !(v && (!strcmp(v, "off") || !strcmp(v, "0")));
     }
+    return on;
+}
+
+static bool plan_same(GArray *plan, const uint8_t *ref)
+{
+    for (guint i = 0; i < plan->len; i++) {
+        FbSeg *g = &g_array_index(plan, FbSeg, i);
+        hwaddr done = 0;
+
+        if (g->pa == (hwaddr)-1) {
+            if (!buffer_is_zero(ref + g->off, g->len)) {
+                return false;
+            }
+            continue;
+        }
+        while (done < g->len) {
+            hwaddr l = g->len - done;
+            void *p = address_space_map(&address_space_memory, g->pa + done, &l, false, MEMTXATTRS_UNSPECIFIED);
+            bool same;
+
+            if (!p) {
+                return false;
+            }
+            same = l && !memcmp(p, ref + g->off + done, l);
+            address_space_unmap(&address_space_memory, p, l, false, 0);
+            if (!same) {
+                return false;
+            }
+            done += l;
+        }
+    }
+    return true;
+}
+
+static hwaddr h5p_ui_xlate(const uint32_t tables[64], uint32_t va)
+{
+    /* 11A465 AppleH5PDisplayPipe 80bb3c54 programs 64 table pointers
+     * at UI+0x98. 80bb3de0 fills 1024 physical-page|1 PTEs per table.
+     * This is per-layer translation, independent of the external DART. */
+    unsigned segment = va >> 22;
+    if (segment >= 64 || !tables[segment]) {
+        return (hwaddr)-1;
+    }
+    hwaddr table = tables[segment] & ~0xfffu;
+    uint32_t pte = address_space_ldl_le(&address_space_memory,
+        table + ((va >> 12) & 0x3ff) * 4, MEMTXATTRS_UNSPECIFIED, NULL);
+    return pte & 1 ? (pte & ~0xfffu) | (va & 0xfff) : (hwaddr)-1;
 }
 
 /* ---- scanout ------------------------------------------------------------- */
@@ -728,8 +848,71 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
                           UILayer *u)
 {
     uint32_t *r = s->pipe[0].regs, *ui = r + DP_UI_BASE(layer) / 4;
-    uint32_t org = ui[DP_UI_DST_ORIGIN / 4], sz = ui[DP_UI_SRC_SIZE / 4];
-    uint32_t end = ui[DP_UI_DST_END / 4];
+    uint32_t org = ui[DP_UI_DST_ORIGIN / 4], end = ui[DP_UI_DST_END / 4];
+    uint32_t sorg = ui[DP_UI_SRC_ORIGIN / 4], send = ui[DP_UI_SRC_END / 4];
+    u->regions = 0;
+    memset(u->region_start, 0, sizeof(u->region_start));
+    memset(u->region_end, 0, sizeof(u->region_end));
+    if (s->h5p) {
+        /* N42 11A465 AppleH5PDisplayPipe: boot adoption at 80bb0eec..0f2a
+         * reads source corners at +60/+70; programming at 80bb49b2..49e8
+         * writes destination corners at +54/+58. H3 uses +50/+60,+54/+64. */
+        sorg = ui[0x60 / 4]; send = ui[0x70 / 4]; end = ui[0x58 / 4];
+        unsigned regions = ui[0x5c / 4] & 15;
+        if (regions & (regions - 1)) {
+            /* H5P can fetch several disjoint UI regions over a video plane.
+             * +50 is the full source extent; +60..6c/+70..7c are the four
+             * region corners, enabled by +5c's low bits. Stretching region
+             * zero to the whole destination turns Camera's top bar into
+             * full-screen vertical strips (native 14G61). */
+            unsigned width = ui[0x50 / 4] >> 16 & 0x3fff;
+            unsigned height = ui[0x50 / 4] & 0x3fff;
+            if (!width || !height) return false;
+            for (unsigned i = 0; i < 4; i++) {
+                if (!(regions & (1u << i))) continue;
+                uint32_t first = ui[(0x60 + i * 4) / 4];
+                uint32_t last = ui[(0x70 + i * 4) / 4];
+                unsigned x0 = first >> 16 & 0x3fff, y0 = first & 0x3fff;
+                unsigned x1 = MIN(last >> 16 & 0x3fff, width);
+                unsigned y1 = MIN(last & 0x3fff, height);
+                if (x0 >= x1 || y0 >= y1) continue;
+                u->regions |= 1u << i;
+                u->region_start[i] = x0 << 16 | y0;
+                u->region_end[i] = x1 << 16 | y1;
+            }
+            if (!u->regions) return false;
+            sorg = 0;
+            send = width << 16 | height;
+        } else if (regions && (ui[0x50 / 4] >> 16 & 0x3fff) && (ui[0x50 / 4] & 0x3fff)) {
+            /*
+             * One region of the +50 extent, the rest of the layer transparent: the layer reads as that region,
+             * placed where it falls in the destination (+54..+58, which the whole extent fills). CoreAnimation
+             * puts the volume HUD over a full-screen EAGL layer as UI1 that way on 14G61: a 640x1136 extent and
+             * destination with region 0 the HUD's 310x310 square. Taken as the source rectangle and scaled to the
+             * destination, the region stretched the HUD over the whole panel. A full-extent region, as UI0's,
+             * maps to itself.
+             */
+            unsigned i = ctz32(regions);
+            unsigned width = ui[0x50 / 4] >> 16 & 0x3fff, height = ui[0x50 / 4] & 0x3fff;
+            uint32_t first = ui[(0x60 + i * 4) / 4], last = ui[(0x70 + i * 4) / 4];
+            unsigned x0 = first >> 16 & 0x3fff, y0 = first & 0x3fff;
+            unsigned x1 = MIN(last >> 16 & 0x3fff, width), y1 = MIN(last & 0x3fff, height);
+            unsigned ox = org >> 16, oy = org & 0xffff;
+            uint64_t dw = end ? (end >> 16) - MIN(ox, end >> 16) : width;
+            uint64_t dh = end ? (end & 0xffff) - MIN(oy, end & 0xffff) : height;
+
+            if (x0 >= x1 || y0 >= y1) {
+                return false;
+            }
+            sorg = x0 << 16 | y0;
+            send = x1 << 16 | y1;
+            org = (uint32_t)(ox + x0 * dw / width) << 16 | (uint32_t)(oy + y0 * dh / height);
+            end = (uint32_t)(ox + x1 * dw / width) << 16 | (uint32_t)(oy + y1 * dh / height);
+        } else {
+            sorg = ui[(0x60 + (regions ? ctz32(regions) : 0) * 4) / 4];
+            send = ui[(0x70 + (regions ? ctz32(regions) : 0) * 4) / 4];
+        }
+    }
 
     /*
      * 3.2's AppleDisplayPipe (7B500 0xc058d4de) programs DST_ORIGIN and DST_END only for a layer placed off 0,0 and
@@ -738,7 +921,7 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
      * them, and honoring those drew the whole Home screen into the window (LightTouchMac issue 87). 4.x writes 0 to
      * UNSCALED and both corners on every swap (8C148 0x806cf468).
      */
-    if (ui[DP_UI_UNSCALED / 4] & 1) {
+    if (!s->h5p && (ui[DP_UI_UNSCALED / 4] & 1)) {
         org = end = 0;
     }
 
@@ -747,35 +930,46 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
     }
     u->base = ui[DP_UI_ADDR / 4];
     u->fmt = (ui[DP_UI_FORMAT / 4] >> 8) & 7;
-    /* Size and placement. A full-panel layer (and the boot surface, which
-     * leaves them 0) covers the panel at 0,0; 4.x CA also places partial
-     * layers, e.g. an EAGL surface as an overlay under its UI. */
-    u->sw = sz ? sz >> 16 : w;
-    u->sh = sz ? sz & 0xffff : h;
-    /* ponytail: a source over 4096 pixels wide is not scanned out. It bounds the host's row buffers
-     * (src) and no guest programs one; find the pipe's real limit if a guest ever does. */
-    if (u->sw > 4096) {
+    u->translated = s->h5p && (ui[0x90 / 4] & 1);
+    if (u->translated) {
+        memcpy(u->page_tables, ui + 0x98 / 4, sizeof(u->page_tables));
+    }
+    /*
+     * The source rectangle: SRC_ORIGIN to SRC_END, 11 bits a coordinate (5.1.1's program_hardware, 9B206
+     * 0x80878a3c). A linear layer's origin is folded into its address down to the 64 bytes the address keeps,
+     * the rest of x in SRC_ORIGIN; a tiled layer keeps the surface's address and its whole origin is there. A
+     * full-panel layer (and the boot surface, which leaves them 0) covers the panel at 0,0; 4.x CA also places
+     * partial layers, e.g. an EAGL surface as an overlay under its UI.
+     */
+    unsigned coord_mask = s->h5p ? 0x3fff : 0x7ff;
+    u->sx = sorg >> 16 & coord_mask;
+    u->sy = sorg & coord_mask;
+    if (send && ((send >> 16 & coord_mask) <= u->sx || (send & coord_mask) <= u->sy)) {
         return false;
     }
+    u->sw = send ? (send >> 16 & coord_mask) - u->sx : w;
+    u->sh = send ? (send & coord_mask) - u->sy : h;
     u->x0 = org >> 16;
     u->y0 = org & 0xffff;
     u->x1 = MIN(end ? end >> 16 : u->x0 + u->sw, w);
     u->y1 = MIN(end ? end & 0xffff : u->y0 + u->sh, h);
-    if (!u->sw || !u->sh || u->x0 >= u->x1 || u->y0 >= u->y1) {
+    if (u->x0 >= u->x1 || u->y0 >= u->y1) {
         return false;
     }
-    /* Two encodings reach this register. The 7B500 swap path writes
-     * (bytes per row << 4) | 2, e.g. (4096 << 4) | 2 for 1024x768 BGRA. The
-     * iBoot framebuffer holds plain bytes per row: AppleDisplayPipe adopts it
-     * with `stride = reg & ~0x3f` (0xc058c42a), so seeding the swap encoding
-     * gave the boot surface 64 KiB rows. A <<4 value never undershoots a row
-     * (of the layer's own width: an overlay is narrower than the panel). */
-    {
-        uint32_t v = ui[DP_UI_STRIDE / 4] & ~0x3fu;
-        unsigned row = u->sw * (u->fmt ? 2 : 4);
-        u->stride = (v >> 4) >= row ? v >> 4 : v;
+    /*
+     * FORMAT bit 0 is set for a linear layer and clear for a tiled one: program_hardware sets it from the
+     * IOSurface's tiled flag (9B206 0x80878bd6, the surface's +0x168; 7B500 0xc058d536, +0x160), and iBoot sets it
+     * for its linear framebuffer. A linear layer's STRIDE is its bytes per row; a tiled layer's is (bytes per row << 4),
+     * the bytes of a row of tiles: 16 rows, each a whole number of 256-byte tiles ("UI requires the stride to be
+     * a multiple of 256 for tiled mode"). The pipe's DART maps a tiled surface's pages contiguously (n90ap 9B206's
+     * 2560-byte rows), and its tiles hold the rows as the CPU and the GL bridge write them, so a tiled layer's row
+     * is a sixteenth of its stride from the last. The low 6 bits are flags (2).
+     */
+    u->stride = ui[DP_UI_STRIDE / 4] & ~(s->h5p ? 0x7fu : 0x3fu);
+    if (!(ui[DP_UI_FORMAT / 4] & DP_UI_FORMAT_LINEAR)) {
+        u->stride >>= 4;
     }
-    return u->base != 0;
+    return u->base != 0 || u->translated;
 }
 
 static size_t layer_row_bytes(const UILayer *u)
@@ -791,14 +985,15 @@ static size_t layer_fetch(S5L8930DisplayState *s, const UILayer *u, size_t off)
 {
     size_t row = layer_row_bytes(u);
     unsigned rows = u->y1 - u->y0;
+    uint32_t base = u->base + u->sy * u->stride + u->sx * (u->fmt ? 2 : 4);
 
     if (u->sh == rows && u->stride == row) {
-        fb_plan(s, u->base, off, row * rows);
+        fb_plan(s, base, off, row * rows, u->translated ? u->page_tables : NULL);
         return row * rows;
     }
     for (unsigned y = u->y0; y < u->y1; y++) {
         unsigned sy = (unsigned)((uint64_t)(y - u->y0) * u->sh / rows);
-        fb_plan(s, u->base + sy * u->stride, off + (y - u->y0) * row, row);
+        fb_plan(s, base + sy * u->stride, off + (y - u->y0) * row, row, u->translated ? u->page_tables : NULL);
     }
     return row * rows;
 }
@@ -890,8 +1085,10 @@ static bool layers(S5L8930DisplayState *s, unsigned w, unsigned h, UILayer u[2],
  */
 typedef struct VideoPlan {
     unsigned sw, sh, dw, dh, x0, y0;
+    unsigned uvw;            /* CbCr row bytes: sw rounded up to a pair (the A6's odd crops) */
+    int yoff;                /* black level: 16, or 0 for the A6's full-range matrix */
     int m[9];
-    uint8_t *planes;         /* Y (sw x sh) then CbCr (sw x sh / 2), filled by plan_run(s->vfetch) */
+    uint8_t *planes;         /* Y (sw x sh) then CbCr (uvw x (sh + 1) / 2), filled by plan_run(s->vfetch) */
 } VideoPlan;
 
 /* Validate the video layer and plan its planes' reads (DART translation needs the BQL). */
@@ -899,24 +1096,45 @@ static bool video_plan(S5L8930DisplayState *s, VideoPlan *v)
 {
     uint32_t *r = s->pipe[0].regs;
     unsigned ys = r[0x3088 / 4] & ~0xfu, uvs = r[0x308c / 4] & ~0xfu;
+    uint32_t ybase = r[0x307c / 4], uvbase = r[0x3080 / 4];
+    const uint32_t *ytables = NULL, *uvtables = NULL;
 
     v->sw = (r[0x3094 / 4] >> 16) & 0xfff, v->sh = r[0x3094 / 4] & 0xfff;
     v->dw = (r[0x309c / 4] >> 16) & 0xfff, v->dh = r[0x309c / 4] & 0xfff;
     v->x0 = r[0x30a0 / 4] >> 16, v->y0 = r[0x30a0 / 4] & 0xffff;
+    /* A visible crop need not end on a chroma-pair boundary on the A6 (H5P): Camera Roll animates odd
+     * widths while dragging a playing movie. The final UV pair/row is kept there; the other boards' pipes
+     * refuse odd sizes, as they were qualified with. */
+    v->uvw = (v->sw + 1) & ~1u;
     v->planes = NULL;
     if (!(r[DP_LAYERS / 4] & 0x400) || !v->sw || !v->sh || !v->dw || !v->dh || v->sw > 4096 ||
-        v->sh > 4096 || ys < v->sw || uvs < v->sw || (v->sw | v->sh) & 1) {
+        v->sh > 4096 || ys < v->sw || uvs < v->uvw || (!s->h5p && ((v->sw | v->sh) & 1))) {
         return false;
     }
-    for (int i = 0; i < 9; i++) {
-        v->m[i] = (int16_t)r[0x3024 / 4 + i];
+    if (s->h5p) {
+        /* N42 10A405 AppleH5PDisplayPipe 80ae24d8/80ae4d9e programs
+         * per-plane MMUs at 3d58/3d5c, tables 3d70/3df0. Each table
+         * maps its plane from virtual page zero; the address register's
+         * intra-page offset survives this rebasing. */
+        if (r[0x3d58 / 4] & 1) {
+            ytables = r + 0x3d70 / 4;
+            ybase &= 0xfff;
+        }
+        if (r[0x3d5c / 4] & 1) {
+            uvtables = r + 0x3df0 / 4;
+            uvbase &= 0xfff;
+        }
     }
-    v->planes = g_malloc((size_t)v->sw * v->sh * 3 / 2);
+    for (int i = 0; i < 9; i++) {
+        v->m[i] = (int16_t)r[(s->h5p ? 0x302c : 0x3024) / 4 + i];
+    }
+    v->yoff = s->h5p && v->m[0] == 4096 ? 0 : 16;
+    v->planes = g_malloc((size_t)v->sw * v->sh + (size_t)v->uvw * ((v->sh + 1) / 2));
     for (unsigned y = 0; y < v->sh; y++) {
-        fb_plan_into(s, s->vfetch, r[0x307c / 4] + y * ys, (size_t)y * v->sw, v->sw);
+        fb_plan_into(s, s->vfetch, ybase + y * ys, (size_t)y * v->sw, v->sw, ytables);
         if (!(y & 1)) {
-            fb_plan_into(s, s->vfetch, r[0x3080 / 4] + y / 2 * uvs,
-                         (size_t)v->sw * v->sh + (size_t)y / 2 * v->sw, v->sw);
+            fb_plan_into(s, s->vfetch, uvbase + y / 2 * uvs,
+                         (size_t)v->sw * v->sh + (size_t)y / 2 * v->uvw, v->uvw, uvtables);
         }
     }
     return true;
@@ -933,7 +1151,7 @@ static inline uint32_t video_px(const VideoPlan *v, int Y, int cb, int cr)
     uint32_t px = 0xff000000u;
 
     for (int k = 0; k < 3; k++) {
-        int t = (v->m[k * 3] * (Y - 16) + v->m[k * 3 + 1] * (cb - 128) + v->m[k * 3 + 2] * (cr - 128) +
+        int t = (v->m[k * 3] * (Y - v->yoff) + v->m[k * 3 + 1] * (cb - 128) + v->m[k * 3 + 2] * (cr - 128) +
                  2048) >> 12;
         px |= (uint32_t)MIN(255, MAX(0, t)) << (16 - 8 * k);    /* BGRA: R in bits 16-23 */
     }
@@ -955,7 +1173,7 @@ static void video_render(const VideoPlan *v, unsigned w, unsigned h, uint32_t *o
     }
     if (rgb) {
         for (unsigned y = 0; y < v->sh; y++) {
-            const uint8_t *yrow = yp + (size_t)y * v->sw, *crow = uvp + (size_t)(y / 2) * v->sw;
+            const uint8_t *yrow = yp + (size_t)y * v->sw, *crow = uvp + (size_t)(y / 2) * v->uvw;
             uint32_t *d = rgb + (size_t)y * v->sw;
 
             for (unsigned x = 0; x < v->sw; x++) {
@@ -965,13 +1183,13 @@ static void video_render(const VideoPlan *v, unsigned w, unsigned h, uint32_t *o
     }
     for (unsigned y = v->y0; y < y1; y++) {
         unsigned sy = (unsigned)((uint64_t)(y - v->y0) * v->sh / v->dh);
-        const uint8_t *yrow = yp + (size_t)sy * v->sw, *crow = uvp + (size_t)(sy / 2) * v->sw;
+        const uint8_t *yrow = yp + (size_t)sy * v->sw, *crow = uvp + (size_t)(sy / 2) * v->uvw;
         const uint32_t *srow = rgb ? rgb + (size_t)sy * v->sw : NULL;
         uint32_t *d = out + (size_t)y * w;
 
         for (unsigned x = v->x0; x < x1; x++) {
             unsigned sx = xs[x];
-            d[x] = srow ? srow[sx] : video_px(v, yrow[sx], crow[sx & ~1u], crow[(sx & ~1u) + 1]);
+            d[x] = srow ? srow[sx] : video_px(v, yrow[sx], crow[sx & ~1u], crow[(sx & ~1u) + 1]);   /* bounded: sx = xs[x] < v->sw */
         }
     }
 }
@@ -1015,7 +1233,7 @@ static void blend(const UILayer u[2], const bool on[2], const uint8_t *src, unsi
                 continue;
             }
             /* Unscaled BGRA that replaces what is under it: the row as it is. */
-            if ((l == 0 || !on[0]) && !base && L->fmt == 0 && L->sw == dw) {
+            if (!L->regions && (l == 0 || !on[0]) && !base && L->fmt == 0 && L->sw == dw) {
                 memcpy(d + L->x0, lsrc[l] + (y - L->y0) * layer_row_bytes(L), dw * 4);
                 continue;
             }
@@ -1023,6 +1241,19 @@ static void blend(const UILayer u[2], const bool on[2], const uint8_t *src, unsi
             for (unsigned x = L->x0; x < L->x1; x++) {
                 unsigned sx = L->sw == dw ? x - L->x0
                             : (unsigned)((uint64_t)(x - L->x0) * L->sw / dw);
+                if (L->regions) {
+                    unsigned source_x = L->sx + sx;
+                    unsigned source_y = L->sy + (unsigned)((uint64_t)(y - L->y0) *
+                        L->sh / (L->y1 - L->y0));
+                    bool covered = false;
+                    for (unsigned i = 0; i < 4; i++) {
+                        if (!(L->regions & (1u << i))) continue;
+                        uint32_t first = L->region_start[i], last = L->region_end[i];
+                        covered |= source_x >= first >> 16 && source_x < last >> 16 &&
+                                   source_y >= (first & 0xffff) && source_y < (last & 0xffff);
+                    }
+                    if (!covered) continue;
+                }
                 uint32_t t = row[sx], a = t >> 24;
 
                 if ((l == 0 && !base) || a == 0xff || (!on[0] && !base)) {
@@ -1061,6 +1292,42 @@ static bool compose(S5L8930DisplayState *s, unsigned w, unsigned h, uint32_t *ou
     return true;
 }
 /* vbl: called from the VBL tick, which may drop the BQL for the pixel work. */
+/* IT_DISPLAY_TRACE=FILE: each latch's layers and result, at most one line per 100 ms unless the layers changed, and
+ * the movie layer's buffer each time it changes. */
+static void display_trace_latch(S5L8930DisplayState *s, bool valid, bool video, bool changed, const uint32_t key[4])
+{
+    static FILE *tr; static bool tried; static int64_t last; static uint32_t lastkey[4];
+    if (!tried) {
+        const char *t = getenv("IT_DISPLAY_TRACE");
+        tried = true;
+        if (t && *t && (tr = fopen(t, "a"))) {
+            setvbuf(tr, NULL, _IOLBF, 0);
+        }
+    }
+    if (!tr) {
+        return;
+    }
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) / 1000;
+    if (video) {
+        /* a movie's frame: the buffer (physical) the video layer now reads, whenever it changes (cf. IT_VXD_TRACE) */
+        static hwaddr last_video;
+        hwaddr pa = dart_xlate(s, s->pipe[0].regs[0x307c / 4]);
+        if (pa != last_video) {
+            last_video = pa;
+            fprintf(tr, "display t %" PRId64 " video luma pa %08" HWADDR_PRIx "\n", now, pa);
+        }
+    }
+    if (now - last >= 100000 || memcmp(key, lastkey, sizeof(uint32_t) * 4)) {
+        uint32_t *r = s->pipe[0].regs;
+        fprintf(tr, "t %" PRId64 " latch swap %u valid %d video %d changed %d gen %u swaps %u layers %08x key %08x %08x %08x %08x "
+                "ui0 %08x ui1 %08x\n", now, s->pipe[0].swap_id, valid, video, changed, s->front_gen, s->swaps,
+                r[DP_LAYERS / 4], key[0], key[1], key[2], key[3],
+                r[(DP_UI_BASE(0) + DP_UI_ADDR) / 4], r[(DP_UI_BASE(1) + DP_UI_ADDR) / 4]);
+        last = now;
+        memcpy(lastkey, key, sizeof(uint32_t) * 4);
+    }
+}
+
 static void front_latch(S5L8930DisplayState *s, bool vbl)
 {
     unsigned w, h;
@@ -1145,6 +1412,17 @@ static void front_latch(S5L8930DisplayState *s, bool vbl)
             g_free(vp.planes);
         }
     }
+    /* The same layers as the front's, unchanged in guest RAM: nothing to copy or compose. */
+    if (s->h5p && latch_compare_in_place() && valid && !video && !s->front_video && s->front_valid &&
+        !memcmp(key, s->front_key, sizeof(key)) && len == s->src_len && !memcmp(u, s->src_layers, sizeof(u)) &&
+        plan_same(s->fetch, s->src)) {
+        g_array_set_size(s->fetch, 0);
+        if (unlocked) {
+            bql_lock();
+        }
+        display_trace_latch(s, valid, video, false, key);
+        return;
+    }
     fetch_run(s, s->src_next);
     /* The front was composed from these very layers and bytes (and the same movie frame). */
     if (valid && (!video || video_same) && video == s->front_video && valid == s->front_valid &&
@@ -1153,6 +1431,7 @@ static void front_latch(S5L8930DisplayState *s, bool vbl)
         if (unlocked) {
             bql_lock();
         }
+        display_trace_latch(s, valid, video, false, key);
         return;
     }
     if (valid) {
@@ -1178,6 +1457,7 @@ static void front_latch(S5L8930DisplayState *s, bool vbl)
         s->front_gen++;
     }
     s->front_video = video;
+    display_trace_latch(s, valid, video, changed, key);
 }
 
 /* One row of the panel through the output gamma (BGRA: B in bits 0-7, R in 16-23). */
@@ -1334,7 +1614,9 @@ static void s5l8930_display_reset(DeviceState *dev)
          * mapping. SpringBoard died with SIGBUS (KERN_PROTECTION_FAILURE)
          * and never reached reboot2, so Hold -> slide never powered off. */
         r[(DP_UI_BASE(0) + DP_UI_STRIDE) / 4] = s->width * 4 | 2;
-        r[0x4060 / 4] = s->width << 16 | s->height;
+        /* ARGB and linear, as iBoot programs its framebuffer (iBoot-931 0x5ff01bfc: format << 8 | 1). */
+        r[(DP_UI_BASE(0) + DP_UI_FORMAT) / 4] = DP_UI_FORMAT_LINEAR;
+        r[(DP_UI_BASE(0) + (s->h5p ? 0x70 : DP_UI_SRC_END)) / 4] = s->width << 16 | s->height;
     }
     pipes_update_irq(s);
     s->next_vbl = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VBL_PERIOD_NS(s);
@@ -1354,6 +1636,7 @@ static void s5l8930_display_realize(DeviceState *dev, Error **errp)
     s->vfetch = g_array_new(false, false, sizeof(FbSeg));
     s->con = graphic_console_init(dev, 0, &display_gfx_ops, s);
     s->pipe[0].native = s->width << 16 | s->height;
+    s->pipe[0].h5p = s->pipe[1].h5p = s->h5p;
     if (s->pw || s->ph) {
         if (s->pw < 64 || s->ph < 64 || s->pw > 2047 || s->ph > 2047) {
             error_setg(errp, "panel must be 64..2047 pixels each way");
@@ -1500,6 +1783,7 @@ static const VMStateDescription vmstate_s5l8930_display = {
 };
 
 static const Property s5l8930_display_properties[] = {
+    DEFINE_PROP_BOOL("h5p", S5L8930DisplayState, h5p, false),
     DEFINE_PROP_UINT64("fb-base", S5L8930DisplayState, fb_base, 0),
     DEFINE_PROP_UINT16("width", S5L8930DisplayState, width, 1024),     /* K48 */
     DEFINE_PROP_UINT16("height", S5L8930DisplayState, height, 768),

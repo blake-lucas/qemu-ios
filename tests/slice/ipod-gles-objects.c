@@ -4,6 +4,7 @@
  * SLICE:gles-prelude hw/arm/gles-host.c range #include <TargetConditionals.h> | /* Old guest engines retain
  * SLICE:gles-refusals hw/arm/gles-host.c range /* ---------------------------------------------------------------- refusals | /* Only expose formats our decoder accepts
  * SLICE hw/arm/gles-host.c fn gles_x gles_f gles_reject
+ * SLICE hw/arm/gles-host.c range #define GLES_PRIVATE_NAME | static bool gles_is_drawable(
  * SLICE:mip hw/arm/gles-host.c range static int64_t gles_generate_mipmap( | static int64_t gles_pvrtc_upload(
  * SLICE:cases hw/arm/gles-host.c range case GLES_SLOT_LOAD_MATRIXX: | case GLES_SLOT_GEN_RENDERBUFFERS:
  * CFLAGS -I$ROOT/include -Wno-pointer-to-int-cast -Wno-pointer-bool-conversion -framework OpenGL -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework CoreFoundation

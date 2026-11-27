@@ -71,7 +71,7 @@ static void ioprof_tick(void)
 {
     static const char *names[IOPROF_N] = {
         "pread", "pwrite", "zero", "pread_us", "pwrite_us", "zero_us", "pg_read", "pg_prog", "erase",
-        "fmi_irq", "cdma_irq", "db_ap2iop", "db_iop2ap", "cachectl", "cdma_go", "iop_us", "ap_us",
+        "fmi_irq", "cdma_irq", "db_ap2iop", "db_iop2ap", "cachectl", "cdma_go", "iop_us", "ap_us", "pwrite_max_us",
     };
     static int64_t last;
     static uint64_t prev[IOPROF_N];
@@ -89,7 +89,10 @@ static void ioprof_tick(void)
     for (int i = 0; i < IOPROF_N; i++) {
         uint64_t v = qatomic_read(&s5l8930_ioprof[i]), d = v - prev[i];
         prev[i] = v;
-        if (i == IOPROF_PREAD_NS || i == IOPROF_PWRITE_NS || i == IOPROF_ZERO_NS ||
+        if (i == IOPROF_PWRITE_MAX_NS) {   /* the window's longest program write, not a running total */
+            d = qatomic_xchg(&s5l8930_ioprof[i], 0) / 1000;
+            prev[i] = 0;
+        } else if (i == IOPROF_PREAD_NS || i == IOPROF_PWRITE_NS || i == IOPROF_ZERO_NS ||
             i == IOPROF_IOP_NS || i == IOPROF_AP_NS) {
             d /= 1000;
         }
@@ -241,7 +244,7 @@ static void ioprof_done(int n, int ns, int64_t t0)
 #define FMI_ID_CES              16
 #define FMI_META_BYTES          10          /* bytes_per_meta, fw set_config */
 #define FMI_BOOTPAGE_BYTES      0x600       /* kext c04e92b6 */
-#define FMI_MAX_PAGE            0x4000
+#define FMI_MAX_PAGE            0x8800 /* includes data and spare on 16 KiB PPN parts */
 #define FMI_MAX_MULTI           0x200       /* 0x800-byte CE/page arrays */
 
 #define SDIO_OP_PING            1
@@ -498,15 +501,19 @@ static uint32_t nand_read_page(S5L8930IOPState *s, int bus, uint32_t ce,
     if (bus >= 0 && bus < NAND_BUSES) {
         len = MAX(len, s->bytes_per_page[bus] + s->bytes_per_spare[bus]);
     }
-    memset(data, 0xff, len);
+    /* The caller's buffer is written only below the I/O, which may run without the BQL (nand_disk_read): until
+     * the BQL is back the controller model can still hand out what the buffer held. */
     memset(meta, 0xff, FMI_META_BYTES);
     if (nand_addr_bad(s, bus, ce, page)) {
+        memset(data, 0xff, len);
         return FMI_STATUS_PARAM;
     }
     blk = nand_backend(s, bus, ce, page, false);
     if (!blk && !s->disk) {
+        memset(data, 0xff, len);
         return FMI_STATUS_BLANK;
     }
+    uint32_t fill = len;
     len = s->page_stride;
     p = g_malloc(len);
     int64_t t0 = ioprof_t0(), stat = nand_stat_begin();
@@ -516,6 +523,7 @@ static uint32_t nand_read_page(S5L8930IOPState *s, int bus, uint32_t ce,
     nand_stat(NAND_STAT_READ, len, stat);
     ioprof_done(IOPROF_PREAD, IOPROF_PREAD_NS, t0);
     s5l8930_ioprof_add(IOPROF_PG_READ, 1);
+    memset(data, 0xff, fill);
     if (result != FMI_STATUS_OK) {
         return result;
     }
@@ -642,6 +650,12 @@ static uint32_t nand_program_page(S5L8930IOPState *s, int bus, uint32_t ce,
                            nand_page_io(nand_fd(s, bus, ce, page, true), blk, (int64_t)page * s->page_stride,
                                         s->page_stride, p, true), bus, ce, "program");
     nand_stat(NAND_STAT_WRITE, s->page_stride, stat);
+    if (unlikely(s5l8930_ioprof_on)) {
+        int64_t took = get_clock() - t0;
+        if (took > (int64_t)qatomic_read(&s5l8930_ioprof[IOPROF_PWRITE_MAX_NS])) {
+            qatomic_set(&s5l8930_ioprof[IOPROF_PWRITE_MAX_NS], took);
+        }
+    }
     ioprof_done(IOPROF_PWRITE, IOPROF_PWRITE_NS, t0);
     if (result == FMI_STATUS_OK && s->overlay_dir && !s->disk && nand_set_dirty(s, bus, ce, page)) {
         nand_publish_owners(s, bus, ce, page, page);
@@ -771,8 +785,9 @@ static uint32_t fmi_set_config(S5L8930IOPState *s, int bus, uint8_t *cmd)
     uint32_t bpp = ARG(0x24);
     uint32_t spare = ARG(0x28);
 
+    /* nand_read_page fills page + spare into buffers of FMI_MAX_PAGE (s5l8930_h2fmi.c's H2FMI_BUF) */
     if (ARG(0x10) != bus || bpp == 0 || bpp > FMI_MAX_PAGE ||
-        spare > FMI_MAX_PAGE) {
+        spare > FMI_MAX_PAGE - bpp) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad config bus %u page %u spare %u\n",
                       __func__, ARG(0x10), bpp, spare);
         if (qemu_loglevel_mask(LOG_GUEST_ERROR)) {   /* the command's argument words */
@@ -1405,7 +1420,8 @@ static void iop_run(S5L8930IOPState *s)
     uint32_t end = iop_ldl(s->fw_base + FW_HDR_BSS_END);
 
     s->fw_config = 0;
-    if (!iop_config(s) || bss >= end || end > s->fw_size) {
+    /* The header and FW_SIZE are the guest's: the zeroed bss stays inside an image of a sane size. */
+    if (!iop_config(s) || bss >= end || end > MIN(s->fw_size, 16u << 20)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: no 'cnfg' block / bss [0x%x, 0x%x) in firmware at 0x%08x+0x%x\n",
                       __func__, bss, end, s->fw_base, s->fw_size);
@@ -1955,6 +1971,12 @@ static int iop_post_load(void *opaque, int version)
     if (s->snapshot_format != (s->nand_xor_ff ? 2 : 0)) {
         error_report("s5l8930-iop: snapshot NAND storage format mismatch");
         return -EINVAL;
+    }
+    for (int bus = 0; bus < NAND_BUSES; bus++) {     /* fmi_set_config's bounds: the page buffers */
+        if (!s->bytes_per_page[bus] || s->bytes_per_page[bus] > FMI_MAX_PAGE ||
+            s->bytes_per_spare[bus] > FMI_MAX_PAGE - s->bytes_per_page[bus]) {
+            return -EINVAL;
+        }
     }
     return 0;
 }

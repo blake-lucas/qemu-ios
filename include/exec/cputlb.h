@@ -34,6 +34,9 @@ void tlb_unprotect_code(ram_addr_t ram_addr);
 #ifndef CONFIG_USER_ONLY
 void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length);
 void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length);
+/* ranges: n sorted, disjoint (host address, length) pairs */
+void tlb_reset_dirty_ranges(CPUState *cpu, const uintptr_t *ranges, unsigned n);
+void tlb_reset_dirty_ranges_all(const ram_addr_t *start, const ram_addr_t *length, unsigned n);
 #endif
 
 /**
@@ -172,6 +175,8 @@ void tlb_flush_by_mmuidx_keep_jmp_cache(CPUState *cpu, MMUIdxMap idxmap);
  * emptied, keeping the other address spaces' and the global (kernel) entries.
  */
 void tlb_flush_context(CPUState *cpu, uint64_t key);
+/* Run @fn(cpu, @arg) on every CPU a broadcast from @src reaches, each on its own thread; false if unavailable. */
+bool tlb_flush_call_all_cpus_synced(CPUState *src, void (*fn)(CPUState *cpu, uint64_t arg), uint64_t arg);
 
 /*
  * Park @mmu_idx's table under @old_key and bring back @new_key's if it is still held, else start

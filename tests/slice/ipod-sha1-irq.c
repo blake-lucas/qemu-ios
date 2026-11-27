@@ -1,5 +1,7 @@
 /* SHA completion interrupts follow config bit 2, not SHA_INTENABLE alone.
  *
+ * SLICE include/hw/arm/ipod_touch_guard.h range static inline uint64_t it_guard_idx | #endif /* HW_ARM_IPOD_TOUCH_GUARD_H
+ * SLICE hw/arm/ipod_touch_sha1.c define IT_SHA1_MAX_JOB
  * SLICE include/hw/arm/ipod_touch_sha1.h typedef IPodTouchSHA1State
  * SLICE include/hw/arm/sha1_compress.h file
  * SLICE hw/arm/ipod_touch_sha1.c fn sha1_trace sha1_publish sha1_clear_irq sha1_run
@@ -12,6 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
+#define LOG_GUEST_ERROR 2
+#define qemu_log_mask(...) ((void)0)
 typedef int SysBusDevice, MemoryRegion, qemu_irq;
 static int line;
 static void qemu_irq_raise(qemu_irq irq) {line=1;}

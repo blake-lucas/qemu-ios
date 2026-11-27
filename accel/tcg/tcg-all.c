@@ -87,6 +87,7 @@ static void tcg_accel_instance_init(Object *obj)
 bool one_insn_per_tb;
 bool tcg_cross_page_chain;
 bool tcg_indirect_cache;
+bool tcg_indirect_cache_parallel;
 bool tcg_inline_tb_lookup;
 bool tcg_masked_irq_fast;
 
