@@ -148,6 +148,10 @@ typedef struct {
     GLint units;
     SnapUnit unit[GLES_MAX_TEXUNITS];
     GLint active_tex, fbo, rb, program;
+    /* What the context has (snap_limits): only those caps, lights and clip planes are read and set, as a driver
+     * need not check a name past its limits. */
+    GLint max_lights, max_clip, point_sprite;
+    GLboolean enable_ok[ARRAY_SIZE(snap_enables)];
     GLfloat vattr[GLES_MAX_ATTRIBS][4];
 } GLESCtxGL;
 
@@ -185,6 +189,38 @@ static void snap_set_stack(GLenum mode, GLenum depth_pname, GLint depth, GLfloat
 }
 
 static void snap_capture_fixed(GLESCtxGL *s);
+
+/* The context's lights, clip planes and point sprites; an ES2 context has none. */
+static void snap_limits(GLESCtxGL *s)
+{
+    s->max_lights = s->max_clip = s->point_sprite = 0;
+    if (!snap_fixed()) return;
+    glGetIntegerv(GL_MAX_LIGHTS, &s->max_lights);
+    glGetIntegerv(GL_MAX_CLIP_PLANES, &s->max_clip);
+    s->max_lights = MIN(MAX(s->max_lights, 0), 8);
+    s->max_clip = MIN(MAX(s->max_clip, 0), 6);
+#ifdef GLES_HOST_EGL_ES
+    s->point_sprite = gles_native_extension((const char *)glGetString(GL_EXTENSIONS), "GL_OES_point_sprite");
+#else
+    s->point_sprite = 1;
+#endif
+}
+
+/* Whether the context has @cap: an ES2 context only the per-fragment and rasterizer ones. */
+static bool snap_cap_ok(const GLESCtxGL *s, GLenum cap)
+{
+    if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7) return cap - GL_LIGHT0 < (GLuint)s->max_lights;
+    if (cap >= GL_CLIP_PLANE0 && cap <= GL_CLIP_PLANE5) return cap - GL_CLIP_PLANE0 < (GLuint)s->max_clip;
+    if (cap == GL_POINT_SPRITE) return s->point_sprite;
+    if (snap_fixed()) return true;
+    switch (cap) {
+    case GL_BLEND: case GL_CULL_FACE: case GL_DEPTH_TEST: case GL_STENCIL_TEST: case GL_SCISSOR_TEST:
+    case GL_DITHER: case GL_POLYGON_OFFSET_FILL: case GL_SAMPLE_ALPHA_TO_COVERAGE: case GL_SAMPLE_COVERAGE:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static void snap_capture_gl(GLESCtxGL *s)
 {
@@ -227,7 +263,11 @@ static void snap_capture_gl(GLESCtxGL *s)
     glGetFloatv(GL_POLYGON_OFFSET_UNITS, &s->poly_units);
     glGetFloatv(GL_LINE_WIDTH, &s->line_width);
     glGetFloatv(GL_SAMPLE_COVERAGE_VALUE, &s->sample_cov);
-    for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) s->enables[i] = glIsEnabled(snap_enables[i]);
+    snap_limits(s);
+    for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) {
+        s->enable_ok[i] = snap_cap_ok(s, snap_enables[i]);
+        if (s->enable_ok[i]) s->enables[i] = glIsEnabled(snap_enables[i]);
+    }
     glGetIntegerv(GL_ACTIVE_TEXTURE, &s->active_tex);
     if (snap_fixed()) {
         snap_capture_fixed(s);
@@ -267,7 +307,7 @@ static void snap_capture_fixed(GLESCtxGL *s)
     glGetIntegerv(GL_LOGIC_OP_MODE, &s->logic_op);
     for (unsigned i = 0; i < ARRAY_SIZE(snap_hints); i++) glGetIntegerv(snap_hints[i], &s->hints[i]);
 
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < s->max_lights; i++) {
         SnapLight *l = &s->light[i];
         GLenum n = GL_LIGHT0 + i;
         glGetLightfv(n, GL_AMBIENT, l->amb);
@@ -299,7 +339,7 @@ static void snap_capture_fixed(GLESCtxGL *s)
     glGetFloatv(GL_POINT_SIZE_MAX, &s->pt_max);
     glGetFloatv(GL_POINT_DISTANCE_ATTENUATION, s->pt_att);
     glGetFloatv(GL_POINT_FADE_THRESHOLD_SIZE, &s->pt_fade);
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < s->max_clip; i++) {
         double eq[4] = { 0 };
         glGetClipPlane(GL_CLIP_PLANE0 + i, eq);
         for (int k = 0; k < 4; k++) s->clip[i][k] = eq[k];
@@ -328,7 +368,7 @@ static void snap_capture_fixed(GLESCtxGL *s)
         }
         glGetTexEnvfv(GL_TEXTURE_ENV, GL_RGB_SCALE, &t->rgb_scale);
         glGetTexEnvfv(GL_TEXTURE_ENV, GL_ALPHA_SCALE, &t->a_scale);
-        glGetTexEnviv(GL_POINT_SPRITE, GL_COORD_REPLACE, &t->coord_replace);
+        if (s->point_sprite) glGetTexEnviv(GL_POINT_SPRITE, GL_COORD_REPLACE, &t->coord_replace);
         glGetFloatv(GL_CURRENT_TEXTURE_COORDS, t->cur_tex);
         t->tex2d = glIsEnabled(GL_TEXTURE_2D);
         t->rect = glIsEnabled(GL_TEXTURE_RECTANGLE_ARB);
@@ -344,7 +384,8 @@ static void snap_capture_fixed(GLESCtxGL *s)
 /* The counts snap_apply_gl indexes its arrays with, as snap_capture_gl bounds them. */
 static bool snap_gl_ok(const GLESCtxGL *s)
 {
-    if (s->units < 0 || s->units > (GLint)GLES_MAX_TEXUNITS ||
+    if (s->units < 0 || s->units > (GLint)GLES_MAX_TEXUNITS || s->max_lights < 0 || s->max_lights > 8 ||
+        s->max_clip < 0 || s->max_clip > 6 ||
         s->mv_depth < 1 || s->mv_depth > SNAP_MV_DEPTH ||
         s->proj_depth < 1 || s->proj_depth > SNAP_AUX_DEPTH) {
         return false;
@@ -366,6 +407,13 @@ static void snap_apply_fixed(const GLESCtxGL *s);
 
 static void snap_apply_gl(const GLESCtxGL *s)
 {
+    /*
+     * The context's own framebuffer first: the object walk left the last framebuffer it visited bound, and state
+     * set over a framebuffer the driver didn't expect can be fatal. PowerVR's ES1 glDisable(GL_DEPTH_TEST) over a
+     * color-only one dereferenced null on the Pixel 10.
+     */
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, s->fbo);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, s->rb);
     glViewport(s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3]);
     glScissor(s->scissor[0], s->scissor[1], s->scissor[2], s->scissor[3]);
     glDepthRange(s->depth_range[0], s->depth_range[1]);
@@ -396,7 +444,9 @@ static void snap_apply_gl(const GLESCtxGL *s)
     glPolygonOffset(s->poly_factor, s->poly_units);
     glLineWidth(s->line_width);
     glSampleCoverage(s->sample_cov, s->sample_inv);
-    for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) snap_set_enable(snap_enables[i], s->enables[i]);
+    for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) {
+        if (s->enable_ok[i]) snap_set_enable(snap_enables[i], s->enables[i]);
+    }
     if (snap_fixed()) {
         snap_apply_fixed(s);
     } else {
@@ -430,7 +480,7 @@ static void snap_apply_fixed(const GLESCtxGL *s)
     glMatrixMode(GL_MODELVIEW);
     glPushMatrix();
     glLoadIdentity();
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < s->max_lights; i++) {
         const SnapLight *l = &s->light[i];
         GLenum n = GL_LIGHT0 + i;
         glLightfv(n, GL_AMBIENT, l->amb);
@@ -444,7 +494,7 @@ static void snap_apply_fixed(const GLESCtxGL *s)
         glLightf(n, GL_LINEAR_ATTENUATION, l->att[1]);
         glLightf(n, GL_QUADRATIC_ATTENUATION, l->att[2]);
     }
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < s->max_clip; i++) {
         double eq[4] = { s->clip[i][0], s->clip[i][1], s->clip[i][2], s->clip[i][3] };
         glClipPlane(GL_CLIP_PLANE0 + i, eq);
     }
@@ -483,7 +533,7 @@ static void snap_apply_fixed(const GLESCtxGL *s)
         }
         glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, t->rgb_scale);
         glTexEnvf(GL_TEXTURE_ENV, GL_ALPHA_SCALE, t->a_scale);
-        glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, t->coord_replace);
+        if (s->point_sprite) glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, t->coord_replace);
         glMultiTexCoord4f(GL_TEXTURE0 + u, t->cur_tex[0], t->cur_tex[1], t->cur_tex[2], t->cur_tex[3]);
         snap_set_enable(GL_TEXTURE_2D, t->tex2d);
         snap_set_enable(GL_TEXTURE_RECTANGLE_ARB, t->rect);
