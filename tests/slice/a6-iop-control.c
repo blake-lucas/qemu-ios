@@ -1,5 +1,5 @@
 /* Native AP stop/reload/start must not execute the old IOP image.
- * SLICE hw/arm/s5l8950.c fn a6_iop_write
+ * SLICE hw/arm/s5l8950.c fn a6_unmap_iop_firmware a6_map_iop_firmware a6_iop_write
  */
 #include <assert.h>
 #include <stdbool.h>
