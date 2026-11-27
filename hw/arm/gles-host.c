@@ -33,6 +33,7 @@ extern bool it_profile_on;
 #include "powervr/pvrtc.h"
 #include "migration/blocker.h"
 #include "migration/vmstate.h"
+#include "migration/qemu-file-types.h"
 #include "qapi/error.h"
 #include "cpu.h"
 #include "exec/target_page.h"
@@ -12080,6 +12081,9 @@ void gles_host_reset(void)
 {
 #if !defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE) || defined(GLES_HOST_EGL)
     gles_snapshot_register();
+#if defined(GLES_HOST_EGL) || defined(GLES_HOST_WGL)
+    gles_fences_register();
+#endif
     gles_queue_run(gles_drop_all_1, NULL);
     gles_queue_forget();
 #endif

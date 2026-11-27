@@ -103,6 +103,87 @@ static void gles_egl_finish_fence(GLuint name)
 #endif
     glFinish();
 }
+/*
+ * Save states: the fence names the guest holds, and the next one to give out. A
+ * fence's marker is the host GPU's and can't be saved; a restored machine's GPU
+ * work is all done, so each name comes back met. Without this, a name the guest
+ * set before the save tested false for ever after a load (gles_egl_test_fence:
+ * an unknown name), and the iPhone 5's backboardd, which waits for its fences,
+ * never drew again.
+ */
+#define GLES_FENCES_SAVED 65536
+typedef struct {
+  uint32_t
+      fences; /* the field the table is saved through (gles_fences_put/get) */
+} GLESFenceState;
+static GLESFenceState gles_fence_state;
+
+static int gles_fences_put(QEMUFile *f, void *pv, size_t size,
+                           const VMStateField *field, JSONWriter *vmdesc) {
+  uint32_t count = gles_egl_fences ? g_hash_table_size(gles_egl_fences) : 0;
+  GHashTableIter it;
+  gpointer key;
+
+  if (count > GLES_FENCES_SAVED) {
+    return -E2BIG;
+  }
+  qemu_put_be32(f, gles_egl_next_fence);
+  qemu_put_be32(f, count);
+  if (count) {
+    g_hash_table_iter_init(&it, gles_egl_fences);
+    while (g_hash_table_iter_next(&it, &key, NULL)) {
+      qemu_put_be32(f, GPOINTER_TO_UINT(key));
+    }
+  }
+  return qemu_file_get_error(f);
+}
+
+static int gles_fences_get(QEMUFile *f, void *pv, size_t size,
+                           const VMStateField *field) {
+  uint32_t next = qemu_get_be32(f), count = qemu_get_be32(f);
+
+  if (count > GLES_FENCES_SAVED) {
+    return -EINVAL;
+  }
+  if (!gles_egl_fences) {
+    gles_egl_fences = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                                            gles_fence_drop);
+  }
+  g_hash_table_remove_all(gles_egl_fences);
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t name = qemu_get_be32(f);
+    if (!name || name > next) {
+      return -EINVAL;
+    }
+    g_hash_table_insert(gles_egl_fences, GUINT_TO_POINTER(name), NULL);
+  }
+  gles_egl_next_fence = next;
+  return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_gles_fences_info = {
+    .name = "gles-fences",
+    .get = gles_fences_get,
+    .put = gles_fences_put,
+};
+
+static const VMStateDescription vmstate_gles_fences = {
+    .name = "gles-fences",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]){VMSTATE_SINGLE(fences, GLESFenceState, 0,
+                                                    vmstate_gles_fences_info,
+                                                    uint32_t),
+                                     VMSTATE_END_OF_LIST()}};
+
+static void gles_fences_register(void) {
+  static bool done;
+  if (!done) {
+    done = true;
+    vmstate_register(NULL, 0, &vmstate_gles_fences, &gles_fence_state);
+  }
+}
+
 static GLboolean gles_egl_test_object(GLenum object, GLuint name) { glFinish(); return GL_TRUE; }
 static void gles_egl_finish_object(GLenum object, GLint name) { glFinish(); }
 #define glGenFencesAPPLE gles_egl_gen_fences
