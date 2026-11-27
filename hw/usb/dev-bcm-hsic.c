@@ -10,6 +10,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "migration/vmstate.h"
+#include "migration/qemu-file-types.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/usb/usb.h"
@@ -48,6 +50,8 @@ struct BCMHSICState {
     uint8_t control_prefix[16];
     uint16_t interrupt_seq, bulk_rx_seq, bulk_tx_seq;
     size_t bulk_rx_offset;
+    uint32_t bulk_rx_offset_vm;     /* bulk_rx_offset in a save state */
+    uint8_t country_vm[3];          /* fullmac.country in a save state */
     unsigned bulk_error_log;
     qemu_irq remote_wake;
 };
@@ -634,6 +638,175 @@ static void bcm_unrealize(USBDevice *dev)
     g_queue_free_full(s->data_rx, (GDestroyNotify)g_bytes_unref);
     g_clear_pointer(&s->download, g_byte_array_unref);
 }
+/*
+ * Save states: the running dongle (its FullMAC state and the frames the host has not read yet), the ROM loader's
+ * progress and the image so far while it loads, and the USB device itself. Bounded as the SDIO dongle's are.
+ */
+#define BCM_VM_FRAMES 256
+#define BCM_VM_FRAME_BYTES 65536
+
+static int bcm_put_queue(QEMUFile *f, void *pv, size_t size, const VMStateField *field, JSONWriter *vmdesc)
+{
+    GQueue *queue = *(GQueue **)pv;
+
+    if (queue->length > BCM_VM_FRAMES) {
+        return -E2BIG;
+    }
+    qemu_put_be32(f, queue->length);
+    for (GList *item = queue->head; item; item = item->next) {
+        gsize len;
+        const uint8_t *data = g_bytes_get_data(item->data, &len);
+
+        if (len > BCM_VM_FRAME_BYTES) {
+            return -E2BIG;
+        }
+        qemu_put_be32(f, len);
+        qemu_put_buffer(f, data, len);
+    }
+    return qemu_file_get_error(f);
+}
+
+static int bcm_get_queue(QEMUFile *f, void *pv, size_t size, const VMStateField *field)
+{
+    GQueue *queue = *(GQueue **)pv;
+    uint32_t count = qemu_get_be32(f);
+
+    if (count > BCM_VM_FRAMES) {
+        return -EINVAL;
+    }
+    g_queue_clear_full(queue, (GDestroyNotify)g_bytes_unref);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t len = qemu_get_be32(f);
+        uint8_t *data;
+
+        if (len > BCM_VM_FRAME_BYTES) {
+            return -EINVAL;
+        }
+        data = g_malloc(len);
+        if (qemu_get_buffer(f, data, len) != len) {
+            g_free(data);
+            return -EIO;
+        }
+        g_queue_push_tail(queue, g_bytes_new_take(data, len));
+    }
+    return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_bcm_queue = {
+    .name = "bcm-hsic-frames",
+    .get = bcm_get_queue,
+    .put = bcm_put_queue,
+};
+
+static int bcm_put_download(QEMUFile *f, void *pv, size_t size, const VMStateField *field, JSONWriter *vmdesc)
+{
+    GByteArray *download = *(GByteArray **)pv;
+    uint32_t len = download ? download->len : 0;
+
+    if (len > BCM_DL_MAX) {
+        return -E2BIG;
+    }
+    qemu_put_be32(f, len);
+    if (len) {
+        qemu_put_buffer(f, download->data, len);
+    }
+    return qemu_file_get_error(f);
+}
+
+static int bcm_get_download(QEMUFile *f, void *pv, size_t size, const VMStateField *field)
+{
+    GByteArray **download = pv;
+    uint32_t len = qemu_get_be32(f);
+
+    if (len > BCM_DL_MAX) {
+        return -EINVAL;
+    }
+    if (!*download) {
+        *download = g_byte_array_new();
+    }
+    g_byte_array_set_size(*download, len);
+    if (len && qemu_get_buffer(f, (*download)->data, len) != len) {
+        return -EIO;
+    }
+    return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_bcm_download = {
+    .name = "bcm-hsic-download",
+    .get = bcm_get_download,
+    .put = bcm_put_download,
+};
+
+static int bcm_pre_save(void *opaque)
+{
+    BCMHSICState *s = opaque;
+
+    if (s->bulk_rx_offset > BCM_VM_FRAME_BYTES) {
+        return -E2BIG;
+    }
+    s->bulk_rx_offset_vm = s->bulk_rx_offset;
+    memcpy(s->country_vm, s->fullmac.country, sizeof(s->country_vm));
+    return 0;
+}
+
+static int bcm_post_load(void *opaque, int version_id)
+{
+    BCMHSICState *s = opaque;
+    GBytes *frame = g_queue_peek_head(s->data_rx);
+
+    if (s->bulk_rx_offset_vm > (frame ? g_bytes_get_size(frame) : 0) ||
+        s->fullmac.cdc_hdrlen > 64 || s->fullmac.bdc_hdrlen > 64) {
+        return -EINVAL;
+    }
+    s->bulk_rx_offset = s->bulk_rx_offset_vm;
+    memcpy(s->fullmac.country, s->country_vm, sizeof(s->country_vm));
+    s->fullmac.country[2] = 0;
+    return 0;
+}
+
+static const VMStateDescription vmstate_bcm_hsic = {
+    .name = TYPE_BCM_HSIC,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = bcm_pre_save,
+    .post_load = bcm_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_USB_DEVICE(parent_obj, BCMHSICState),
+        VMSTATE_UINT32(dl_state, BCMHSICState),
+        VMSTATE_UINT32(dl_size, BCMHSICState),
+        VMSTATE_BOOL(dl_started, BCMHSICState),
+        VMSTATE_BOOL(running, BCMHSICState),
+        VMSTATE_BOOL(reset_asserted, BCMHSICState),
+        VMSTATE_SINGLE(download, BCMHSICState, 1, vmstate_bcm_download, GByteArray *),
+        VMSTATE_BOOL(fullmac.dongle_started, BCMHSICState),
+        VMSTATE_BOOL(fullmac.iscan_reported, BCMHSICState),
+        VMSTATE_BOOL(fullmac.associated, BCMHSICState),
+        VMSTATE_BOOL(fullmac.host_netif, BCMHSICState),
+        VMSTATE_BOOL(fullmac.escan_pending, BCMHSICState),
+        VMSTATE_UINT16(fullmac.escan_sync_id, BCMHSICState),
+        VMSTATE_UINT32(fullmac.escan_status, BCMHSICState),
+        VMSTATE_UINT32(fullmac.cdc_hdrlen, BCMHSICState),
+        VMSTATE_UINT32(fullmac.bdc_hdrlen, BCMHSICState),
+        VMSTATE_UINT32(fullmac.fws_tlv, BCMHSICState),
+        VMSTATE_TIMER_PTR(fullmac.scan_timer, BCMHSICState),
+        VMSTATE_TIMER_PTR(fullmac.join_timer, BCMHSICState),
+        VMSTATE_UINT8_ARRAY(fullmac.bssid, BCMHSICState, 6),
+        VMSTATE_UINT8_ARRAY(country_vm, BCMHSICState, 3),
+        VMSTATE_UINT32(fullmac.toe, BCMHSICState),
+        VMSTATE_UINT32(fullmac.toe_ol, BCMHSICState),
+        VMSTATE_SINGLE(control_rx, BCMHSICState, 1, vmstate_bcm_queue, GQueue *),
+        VMSTATE_SINGLE(data_rx, BCMHSICState, 1, vmstate_bcm_queue, GQueue *),
+        VMSTATE_BOOL(control_notified, BCMHSICState),
+        VMSTATE_BOOL(control_prefixed, BCMHSICState),
+        VMSTATE_UINT8_ARRAY(control_prefix, BCMHSICState, 16),
+        VMSTATE_UINT16(interrupt_seq, BCMHSICState),
+        VMSTATE_UINT16(bulk_rx_seq, BCMHSICState),
+        VMSTATE_UINT16(bulk_tx_seq, BCMHSICState),
+        VMSTATE_UINT32(bulk_rx_offset_vm, BCMHSICState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static char *bcm_get_boot_status(Object *obj, Error **errp)
 {
     BCMHSICState *s = BCM_HSIC(obj);
@@ -659,6 +832,7 @@ static void bcm_class_init(ObjectClass *klass, const void *data)
      * as the other descriptor-backed USB devices do. */
     uc->handle_attach = usb_desc_attach;
     uc->handle_reset = bcm_reset;
+    DEVICE_CLASS(klass)->vmsd = &vmstate_bcm_hsic;
     uc->handle_control = bcm_control;
     uc->handle_data = bcm_data;
     object_class_property_add_str(klass, "boot-status", bcm_get_boot_status,

@@ -263,6 +263,10 @@ struct USBDevice {
     int configuration;
     int ninterfaces;
     int altsetting[USB_MAX_INTERFACES];
+    /* A save state's copy of the speed, configuration and alternate settings (hw/usb/bus.c), made current again on
+     * load (usb_desc_restore). */
+    int32_t vm_speed, vm_configuration, vm_altsetting[USB_MAX_INTERFACES];
+    bool vm_config_loaded;
     const USBDescConfig *config;
     const USBDescIface  *ifaces[USB_MAX_INTERFACES];
 };

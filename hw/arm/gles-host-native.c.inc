@@ -164,7 +164,7 @@ static void gles_native_collect_textures(bool current)
         glDeleteTextures(1,&texture->native_name);
         *slot=texture->next;
         memset(gles_egl_current->textures->recent,0,sizeof(gles_egl_current->textures->recent));
-        free(texture);
+        gles_egl_texture_free(texture);
     }
 }
 static void gles_native_texture_cleanup(CGLContextObj context, bool current)
@@ -323,7 +323,75 @@ static void gles_native_get_tex_enviv(GLenum target, GLenum pname, GLint *value)
     if (!gles_native_lod_bias_get(target,pname,&bias)) glGetTexEnviv(target,pname,value);
     else if (pname==GL_TEXTURE_LOD_BIAS_EXT) *value=(GLint)lrintf(bias);
 }
+static void gles_native_level_set(GLenum native_target, GLint level, GLenum internal, GLsizei w, GLsizei h,
+                                  GLenum format, GLenum type, const void *pixels);
 #include "gles-host-rectangle.c.inc"
+/* Whether a level can be read back through a framebuffer as RGBA bytes (save states); else the layer keeps its bytes. */
+static bool gles_native_level_readable(GLenum format, GLenum type)
+{
+    return (format==GL_RGBA || format==GL_RGB || format==GL_BGRA_EXT) &&
+           (type==GL_UNSIGNED_BYTE || type==GL_UNSIGNED_SHORT_5_6_5 || type==GL_UNSIGNED_SHORT_4_4_4_4 ||
+            type==GL_UNSIGNED_SHORT_5_5_5_1);
+}
+static size_t gles_texel_bytes(uint32_t fmt, uint32_t type);
+static size_t gles_native_level_bpp(GLenum format, GLenum type)
+{
+    if (type==0x140B) type=0x8D61;  /* the desktop's HALF_FLOAT is the ES one */
+    return gles_texel_bytes(format,type);
+}
+/* A depth (or depth and stencil) level: like a renderbuffer's, its contents aren't kept, only its storage. */
+static bool gles_native_level_depth(GLenum format)
+{
+    return format==GL_DEPTH_COMPONENT || format==0x84F9 /* DEPTH_STENCIL_OES */;
+}
+/* The 2D texture bound natively (as an upload leaves it), or NULL for the default one. */
+static GLESEGLTexture *gles_native_level_texture(GLenum native_target, GLint level)
+{
+    if (native_target!=GL_TEXTURE_2D || level<0 || level>=GLES_EGL_LEVELS) return NULL;
+    GLint name=0; glGetIntegerv(GL_TEXTURE_BINDING_2D,&name);
+    return name ? gles_native_texture_from_native(name) : NULL;
+}
+/* A level (re)specified: its size and format, and its bytes where a framebuffer can't read them. */
+static void gles_native_level_set(GLenum native_target, GLint level, GLenum internal, GLsizei w, GLsizei h,
+                                  GLenum format, GLenum type, const void *pixels)
+{
+    GLESEGLTexture *texture=gles_native_level_texture(native_target,level);
+    if (!texture) return;
+    GLESEGLLevel *l=&texture->level[level];
+    free(l->shadow);
+    *l=(GLESEGLLevel){ w, h, internal, format, type, false, NULL };
+    if (!gles_native_level_readable(format,type) && !gles_native_level_depth(format) && w>0 && h>0 &&
+        gles_native_level_bpp(format,type)) {
+        size_t n=(size_t)w*h*gles_native_level_bpp(format,type);
+        l->shadow=pixels ? malloc(n) : calloc(1,n);
+        if (l->shadow && pixels) memcpy(l->shadow,pixels,n);
+    }
+}
+static void gles_native_level_update(GLenum native_target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
+                                     GLenum format, GLenum type, const void *pixels)
+{
+    GLESEGLTexture *texture=gles_native_level_texture(native_target,level);
+    GLESEGLLevel *l=texture ? &texture->level[level] : NULL;
+    if (!l || !l->shadow || !pixels || format!=l->format || type!=l->type || x<0 || y<0 || w<=0 || h<=0 ||
+        (unsigned)x+w>l->width || (unsigned)y+h>l->height) return;
+    size_t bpp=gles_native_level_bpp(format,type);
+    for (GLsizei row=0;row<h;row++)
+        memcpy((uint8_t *)l->shadow+((size_t)(y+row)*l->width+x)*bpp,(const uint8_t *)pixels+(size_t)row*w*bpp,
+               (size_t)w*bpp);
+}
+/* glGenerateMipmap made the chain below level 0. */
+static void gles_native_levels_generated(GLenum native_target)
+{
+    GLESEGLTexture *texture=gles_native_level_texture(native_target,0);
+    if (!texture || !texture->level[0].width) return;
+    GLESEGLLevel base=texture->level[0];
+    unsigned w=base.width, h=base.height;
+    for (unsigned level=1;level<GLES_EGL_LEVELS && (w>1 || h>1);level++) {
+        w=w>1 ? w/2 : 1; h=h>1 ? h/2 : 1;
+        free(texture->level[level].shadow);
+        texture->level[level]=(GLESEGLLevel){ w, h, base.internal, base.format, base.type, true, NULL };
+    }
+}
 static void gles_native_tex_image(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h,
                                   GLint border, GLenum format, GLenum type, const void *pixels)
 {
@@ -373,6 +441,7 @@ static void gles_native_tex_image(GLenum target, GLint level, GLint internal, GL
         GLESEGLTexture *texture=gles_native_texture_from_native(name);
         if (texture) { texture->width=w; texture->height=h; }
     }
+    if (error==GL_NO_ERROR) gles_native_level_set(native_target,level,internal,w,h,format,type,copy);
     glPixelStorei(GL_UNPACK_ALIGNMENT,gles_egl_current->unpack_alignment);
     gles_native_texture_finish(target,old);
     free(copy);
@@ -385,6 +454,7 @@ static void gles_native_tex_sub_image(GLenum target, GLint level, GLint x, GLint
     GLuint old=gles_native_texture_start(target);
     glPixelStorei(GL_UNPACK_ALIGNMENT,1);
     glTexSubImage2D(gles_native_target(target),level,x,y,w,h,format,type,copy);
+    gles_native_level_update(gles_native_target(target),level,x,y,w,h,format,type,copy);
     glPixelStorei(GL_UNPACK_ALIGNMENT,gles_egl_current->unpack_alignment);
     gles_native_texture_finish(target,old);
     free(copy);
@@ -529,7 +599,10 @@ static void gles_native_GenerateMipmap(GLenum target)
         if (!es1) { gles_native_error(GL_INVALID_OPERATION); return; }
     }
     GLuint old=gles_native_texture_start(target);
+    gles_native_save_errors();
     if (gles_egl_current->api==2) glGenerateMipmap(target); else es1(target);
+    GLenum error=gles_native_driver_error(); gles_native_error(error);
+    if (!error) gles_native_levels_generated(gles_native_target(target));
     gles_native_texture_finish(target,old);
 }
 /*

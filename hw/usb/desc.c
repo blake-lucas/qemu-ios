@@ -521,6 +521,24 @@ void usb_desc_attach(USBDevice *dev)
     usb_desc_setdefaults(dev);
 }
 
+int usb_desc_restore(USBDevice *dev, int speed, int configuration, const int32_t *altsetting)
+{
+    if (speed < USB_SPEED_LOW || speed > USB_SPEED_SUPER || !(dev->speedmask & (1 << speed))) {
+        return -EINVAL;
+    }
+    dev->speed = speed;
+    usb_desc_setdefaults(dev);
+    if (!dev->device || usb_desc_set_config(dev, configuration) < 0 || dev->configuration != configuration) {
+        return -EINVAL;
+    }
+    for (int i = 0; i < dev->ninterfaces; i++) {
+        if (altsetting[i] && usb_desc_set_interface(dev, i, altsetting[i]) < 0) {
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
 void usb_desc_set_string(USBDevice *dev, uint8_t index, const char *str)
 {
     USBDescString *s;

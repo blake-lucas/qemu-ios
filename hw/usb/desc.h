@@ -233,6 +233,8 @@ int usb_desc_msos(const USBDesc *desc, USBPacket *p,
 /* control message emulation helpers */
 void usb_desc_init(USBDevice *dev);
 void usb_desc_attach(USBDevice *dev);
+/* Make a save state's speed, configuration and alternate settings current again, without the guest asking. */
+int usb_desc_restore(USBDevice *dev, int speed, int configuration, const int32_t *altsetting);
 void usb_desc_set_string(USBDevice *dev, uint8_t index, const char *str);
 void usb_desc_create_serial(USBDevice *dev);
 const char *usb_desc_get_string(USBDevice *dev, uint8_t index);

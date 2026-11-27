@@ -25,6 +25,7 @@
 #include "windows-memory.c.inc"
 #include "hw/arm/machines-qom.h"
 #include "qapi/error.h"
+#include "migration/blocker.h"
 #include "qapi/visitor.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -744,6 +745,11 @@ static void n45_machine_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     DeviceState *dev;
     SysBusDevice *busdev;
+    /* Save states: the S5L8900's devices carry no saved state yet, so a save is refused rather than made wrong. */
+    static Error *save_blocker;
+
+    error_setg(&save_blocker, "Save states aren't available for this device yet");
+    migrate_add_blocker(&save_blocker, &error_fatal);
 
     s->board = object_dynamic_cast(OBJECT(machine), TYPE_IPHONE_2G_MACHINE) ? &m68_board : &n45_board;
 
