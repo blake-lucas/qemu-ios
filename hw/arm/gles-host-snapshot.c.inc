@@ -190,6 +190,21 @@ static void snap_set_stack(GLenum mode, GLenum depth_pname, GLint depth, GLfloat
 
 static void snap_capture_fixed(GLESCtxGL *s);
 
+/*
+ * The GL errors a save or load step left, dropped (they are not the guest's). LT_STATE_GL_LOG=1 logs them by step:
+ * a call a context refuses here is one a stricter driver may not survive, so a clean log on Mesa, Adreno and ANGLE is
+ * the check that every call fits its context.
+ */
+static void snap_drain(const char *where)
+{
+    static int log = -1;
+
+    if (log < 0) log = getenv("LT_STATE_GL_LOG") != NULL;
+    for (GLenum e; (e = glGetError()) != GL_NO_ERROR;) {
+        if (log) fprintf(stderr, "[gles] snapshot: GL error 0x%x after %s (api %u)\n", e, where, gh.api_version);
+    }
+}
+
 /* The context's lights, clip planes and point sprites; an ES2 context has none. */
 static void snap_limits(GLESCtxGL *s)
 {
@@ -263,6 +278,7 @@ static void snap_capture_gl(GLESCtxGL *s)
     glGetFloatv(GL_POLYGON_OFFSET_UNITS, &s->poly_units);
     glGetFloatv(GL_LINE_WIDTH, &s->line_width);
     glGetFloatv(GL_SAMPLE_COVERAGE_VALUE, &s->sample_cov);
+    snap_drain("capture: common state");
     snap_limits(s);
     for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) {
         s->enable_ok[i] = snap_cap_ok(s, snap_enables[i]);
@@ -283,6 +299,7 @@ static void snap_capture_gl(GLESCtxGL *s)
         }
         glActiveTexture(s->active_tex);
     }
+    snap_drain("capture: enables, units and fixed function");
     glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &s->fbo);
     glGetIntegerv(GL_RENDERBUFFER_BINDING_EXT, &s->rb);
     if (snap_shaders()) {
@@ -291,9 +308,7 @@ static void snap_capture_gl(GLESCtxGL *s)
             glGetVertexAttribfv(i, GL_CURRENT_VERTEX_ATTRIB, s->vattr[i]);
         }
     }
-    while (glGetError() != GL_NO_ERROR) {
-        /* pnames a context does not know leave their zero */
-    }
+    snap_drain("capture: bindings and program");
 }
 
 /* The fixed-function state, with the texture units' environments and the matrix stacks. */
@@ -405,7 +420,9 @@ static void snap_set_enable(GLenum cap, GLboolean on)
 
 static void snap_apply_fixed(const GLESCtxGL *s);
 
-static void snap_apply_gl(const GLESCtxGL *s)
+/* loading: the saved program name is the old host one, which may name another program or a shader now; the
+ * program is bound by its guest name once every context is back (snap_use_program). */
+static void snap_apply_gl(const GLESCtxGL *s, bool loading)
 {
     /*
      * The context's own framebuffer first: the object walk left the last framebuffer it visited bound, and state
@@ -444,9 +461,11 @@ static void snap_apply_gl(const GLESCtxGL *s)
     glPolygonOffset(s->poly_factor, s->poly_units);
     glLineWidth(s->line_width);
     glSampleCoverage(s->sample_cov, s->sample_inv);
+    snap_drain("apply: common state");
     for (unsigned i = 0; i < ARRAY_SIZE(snap_enables); i++) {
         if (s->enable_ok[i]) snap_set_enable(snap_enables[i], s->enables[i]);
     }
+    snap_drain("apply: enables");
     if (snap_fixed()) {
         snap_apply_fixed(s);
     } else {
@@ -460,11 +479,10 @@ static void snap_apply_gl(const GLESCtxGL *s)
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, s->fbo);
     glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, s->rb);
     if (snap_shaders()) {
-        glUseProgram(s->program);
+        if (!loading) glUseProgram(s->program);
         for (unsigned i = 1; i < GLES_MAX_ATTRIBS; i++) glVertexAttrib4fv(i, s->vattr[i]);
     }
-    while (glGetError() != GL_NO_ERROR) {
-    }
+    snap_drain("apply: units, bindings and program");
 }
 
 static void snap_apply_fixed(const GLESCtxGL *s)
@@ -673,8 +691,7 @@ static bool snap_es_read_level(GLenum target, GLuint name, GLint level, GLsizei 
     glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, target, 0, 0);
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, old);
     glDeleteFramebuffersEXT(1, &fb);
-    while (glGetError() != GL_NO_ERROR) {
-    }
+    snap_drain("texture readback");
     return status == GL_FRAMEBUFFER_COMPLETE_EXT;
 }
 
@@ -735,8 +752,7 @@ static void snap_put_textures(SnapW *w)
             if (k < 4 || (k == 4 && snap_fixed())) glGetTexParameteriv(target, p[k], &v);
             sw32(&tw, v);
         }
-        while (glGetError() != GL_NO_ERROR) {
-        }
+        snap_drain("texture parameters");
         for (GLint lvl = 0; lvl < GLES_EGL_LEVELS; lvl++) {
             GLESEGLLevel l;
             bool generated;
@@ -835,8 +851,7 @@ static void snap_get_textures(SnapR *r)
             }
         }
         if (generated && target == GL_TEXTURE_2D) glGenerateMipmapEXT(target);
-        while (glGetError() != GL_NO_ERROR) {
-        }
+        snap_drain("texture restore");
     }
 }
 #else
@@ -1288,17 +1303,25 @@ static void snap_get_glsl(SnapR *r)
 static void snap_put_objects(SnapW *w)
 {
     snap_put_textures(w);
+    snap_drain("textures");
     snap_put_renderbuffers(w);
+    snap_drain("renderbuffers");
     snap_put_framebuffers(w);
+    snap_drain("framebuffers");
     snap_put_glsl(w);
+    snap_drain("shaders and programs");
 }
 
 static void snap_get_objects(SnapR *r)
 {
     snap_get_textures(r);
+    snap_drain("textures");
     snap_get_renderbuffers(r);
+    snap_drain("renderbuffers");
     snap_get_framebuffers(r);
+    snap_drain("framebuffers");
     snap_get_glsl(r);
+    snap_drain("shaders and programs");
 }
 
 /* ---- GLESHost fields ------------------------------------------------------ */
@@ -1732,7 +1755,7 @@ static void snap_put_context(SnapW *w, uint32_t handle, GLESHost *h, bool object
     snap_capture_gl(&s);
     swbytes(w, &s, sizeof(s));
     if (objects) snap_put_objects(w);
-    snap_apply_gl(&s);               /* the object scan moved bindings */
+    snap_apply_gl(&s, false);        /* the object scan moved bindings */
 }
 
 static uint32_t gles_group_handle(GLESGroup *group)
@@ -1797,7 +1820,7 @@ static GByteArray *gles_snapshot_save(void)
  * A context's program as the guest left it current, with what glUseProgram derives from it (its framebuffer fetch
  * uniforms), and on Android its drawable back in an AHardwareBuffer. Programs come back with new host names
  * (snap_get_glsl), and a context's objects may come with a later context of its share group, so this runs once every
- * context is back; the host name snap_apply_gl bound was the old one, which named another program or none.
+ * context is back; snap_apply_gl, loading, leaves it alone.
  */
 #ifdef GLES_HOST_AHB
 /*
@@ -1844,8 +1867,7 @@ static void snap_drawable_ahb(GLESHost *h)
     }
     glBindTexture(GL_TEXTURE_2D, (GLuint)texture == old ? h->tex : (GLuint)texture);
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, framebuffer);
-    while (glGetError() != GL_NO_ERROR) {
-    }
+    snap_drain("drawable into a hardware buffer");
 }
 #endif
 
@@ -1864,8 +1886,7 @@ static void snap_use_program(GLESHost *h)
     glUseProgram(host);
     h->fetch_sampler = host ? glGetUniformLocation(host, "gles_fetch") : -1;
     h->fetch_size = host ? glGetUniformLocation(host, "gles_fetch_size") : -1;
-    while (glGetError() != GL_NO_ERROR) {
-    }
+    snap_drain("program");
 }
 
 static bool gles_snapshot_load(const uint8_t *p, size_t n)
@@ -1961,7 +1982,7 @@ static bool gles_snapshot_load(const uint8_t *p, size_t n)
         h->iosurface = false;
         if (!handle) qatomic_inc(&gles_live_contexts);
         if (objects) snap_get_objects(&r);
-        snap_apply_gl(&s);
+        snap_apply_gl(&s, true);
         snap_restore_queries(h);
     }
     if (!r.bad) {
