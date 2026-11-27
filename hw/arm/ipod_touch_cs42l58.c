@@ -125,7 +125,14 @@ static unsigned cs42l58_sample_rate(uint8_t control)
  *
  * CS42L61 on the iPhone 4 (n90, 10B329) and iPad (k48), modelled as this
  * CS42L58: on the speaker iOS scales the PCM itself and only mutes the codec at
- * level 0, which the host doesn't follow (unity, as before). With a headphone
+ * level 0, which the host doesn't follow (unity, as before), except for the
+ * iPhone 4's ringtone ("ringer"): its PCM stays at full scale and iOS sets the
+ * Ringer's level in 0x21, the 3GS's speaker register (0x14, +10 dB, at the
+ * slider's top to 0xc2, -31 dB, at its bottom), and puts back 0x00 for every
+ * other sound (0x34 at power-on, before any). 0x00 plays at unity and nothing
+ * above it louder, so the ring follows the Ringer, its top few steps at full
+ * scale. The iPad (5.1.1) parks 0x21 at 0xed for its own sounds, heard at unity
+ * as before. With a headphone
  * in the jack ("headphones", the Mikey's jack) iOS sets the volume in 0x22:
  * bit 7 mutes (level 0 and an idle output), bits 0-6 are 7-bit two's
  * complement in 0.5 dB steps, levels 1-16 0x44 (-30 dB) to 0x02 (+1 dB), the
@@ -133,7 +140,8 @@ static unsigned cs42l58_sample_rate(uint8_t control)
  * iPad, 0x67 on the iPhone 4 unmuted: 0x00, 0x3f muted), the speaker's PCM
  * plays as before.
  * ponytail: from 17 -> 0 -> 17 volume-button traces with Doodle Jump (n90) and
- * Jetpack (k48) playing on each route.
+ * Jetpack (k48) playing on each route, and n90 rung at the Ringer's top and
+ * bottom on the speaker.
  */
 double cs42l58_output_gain(CS42L58State *s)
 {
@@ -173,12 +181,15 @@ double cs42l58_output_gain(CS42L58State *s)
 
             if (!(v & 0x80)) {
                 db = (double)((int8_t)(v << 1) / 2 - 2) / 2;
-            } else if (!s->regs[0x63] || !s->regs[0x67]) {
-                return 1.0;     /* the headphones muted, the speaker playing (iOS's own scale) */
+                break;
             }
-            break;
+            if (s->regs[0x63] && s->regs[0x67]) {
+                break;  /* both muted */
+            }
+            /* the headphones muted, the speaker playing */
         }
-        return 1.0;
+        /* the speaker: iOS's own scale, or the iPhone 4's ringtone at the Ringer's level in 0x21 (above) */
+        return s->ringer ? MIN(pow(10.0, (double)(int8_t)s->regs[0x21] / 2 / 20.0), 1.0) : 1.0;
     }
     return db == -INFINITY ? 0.0 : pow(10.0, db / 20.0);
 }
@@ -316,6 +327,8 @@ static const VMStateDescription vmstate_cs42l58 = {
 static const Property cs42l58_props[] = {
     /* CS42L59 only: report a plain headphone plugged in (see CS42L59_REG_JACK) */
     DEFINE_PROP_BOOL("headphones", CS42L58State, hp, false),
+    /* the iPhone 4's: its speaker plays a ringtone at 0x21's level (see cs42l58_output_gain) */
+    DEFINE_PROP_BOOL("ringer", CS42L58State, ringer, false),
 };
 
 static void cs42l58_class_init(ObjectClass *klass, const void *data)
