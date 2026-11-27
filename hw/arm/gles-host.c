@@ -1964,6 +1964,29 @@ static bool gles_pointer_ok(GLenum client_state, uint32_t size, GLenum type)
     }
 }
 
+/*
+ * What the guest sees glIsEnabled say about a client array: its own enable state, not the host's. With the array
+ * cache the host's flags change only at a draw (gles_array_enable), so between the guest's glDisableClientState and
+ * the next draw the host still says enabled, and a game that saves the state and enables what it finds off drew
+ * nothing: Dino Jump (GitHub issue 23) disables its arrays, asks glIsEnabled, read "enabled", skipped its own
+ * glEnableClientState and then drew its frame's full-screen quad into the screen with no vertex array, so the
+ * picture stayed on the level's first frame while the game ran. The point-size array, which desktop GL has no
+ * flag for, was refused as an unknown capability the same way. false: not a client array.
+ */
+static bool gles_client_array_enabled(uint32_t cap, bool *enabled)
+{
+    switch (cap) {
+    case GL_VERTEX_ARRAY:           *enabled = gh.vertex.enabled; return true;
+    case GL_COLOR_ARRAY:            *enabled = gh.color.enabled; return true;
+    case GL_NORMAL_ARRAY:           *enabled = gh.normal.enabled; return true;
+    case GL_TEXTURE_COORD_ARRAY:    *enabled = gh.texcoord[gh.client_active_unit].enabled; return true;
+    case GL_POINT_SIZE_ARRAY_OES:   *enabled = gh.pointsize.enabled; return true;
+    case GL_WEIGHT_ARRAY_OES:       *enabled = gh.weight.enabled; return true;
+    case GL_MATRIX_INDEX_ARRAY_OES: *enabled = gh.matrix_index.enabled; return true;
+    default:                        return false;
+    }
+}
+
 static void gles_client_active(unsigned unit)
 {
     if (!gles_array_cache || gh.host_client_active_unit != unit) {
@@ -10844,15 +10867,21 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         glCopyTexSubImage2D(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
         gles_surface_forget(a[0]);
         return 0;
-    case GLES_SLOT_IS_ENABLED:
+    case GLES_SLOT_IS_ENABLED: {
+        bool array_on;
+
         if (a[0] == GL_MATRIX_PALETTE_OES && gh.api_version != 2) {
             return gh.palette_on;
+        }
+        if (gh.api_version != 2 && gles_client_array_enabled(a[0], &array_on)) {
+            return array_on;
         }
 #if !defined(GLES_HOST_EAGL) && !defined(GLES_HOST_ANGLE)
         if (gh.api_version == 2 && a[0] >= 0x3000 && a[0] < 0x3008)
             return !!(gh.clip_enabled & (1u << (a[0]-0x3000)));
 #endif
         return glIsEnabled(a[0]);
+    }
     case GLES_SLOT_IS_TEXTURE:
         return gles_guest_name_ok(a[0]) && glIsTexture(a[0]);
     case GLES_SLOT_LIGHT_MODELF:                /* pname, param */
