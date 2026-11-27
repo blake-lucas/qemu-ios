@@ -28,6 +28,7 @@
 #include "qapi/visitor.h"
 #include "hw/arm/ipod_touch_mipi_dsi.h"
 #include "hw/arm/ipod_touch_spi.h"
+#include "hw/arm/cs35l19.h"
 #include "hw/arm/cs42l65.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/arm/ipod_touch_usb_otg.h"
@@ -252,6 +253,10 @@ struct S5L8950State {
         usb_host_probe;
     bool audio_ports_probe;
     bool headphones;                /* a plain headphone in the CS42L65's jack */
+    DeviceState *speaker;           /* MCA0, the speaker amplifier's port (audio_ports_probe) */
+    DeviceState *amp;               /* the CS35L19 on it */
+    DeviceState *jack_port;         /* i2s0, the CS42L65's headphone port */
+    DeviceState *codec;             /* the CS42L65 */
     bool camera;
     bool quiet_boot; /* omit -v in the RAM boot handoff */
     bool battery_probe;
@@ -1753,6 +1758,23 @@ static void a6_uart_rxdma(void *opaque, int pin, int level)
     }
 }
 
+/*
+ * What the host hears from the speaker port: the CS35L19's volume, which carries the Ringer's level on the speaker
+ * (cs35l19.c), except while the headphone port plays unmuted. With a headphone in, 14G61 rings through both, the
+ * headphones at their own level (cs42l65_output_gain), and the host hears the headphones, as on the iPhone 4 and the
+ * iPod touch 4G (cs42l58_output_gain). i2s0 streams silence between sounds while a headphone is in, so a sound iOS
+ * sent to the speaker alone would be muted too; none was seen with rings, texts and lock sounds.
+ */
+static double a6_speaker_gain(void *opaque)
+{
+    S5L8950State *s = opaque;
+
+    if (s->jack_port && s5l8930_i2s_out_running(s->jack_port) && cs42l65_output_gain(s->codec) > 0.0) {
+        return 0.0;
+    }
+    return s->amp ? cs35l19_output_gain(s->amp) : 1.0;
+}
+
 static void a6_init(MachineState *machine)
 {
     S5L8950State *s = S5L8950_MACHINE(machine);
@@ -1919,6 +1941,8 @@ static void a6_init(MachineState *machine)
             if (i == 0 && codec) {
                 qdev_connect_clock_in(port, "lrclk", qdev_get_clock_out(codec, "lrclk"));
                 s5l8930_i2s_set_gain_source(port, cs42l65_output_gain, codec);
+                s->jack_port = port;
+                s->codec = codec;
             }
             sysbus_realize_and_unref(SYS_BUS_DEVICE(port), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(port), 0, 0x34190000 + i * 0x1000);
@@ -1937,6 +1961,9 @@ static void a6_init(MachineState *machine)
             qdev_prop_set_uint8(port, "port", 6 + i);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(port), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(port), 0, 0x34196000 + i * 0x1000);
+            if (i == 0) {
+                s->speaker = port;
+            }
         }
     }
     for (int i = 0; i < 3; i++) {
@@ -1961,9 +1988,11 @@ static void a6_init(MachineState *machine)
         i2c_slave_realize_and_unref(backlight, s->i2c[0]->bus, &error_fatal);
     }
     if (s->audio_ports_probe) {
-        I2CSlave *amp = i2c_slave_new("cs35l19", 0x40);
+        I2CSlave *amp = i2c_slave_new(TYPE_CS35L19, 0x40);
         qdev_prop_set_bit(DEVICE(amp), "trace-regs", true);
         i2c_slave_realize_and_unref(amp, s->i2c[0]->bus, &error_fatal);
+        s->amp = DEVICE(amp);
+        s5l8930_i2s_set_gain_source(s->speaker, a6_speaker_gain, s);
     }
     if (s->tristar_probe) {
         /* Original N42 DT: i2c0/tristar reg=0x1a. */
