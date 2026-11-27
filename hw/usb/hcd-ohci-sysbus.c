@@ -64,10 +64,22 @@ static const Property ohci_sysbus_properties[] = {
     DEFINE_PROP_DMAADDR("dma-offset", OHCISysBusState, dma_offset, 0),
 };
 
+/* Save states (the iPhone 5's HSIC hosts, which carry its Wi-Fi and modem): the controller as the PCI one saves it. */
+static const VMStateDescription vmstate_ohci_sysbus = {
+    .name = "ohci-sysbus",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT(ohci, OHCISysBusState, 1, vmstate_ohci_state, OHCIState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void ohci_sysbus_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    dc->vmsd = &vmstate_ohci_sysbus;
     dc->realize = ohci_sysbus_realize;
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
     dc->desc = "OHCI USB Controller";

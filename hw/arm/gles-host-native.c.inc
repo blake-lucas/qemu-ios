@@ -333,14 +333,16 @@ static bool gles_native_level_readable(GLenum format, GLenum type)
            (type==GL_UNSIGNED_BYTE || type==GL_UNSIGNED_SHORT_5_6_5 || type==GL_UNSIGNED_SHORT_4_4_4_4 ||
             type==GL_UNSIGNED_SHORT_5_5_5_1);
 }
+static size_t gles_texel_bytes(uint32_t fmt, uint32_t type);
 static size_t gles_native_level_bpp(GLenum format, GLenum type)
 {
-    size_t n = format==GL_RGBA || format==GL_BGRA_EXT ? 4 : format==GL_RGB ? 3 :
-               format==GL_LUMINANCE_ALPHA || format==0x8227 /* RG */ ? 2 : 1;
-    if (type==GL_UNSIGNED_SHORT_5_6_5 || type==GL_UNSIGNED_SHORT_4_4_4_4 || type==GL_UNSIGNED_SHORT_5_5_5_1) return 2;
-    if (type==GL_FLOAT) return n * 4;
-    if (type==0x8D61 /* HALF_FLOAT_OES */ || type==0x140B /* HALF_FLOAT */) return n * 2;
-    return n;
+    if (type==0x140B) type=0x8D61;  /* the desktop's HALF_FLOAT is the ES one */
+    return gles_texel_bytes(format,type);
+}
+/* A depth (or depth and stencil) level: like a renderbuffer's, its contents aren't kept, only its storage. */
+static bool gles_native_level_depth(GLenum format)
+{
+    return format==GL_DEPTH_COMPONENT || format==0x84F9 /* DEPTH_STENCIL_OES */;
 }
 /* The 2D texture bound natively (as an upload leaves it), or NULL for the default one. */
 static GLESEGLTexture *gles_native_level_texture(GLenum native_target, GLint level)
@@ -358,7 +360,8 @@ static void gles_native_level_set(GLenum native_target, GLint level, GLenum inte
     GLESEGLLevel *l=&texture->level[level];
     free(l->shadow);
     *l=(GLESEGLLevel){ w, h, internal, format, type, false, NULL };
-    if (!gles_native_level_readable(format,type) && w>0 && h>0) {
+    if (!gles_native_level_readable(format,type) && !gles_native_level_depth(format) && w>0 && h>0 &&
+        gles_native_level_bpp(format,type)) {
         size_t n=(size_t)w*h*gles_native_level_bpp(format,type);
         l->shadow=pixels ? malloc(n) : calloc(1,n);
         if (l->shadow && pixels) memcpy(l->shadow,pixels,n);

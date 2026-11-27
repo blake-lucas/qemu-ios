@@ -699,7 +699,9 @@ static void snap_put_textures(SnapW *w)
             l = t->level[lvl];
             generated = l.generated;
             if (!l.width && !(lvl == 0 && snap_es_drawable_level(name, &l))) continue;
-            if (!generated && l.shadow) {
+            if (gles_native_level_depth(l.format)) {
+                /* storage only, as a renderbuffer's */
+            } else if (!generated && l.shadow) {
                 bytes = l.shadow;
                 len = (uint32_t)((size_t)l.width * l.height * gles_native_level_bpp(l.format, l.type));
             } else if (!generated) {
@@ -772,8 +774,12 @@ static void snap_get_textures(SnapR *r)
                 generated = true;
                 continue;
             }
-            if (px && (uint64_t)wd * ht * gles_native_level_bpp(format, type) == len &&
-                gles_charge_texture(target, lvl - 1, len)) {
+            if (gles_native_level_depth(format) && !len &&
+                gles_charge_texture(target, lvl - 1, (uint64_t)wd * ht * gles_native_level_bpp(format, type))) {
+                gles_tex_charge.table = NULL;
+                glTexImage2D(target, lvl - 1, internal, wd, ht, 0, format, type, NULL);
+            } else if (px && len && (uint64_t)wd * ht * gles_native_level_bpp(format, type) == len &&
+                       gles_charge_texture(target, lvl - 1, len)) {
                 gles_tex_charge.table = NULL;
                 glTexImage2D(target, lvl - 1, internal, wd, ht, 0, format, type, px);
             }
@@ -784,6 +790,8 @@ static void snap_get_textures(SnapR *r)
     }
 }
 #else
+static bool snap_depth_ifmt(GLint ifmt);
+
 static void snap_put_textures(SnapW *w)
 {
     GByteArray *body = g_byte_array_new();
@@ -824,15 +832,19 @@ static void snap_put_textures(SnapW *w)
             glGetTexLevelParameteriv(target, lvl, GL_TEXTURE_HEIGHT, &ht);
             glGetTexLevelParameteriv(target, lvl, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
             if (wd <= 0 || ht <= 0) break;
+            sw32(&tw, lvl + 1);
+            sw32(&tw, wd);
+            sw32(&tw, ht);
+            sw32(&tw, ifmt);
+            if (snap_depth_ifmt(ifmt)) {
+                swbytes(&tw, NULL, 0);  /* storage only, as a renderbuffer's (snap_get_textures) */
+                continue;
+            }
             g_autofree uint8_t *px = g_malloc((size_t)wd * ht * 4);
             glGetIntegerv(GL_PACK_ALIGNMENT, &unpack);
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glGetTexImage(target, lvl, GL_RGBA, GL_UNSIGNED_BYTE, px);
             glPixelStorei(GL_PACK_ALIGNMENT, unpack);
-            sw32(&tw, lvl + 1);
-            sw32(&tw, wd);
-            sw32(&tw, ht);
-            sw32(&tw, ifmt);
             swbytes(&tw, px, (uint32_t)wd * ht * 4);
         }
         sw32(&tw, 0);
@@ -840,6 +852,18 @@ static void snap_put_textures(SnapW *w)
     sw32(w, count);
     g_byte_array_append(w->b, body->data, body->len);
     g_byte_array_free(body, true);
+}
+
+/* A depth (or depth and stencil) texture: its storage comes back, its contents cleared, as a renderbuffer's. */
+static bool snap_depth_ifmt(GLint ifmt)
+{
+    switch (ifmt) {
+    case GL_DEPTH_COMPONENT: case GL_DEPTH_COMPONENT16: case GL_DEPTH_COMPONENT24: case GL_DEPTH_COMPONENT32:
+    case GL_DEPTH_STENCIL_EXT: case GL_DEPTH24_STENCIL8_EXT:
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* Internal formats that can be recreated from RGBA8 bytes as they are;
@@ -871,7 +895,13 @@ static void snap_get_textures(SnapR *r)
             uint32_t len;
             const uint8_t *px = srbytes(r, &len);
             /* The host reads wd * ht * 4 bytes: exactly the run the blob holds. */
-            if (px && wd > 0 && ht > 0 && (uint64_t)wd * ht * 4 == len &&
+            if (snap_depth_ifmt(ifmt) && !len && wd > 0 && ht > 0 && wd <= 4096 && ht <= 4096 &&
+                gles_charge_texture(target, lvl - 1, (uint64_t)wd * ht * 4)) {
+                bool stencil = ifmt == GL_DEPTH_STENCIL_EXT || ifmt == GL_DEPTH24_STENCIL8_EXT;
+                gles_tex_charge.table = NULL;
+                glTexImage2D(target, lvl - 1, ifmt, wd, ht, 0, stencil ? GL_DEPTH_STENCIL_EXT : GL_DEPTH_COMPONENT,
+                             stencil ? GL_UNSIGNED_INT_24_8_EXT : GL_UNSIGNED_INT, NULL);
+            } else if (px && wd > 0 && ht > 0 && (uint64_t)wd * ht * 4 == len &&
                 gles_charge_texture(target, lvl - 1, len)) {
                 gles_tex_charge.table = NULL;
                 glTexImage2D(target, lvl - 1, snap_texture_ifmt(ifmt), wd, ht, 0,
@@ -984,15 +1014,25 @@ static void snap_get_framebuffers(SnapR *r)
     uint32_t n = sr32(r);
     for (uint32_t i = 0; i < n && !r->bad; i++) {
         GLuint name = sr32(r);
+        GLint seen[ARRAY_SIZE(snap_attachments)][2];
+        GLenum status;
         glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, name);
         for (unsigned k = 0; k < ARRAY_SIZE(snap_attachments); k++) {
             GLint type = sr32(r), obj = sr32(r), lvl = sr32(r), target = sr32(r);
+            seen[k][0] = type;
+            seen[k][1] = obj;
             if (type == GL_TEXTURE) {
                 glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, snap_attachments[k], target, obj, lvl);
             } else if (type == GL_RENDERBUFFER_EXT) {
                 glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, snap_attachments[k],
                                              GL_RENDERBUFFER_EXT, obj);
             }
+        }
+        status = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
+        if (status != GL_FRAMEBUFFER_COMPLETE_EXT && (seen[0][0] || seen[1][0] || seen[2][0])) {
+            fprintf(stderr, "[gles] snapshot: framebuffer %u restored incomplete (0x%x): color 0x%x %d, depth 0x%x %d, "
+                    "stencil 0x%x %d\n", name, status, seen[0][0], seen[0][1], seen[1][0], seen[1][1], seen[2][0],
+                    seen[2][1]);
         }
     }
 }
