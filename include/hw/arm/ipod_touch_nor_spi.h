@@ -43,6 +43,7 @@ typedef struct IPodTouchNORSPIState {
     /* The writable copy's write in flight and the range changed since (nor_persist), and its flush in flight, to
      * run again for a write that landed meanwhile (nor_flush_co); transient. */
     bool persisting, flushing, flush_again;
+    int flush_fd;                       /* the writable copy again, for its flush (nor_sync); -1 = none */
     uint32_t dirty_start, dirty_end;
 } IPodTouchNORSPIState;
 

@@ -8,7 +8,7 @@
  * SLICE include/hw/arm/ipod_touch_nor_spi.h define NOR_
  * SLICE hw/arm/ipod_touch_nor_spi.c define NOR_STATUS
  * SLICE include/hw/arm/ipod_touch_nor_spi.h typedef IPodTouchNORSPIState
- * SLICE:fns hw/arm/ipod_touch_nor_spi.c fn nor_failed nor_flush_co nor_persist_co nor_persist nor_quiesce
+ * SLICE:fns hw/arm/ipod_touch_nor_spi.c fn nor_failed nor_sync nor_flush_co nor_persist_co nor_persist nor_quiesce
  * SLICE:fns hw/arm/ipod_touch_gpio.c fn s5l8900_gpio_write
  * SLICE:fns hw/arm/ipod_touch_nor_spi.c fn nor_reset_transaction nor_finish_transaction ipod_touch_nor_spi_set_cs ipod_touch_nor_spi_reset ipod_touch_nor_spi_transfer ipod_touch_nor_spi_post_load
  * PKG glib-2.0
@@ -51,8 +51,9 @@ static int blk_pwrite(void *blk,uint32_t start,uint32_t length,const void*data,i
  writes++;written_first=*(const uint8_t *)data;return persist_error;
 }
 static void (*during_flush)(void);   /* runs inside the next flush: what lands while it is in flight */
-static int blk_co_flush(void *blk) {
- assert(blk);flushes++;void (*f)(void)=during_flush;during_flush=NULL;if(f)f();return flush_error;
+static int qemu_fdatasync(int fd) {assert(fd==7);flushes++;if(flush_error)errno=-flush_error;return flush_error?-1:0;}
+static int thread_pool_submit_co(int (*fn)(void *), void *arg) {
+ void (*f)(void)=during_flush;during_flush=NULL;if(f)f();return fn(arg);
 }
 static void qemu_system_vmstop_request(int state) {assert(state==RUN_STATE_IO_ERROR);storage_stops++;}
 static void qemu_system_vmstop_request_prepare(void) {}
@@ -124,7 +125,7 @@ int main(void) {
  assert(byte(NOR_GET_JEDECID)==0x40 && byte(NOR_ENABLE_WRITE)==0x10 && byte(0xff)==0x20);end();
  begin(NOR_GET_JEDECID);assert(byte(0xff)==0x1f && byte(0xff)==0x45 && byte(0xff)==0x02 && byte(0xff)==0 && byte(0xff)==0xff);end();
  begin(0);byte(NOR_ENABLE_WRITE);end();assert(!s.write_enabled);
- s.blk=(void*)1;persist_error=-EIO;program(4,0);
+ s.flush_fd=7;s.blk=(void*)1;persist_error=-EIO;program(4,0);
  assert((s.status & NOR_STATUS_EPE) && nor_io_failed && storage_stops==1 && flushes==1);
  persist_error=0;s.restore_pending=true;program(4,0);
  assert(!(s.status & NOR_STATUS_EPE) && !s.restore_pending && nor_io_failed);

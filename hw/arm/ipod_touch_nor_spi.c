@@ -9,6 +9,7 @@
 #include "system/runstate.h"
 #include "qemu/coroutine.h"
 #include "qemu/aio-wait.h"
+#include "block/thread-pool.h"
 #include "qobject/qdict.h"
 #include "qemu/file-identity.h"
 
@@ -157,6 +158,15 @@ void ipod_touch_nor_spi_open_overlay(IPodTouchNORSPIState *s, const char *path, 
         return;
     }
     blk_set_disable_request_queuing(s->blk, true);  /* a drain waits for the write a program made */
+#ifdef O_CLOEXEC
+    s->flush_fd = open(path, O_RDWR | O_BINARY | O_CLOEXEC);
+#else
+    s->flush_fd = open(path, O_RDWR | O_BINARY);
+#endif
+    if (s->flush_fd < 0) {
+        error_setg_errno(errp, errno, "Could not open the writable NOR copy for flushing");
+        return;
+    }
     if (blk_getlength(s->blk) != NOR_FLASH_SIZE) {
         error_setg(errp, "Writable NOR must contain exactly %u bytes", NOR_FLASH_SIZE);
         return;
@@ -185,11 +195,12 @@ bool ipod_touch_nor_io_failed(void)
  * written next. None is in flight at a stop or a save (nor_quiesce), so none is migrated.
  *
  * The flush that makes the copy durable runs in a second coroutine once the write has landed, and the status does not
- * wait for it: a host flush can take a second (FlushFileBuffers on Windows after the preparation's gigabytes of NAND,
- * F_FULLFSYNC on macOS), while the drivers poll a program or erase for much less. iOS 6/7's effaceable storage on
- * the iPhone 4 gave up after 200 ms ("unable to write any units in group 0 during commit"), and its keybag boot then
- * halted without the system keybag. A killed engine still leaves the write in the host's file; a stop, reset or save
- * waits for the flush too.
+ * wait for it: a host flush can take tens to hundreds of milliseconds, while the drivers poll a program or erase for
+ * much less. iOS 6/7's effaceable storage on the iPhone 4 gave up in under 50 ms ("unable to write any units in group
+ * 0 during commit"), and its keybag boot then halted without the system keybag (issue 36). The flush goes through its
+ * own descriptor (flush_fd), not the BlockBackend: Windows serializes I/O on one synchronous handle, so a write queued
+ * behind a FlushFileBuffers on it waited up to 336 ms on an idle NVMe PC, and 0.1 ms at most on a second handle. A
+ * killed engine still leaves the write in the host's file; a stop, reset or save waits for the flush too.
  */
 static void nor_failed(IPodTouchNORSPIState *s, const char *what, int ret)
 {
@@ -200,13 +211,21 @@ static void nor_failed(IPodTouchNORSPIState *s, const char *what, int ret)
     qemu_system_vmstop_request(RUN_STATE_IO_ERROR);
 }
 
+/* In the thread pool: fdatasync covers the file's data whichever descriptor wrote it. */
+static int nor_sync(void *opaque)
+{
+    IPodTouchNORSPIState *s = opaque;
+
+    return qemu_fdatasync(s->flush_fd) < 0 ? -errno : 0;
+}
+
 static void coroutine_fn nor_flush_co(void *opaque)
 {
     IPodTouchNORSPIState *s = opaque;
 
     do {
         s->flush_again = false;
-        int ret = blk_co_flush(s->blk);
+        int ret = thread_pool_submit_co(nor_sync, s);
         if (ret < 0) {
             nor_failed(s, "flush", ret);
         }
@@ -508,9 +527,18 @@ static void ipod_touch_nor_spi_class_init(ObjectClass *klass, const void *data)
     k->cs_polarity = SSI_CS_LOW;
 }
 
+static void ipod_touch_nor_spi_init(Object *obj)
+{
+    IPOD_TOUCH_NOR_SPI(obj)->flush_fd = -1;
+}
+
 static void ipod_touch_nor_spi_finalize(Object *obj)
 {
     IPodTouchNORSPIState *s = IPOD_TOUCH_NOR_SPI(obj);
+
+    if (s->flush_fd >= 0) {
+        close(s->flush_fd);
+    }
     if (s->blk) {
         if (blk_get_attached_dev(s->blk)) {
             blk_detach_dev(s->blk, DEVICE(s));
@@ -524,6 +552,7 @@ static const TypeInfo ipod_touch_nor_spi_type_info = {
     .parent = TYPE_SSI_PERIPHERAL,
     .instance_size = sizeof(IPodTouchNORSPIState),
     .class_init = ipod_touch_nor_spi_class_init,
+    .instance_init = ipod_touch_nor_spi_init,
     .instance_finalize = ipod_touch_nor_spi_finalize,
 };
 
