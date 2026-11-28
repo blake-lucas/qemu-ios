@@ -1,13 +1,14 @@
 /* Production NOR command checks: GPIO framing, protection, programming and erase.
  *
- * A program or erase reaches the writable copy from a coroutine (its host write and flush wait off the BQL) while
- * the status reads busy (bit 0); here the coroutine runs at once, or, with defer, when the test says the write has
- * ended. With the change reverted the write runs inside the CS release and the status never reads busy.
+ * A program or erase reaches the writable copy from a coroutine (its host write waits off the BQL) while the status
+ * reads busy (bit 0); the flush runs in a second coroutine after it, and the status does not wait for that. Here the
+ * coroutines run at once, or, with defer, when the test says their I/O has ended. With the flush back inside the
+ * busy window (a FUA write), the status still reads busy while only the flush is pending and the case fails.
  *
  * SLICE include/hw/arm/ipod_touch_nor_spi.h define NOR_
  * SLICE hw/arm/ipod_touch_nor_spi.c define NOR_STATUS
  * SLICE include/hw/arm/ipod_touch_nor_spi.h typedef IPodTouchNORSPIState
- * SLICE:fns hw/arm/ipod_touch_nor_spi.c fn nor_persist_co nor_persist nor_quiesce
+ * SLICE:fns hw/arm/ipod_touch_nor_spi.c fn nor_failed nor_flush_co nor_persist_co nor_persist nor_quiesce
  * SLICE:fns hw/arm/ipod_touch_gpio.c fn s5l8900_gpio_write
  * SLICE:fns hw/arm/ipod_touch_nor_spi.c fn nor_reset_transaction nor_finish_transaction ipod_touch_nor_spi_set_cs ipod_touch_nor_spi_reset ipod_touch_nor_spi_transfer ipod_touch_nor_spi_post_load
  * PKG glib-2.0
@@ -37,38 +38,57 @@ static void initialize_nor(IPodTouchNORSPIState*s) {
  memset(s->nor_data,0xff,sizeof(s->nor_data));s->nor_size=NOR_FLASH_SIZE;s->nor_initialized=true;
 }
 
-#define BDRV_REQ_FUA 1
 #define RUN_STATE_IO_ERROR 1
 #define qatomic_set(p,v) (*(p)=(v))
 #define error_report(...) ((void)0)
 static bool nor_io_failed;
-static int persist_error, storage_stops, full_writes;
+static int persist_error, flush_error, storage_stops, full_writes, flushes;
 static uint32_t persisted_start, persisted_length;
 static int writes;
 static uint8_t written_first;
 static int blk_pwrite(void *blk,uint32_t start,uint32_t length,const void*data,int flags) {
- assert(blk && flags==BDRV_REQ_FUA);persisted_start=start;persisted_length=length;if(length==NOR_FLASH_SIZE)full_writes++;
+ assert(blk && flags==0);persisted_start=start;persisted_length=length;if(length==NOR_FLASH_SIZE)full_writes++;
  writes++;written_first=*(const uint8_t *)data;return persist_error;
+}
+static void (*during_flush)(void);   /* runs inside the next flush: what lands while it is in flight */
+static int blk_co_flush(void *blk) {
+ assert(blk);flushes++;void (*f)(void)=during_flush;during_flush=NULL;if(f)f();return flush_error;
 }
 static void qemu_system_vmstop_request(int state) {assert(state==RUN_STATE_IO_ERROR);storage_stops++;}
 static void qemu_system_vmstop_request_prepare(void) {}
 #define coroutine_fn
 typedef struct { void (*fn)(void *); void *arg; } Coroutine;
-static Coroutine co; static int defer, deferred;
-static Coroutine *qemu_coroutine_create(void (*fn)(void *), void *arg) {co.fn=fn;co.arg=arg;return &co;}
-static void qemu_coroutine_enter(Coroutine *c) {if(defer)deferred++;else c->fn(c->arg);}
-static void run_deferred(void) {assert(deferred==1);deferred=0;co.fn(co.arg);}
+/* With defer, an entered coroutine waits in `pending` (in order) until run_at runs it: its I/O has ended. */
+static Coroutine made[64], *pending[8]; static int nmade, defer, deferred;
+static Coroutine *qemu_coroutine_create(void (*fn)(void *), void *arg) {
+ Coroutine *c=&made[nmade++ % 64];c->fn=fn;c->arg=arg;return c;
+}
+static void qemu_coroutine_enter(Coroutine *c) {if(defer){assert(deferred<8);pending[deferred++]=c;}else c->fn(c->arg);}
+static void run_at(int i) {
+ assert(i<deferred);Coroutine *c=pending[i];memmove(pending+i,pending+i+1,(deferred-i-1)*sizeof(*pending));deferred--;
+ c->fn(c->arg);
+}
+static void run_deferred(void) {run_at(0);}
+static uint8_t status_byte(void);
+static bool s_persisting(void);
+static bool s_flush_again(void);
+static void land_write(void) {   /* the second program's write lands during the flush: ready while it flushes */
+ run_at(0);assert(!s_persisting() && s_flush_again() && (status_byte()&1)==0);
+}
 static void aio_wait_kick(void) {}
-#define AIO_WAIT_WHILE(ctx, cond) do { if (cond) { run_deferred(); } assert(!(cond)); } while (0)
+#define AIO_WAIT_WHILE(ctx, cond) do { while ((cond) && deferred) { run_deferred(); } assert(!(cond)); } while (0)
 #include "fns.h"
 
 static IPodTouchNORSPIState s;
+static bool s_persisting(void) {return s.persisting;}
+static bool s_flush_again(void) {return s.flush_again;}
 static void begin(uint8_t cmd) {ipod_touch_nor_spi_set_cs(&s.ssidev,false);ipod_touch_nor_spi_transfer(&s.ssidev,cmd);}
 static uint8_t byte(uint8_t value) {return ipod_touch_nor_spi_transfer(&s.ssidev,value);}
 static void end(void) {ipod_touch_nor_spi_set_cs(&s.ssidev,true);}
 static void address(uint32_t value) {byte(value>>16);byte(value>>8);byte(value);}
 static void enable(void) {begin(NOR_ENABLE_WRITE);end();assert(s.write_enabled);}
 static void status(uint8_t value) {enable();begin(NOR_WRITE_TO_STATUS_REG);byte(value);end();}
+static uint8_t status_byte(void) {begin(NOR_GET_STATUS_CMD);uint8_t v=byte(0xff);end();return v;}
 static void program(uint32_t where, uint8_t value) {enable();begin(NOR_WRITE_DATA_CMD);address(where);byte(value);end();}
 int main(void) {
  IPodTouchGPIOState g={.fsel_offset=0x1e0};for(int i=0;i<128;i++)g.outputs[i]=i;
@@ -105,18 +125,27 @@ int main(void) {
  begin(NOR_GET_JEDECID);assert(byte(0xff)==0x1f && byte(0xff)==0x45 && byte(0xff)==0x02 && byte(0xff)==0 && byte(0xff)==0xff);end();
  begin(0);byte(NOR_ENABLE_WRITE);end();assert(!s.write_enabled);
  s.blk=(void*)1;persist_error=-EIO;program(4,0);
- assert((s.status & NOR_STATUS_EPE) && nor_io_failed && storage_stops==1);
+ assert((s.status & NOR_STATUS_EPE) && nor_io_failed && storage_stops==1 && flushes==1);
  persist_error=0;s.restore_pending=true;program(4,0);
  assert(!(s.status & NOR_STATUS_EPE) && !s.restore_pending && nor_io_failed);
- assert(full_writes==1 && persisted_start==0 && persisted_length==NOR_PAGE_SIZE);s.blk=NULL;
- /* In flight: busy, the array already changed; a program meanwhile joins the write; a reset waits for it. */
- s.blk=(void*)1;defer=1;writes=0;memset(s.nor_data,0xff,4096);program(0x10,0x5a);
+ assert(full_writes==1 && persisted_start==0 && persisted_length==NOR_PAGE_SIZE);
+ flush_error=-EIO;program(4,0);assert((s.status & NOR_STATUS_EPE) && storage_stops==2);flush_error=0;
+ program(4,0);assert(!(s.status & NOR_STATUS_EPE));s.blk=NULL;
+ /* In flight: busy, the array already changed; a program meanwhile joins the write. */
+ s.blk=(void*)1;defer=1;writes=0;flushes=0;memset(s.nor_data,0xff,4096);program(0x10,0x5a);
  assert(s.nor_data[0x10]==0x5a && deferred==1 && writes==0);
  begin(NOR_GET_STATUS_CMD);assert(byte(0xff)&1);end();
  program(0x1000,0xa5);assert(deferred==1 && writes==0);
+ /* Written: ready, though its flush is still pending. */
  run_deferred();assert(writes==1 && persisted_start==0 && persisted_length==0x1100 && written_first==0xff);
+ assert(deferred==1 && s.flushing && flushes==0);
  begin(NOR_GET_STATUS_CMD);assert(!(byte(0xff)&1));end();
- program(0x20,0);ipod_touch_nor_spi_reset(&s.ssidev);assert(writes==2 && !s.persisting && !deferred);
+ /* A program during the flush is busy only until written (not behind the flush), and gets a flush of its own. */
+ program(0x20,0);assert(deferred==2);begin(NOR_GET_STATUS_CMD);assert(byte(0xff)&1);end();
+ during_flush=land_write;run_deferred();assert(writes==2 && flushes==2 && !s.flushing && !s.flush_again && !deferred);
+ /* A reset waits for the write and its flush. */
+ program(0x30,0);ipod_touch_nor_spi_reset(&s.ssidev);
+ assert(writes==3 && flushes==3 && !s.persisting && !s.flushing && !deferred);
  defer=0;s.blk=NULL;s.nor_data[0]=0x10;status(0);
  s.nor_size=0;program(0,0);assert((s.status & NOR_STATUS_EPE) && s.nor_data[0]==0x10);s.nor_size=NOR_FLASH_SIZE;
  program(0,0);assert(!(s.status & NOR_STATUS_EPE) && s.nor_data[0]==0);
@@ -125,5 +154,6 @@ int main(void) {
  s.nor_read_ind=NOR_FLASH_SIZE;assert(ipod_touch_nor_spi_post_load(&s,2)==-EINVAL);
  s.nor_read_ind=0;s.nor_initialized=false;assert(ipod_touch_nor_spi_post_load(&s,2)==-EINVAL);
  puts("PASS: GPIO/CS, status/protection, page wrap/AND, erase sizes, read wrap and snapshot bounds; busy while the "
-      "copy's write is in flight, a program meanwhile joins the write, reset waits");
+      "copy's write (not its flush) is in flight, a program meanwhile joins the write, a write during a flush flushes "
+      "again, reset waits for both");
 }

@@ -181,9 +181,40 @@ bool ipod_touch_nor_io_failed(void)
 
 /*
  * The writable copy takes each program or erase as the chip's array does, while the status reads busy (RDY/BSY, bit
- * 0): a coroutine writes the changed range (FUA), so the host's write and flush wait off the BQL. A change made
- * meanwhile joins the range written next. None is in flight at a stop or a save (nor_quiesce), so none is migrated.
+ * 0): a coroutine writes the changed range into the host file, off the BQL. A change made meanwhile joins the range
+ * written next. None is in flight at a stop or a save (nor_quiesce), so none is migrated.
+ *
+ * The flush that makes the copy durable runs in a second coroutine once the write has landed, and the status does not
+ * wait for it: a host flush can take a second (FlushFileBuffers on Windows after the preparation's gigabytes of NAND,
+ * F_FULLFSYNC on macOS), while the drivers poll a program or erase for much less. iOS 6/7's effaceable storage on
+ * the iPhone 4 gave up after 200 ms ("unable to write any units in group 0 during commit"), and its keybag boot then
+ * halted without the system keybag. A killed engine still leaves the write in the host's file; a stop, reset or save
+ * waits for the flush too.
  */
+static void nor_failed(IPodTouchNORSPIState *s, const char *what, int ret)
+{
+    qatomic_set(&nor_io_failed, true);
+    s->status |= NOR_STATUS_EPE;
+    error_report("NOR persistence failed (%s): %s", what, strerror(-ret));
+    qemu_system_vmstop_request_prepare();
+    qemu_system_vmstop_request(RUN_STATE_IO_ERROR);
+}
+
+static void coroutine_fn nor_flush_co(void *opaque)
+{
+    IPodTouchNORSPIState *s = opaque;
+
+    do {
+        s->flush_again = false;
+        int ret = blk_co_flush(s->blk);
+        if (ret < 0) {
+            nor_failed(s, "flush", ret);
+        }
+    } while (s->flush_again);
+    s->flushing = false;
+    aio_wait_kick();
+}
+
 static void coroutine_fn nor_persist_co(void *opaque)
 {
     IPodTouchNORSPIState *s = opaque;
@@ -193,16 +224,18 @@ static void coroutine_fn nor_persist_co(void *opaque)
         g_autofree uint8_t *copy = g_memdup2(s->nor_data + start, length);
 
         s->dirty_start = s->dirty_end = 0;
-        int ret = blk_pwrite(s->blk, start, length, copy, BDRV_REQ_FUA);
+        int ret = blk_pwrite(s->blk, start, length, copy, 0);
         if (ret < 0) {
-            qatomic_set(&nor_io_failed, true);
-            s->status |= NOR_STATUS_EPE;
-            error_report("NOR persistence failed: %s", strerror(-ret));
-            qemu_system_vmstop_request_prepare();
-            qemu_system_vmstop_request(RUN_STATE_IO_ERROR);
+            nor_failed(s, "write", ret);
         }
     }
     s->persisting = false;
+    if (s->flushing) {
+        s->flush_again = true;      /* the flush in flight may have started before this write landed */
+    } else {
+        s->flushing = true;
+        qemu_coroutine_enter(qemu_coroutine_create(nor_flush_co, s));
+    }
     aio_wait_kick();
 }
 
@@ -232,7 +265,7 @@ static void nor_persist(IPodTouchNORSPIState *s, uint32_t start, uint32_t length
 
 static void nor_quiesce(IPodTouchNORSPIState *s)
 {
-    AIO_WAIT_WHILE(NULL, s->persisting);
+    AIO_WAIT_WHILE(NULL, s->persisting || s->flushing);
 }
 
 static void nor_reset_transaction(IPodTouchNORSPIState *s)
