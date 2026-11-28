@@ -28,7 +28,6 @@
 #include "hw/arm/ipod_touch_pke.h"
 #include "hw/arm/ipod_touch_sdio.h"
 #include "net/net.h"
-#include "net/util.h"
 #include "qemu/config-file.h"
 #include "qemu/option.h"
 #include "hw/arm/ipod_touch_spi.h"
@@ -308,8 +307,6 @@ struct S5L8920MachineState {
     bool quiet_boot;                    /* omit -v in the RAM boot handoff */
     bool baseband_on;                    /* baseband=on: the fake modem behind spi2 */
     char *imei;                          /* the unit's IMEI, for that modem to report */
-    uint8_t wifi_mac[6];                 /* the card's CIS MAC (wifi-mac), as the DT and NOR carry it */
-    bool wifi_mac_explicit;
     DeviceState *bb_modem;
     GuestPackage pkg;                    /* hw/arm/guest-package.c: it_boot and the GL shim's hello */
     GuestPasteboard pb;                  /* hw/arm/guest-pasteboard.c */
@@ -849,12 +846,8 @@ static void s5l8920_init(MachineState *machine)
     DeviceState *sdio = NULL;
     if (s->board->wifi.prodid) {
         IPodTouchSDIOState *card = IPOD_TOUCH_SDIO(qdev_new(TYPE_IPOD_TOUCH_SDIO));
-        BCMSDIOChip chip = s->board->wifi;
 
-        if (s->wifi_mac_explicit) {
-            memcpy(chip.mac, s->wifi_mac, sizeof(chip.mac));
-        }
-        ipod_touch_sdio_set_chip(card, &chip);
+        ipod_touch_sdio_set_chip(card, &s->board->wifi);
         object_property_add_alias(OBJECT(machine), "wifi-bssid", OBJECT(card), "bssid");
         if (s->wifi_country) {
             object_property_set_str(OBJECT(card), "country", s->wifi_country, &error_fatal);
@@ -1679,37 +1672,6 @@ static void s5l8920_set_imei(Object *obj, const char *value, Error **errp)
     s->imei = g_strdup(value);
 }
 
-/* The card's MAC as the unit's identity has it (FirmwareKit's device.lock.json machine.wifi-mac). Unset keeps the
- * board's placeholder, which devices prepared without it go on booting with. */
-static char *s5l8920_get_wifi_mac(Object *obj, Error **errp)
-{
-    S5L8920MachineState *s = S5L8920_MACHINE(obj);
-    const uint8_t *m = s->wifi_mac;
-
-    if (!s->wifi_mac_explicit) {
-        return g_strdup("");
-    }
-    return g_strdup_printf("%02x:%02x:%02x:%02x:%02x:%02x",
-                           m[0], m[1], m[2], m[3], m[4], m[5]);
-}
-
-static void s5l8920_set_wifi_mac(Object *obj, const char *value, Error **errp)
-{
-    S5L8920MachineState *s = S5L8920_MACHINE(obj);
-    uint8_t mac[6];
-
-    if (s->cpu) {
-        error_setg(errp, "wifi-mac must be set before the machine starts");
-        return;
-    }
-    if (net_parse_macaddr(mac, value) < 0) {
-        error_setg(errp, "wifi-mac must be a MAC address");
-        return;
-    }
-    memcpy(s->wifi_mac, mac, sizeof(mac));
-    s->wifi_mac_explicit = true;
-}
-
 static char *s5l8920_get_panel(Object *obj, Error **errp)
 {
     S5L8920MachineState *s = S5L8920_MACHINE(obj);
@@ -1839,9 +1801,6 @@ static void s5l8920_class_init(ObjectClass *klass, const void *data)
         "the side switch (buttons/ringerab, iPhone): on = silent, off = ring (default); settable at run time");
     object_class_property_set_description(klass, "baseband",
         "radio boards: put the fake cellular modem behind spi2 (default off: a bare controller)");
-    object_class_property_add_str(klass, "wifi-mac", s5l8920_get_wifi_mac, s5l8920_set_wifi_mac);
-    object_class_property_set_description(klass, "wifi-mac",
-        "the Wi-Fi card's MAC (unset keeps the board's placeholder)");
     object_class_property_add_str(klass, "imei", s5l8920_get_imei, s5l8920_set_imei);
     object_class_property_set_description(klass, "imei",
         "the unit's IMEI (FirmwareKit's device.lock.json machine.imei), for the modem (baseband=on) to report");
