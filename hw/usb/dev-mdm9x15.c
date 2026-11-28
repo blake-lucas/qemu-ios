@@ -2030,9 +2030,14 @@ static GByteArray *mdm_qmi_reply(MDM9x15State *s, unsigned iface,
             result[0] = 1;
             result[2] = 48;
         } else if (message == 0xb001) {
+            /* The unit's fuse serial, then the MDM9615 chip ID (as DLOAD's
+             * 0x16 and 0x17): iOS reports the first word as lockdown's
+             * BasebandSerialNumber and the second as BasebandChipID, so the
+             * serial is the unit's own (from its IMEI), not the one chip ID
+             * every iPhone 5 shares. */
             uint8_t identity[8];
-            stl_le_p(identity, 0x006f10e1); /* Same MDM9615 chip as DLOAD. */
-            stl_le_p(identity + 4, mdm_fuse_serial(s->baseband->bb.imei));
+            stl_le_p(identity, mdm_fuse_serial(s->baseband->bb.imei));
+            stl_le_p(identity + 4, 0x006f10e1);
             tlv(a, 1, identity, sizeof(identity));
         } else {
             /* Standalone simulated modem: no activation postponement or
