@@ -42,7 +42,8 @@ second board on the same machine file (`-M n88`, below).
   the kboot board, a plain NAND store (the DT has no metadata-whitening), the keybag one-shot, the seal and the
   check boot. On that device, app-install passes all 7 steps and regress persist and wifi pass. The machine takes
   `die-id` as ipad1 does.
-- Audio: I2S0 gets the codec's PCM from CDMA channel 0x15 on the audio clock (no listening test yet).
+- Audio: I2S0 gets the codec's PCM from CDMA channel 0x15 on the audio clock. The volume buttons and the alert
+  slider set the LM48557 speaker amplifier (i2c2 0x6f), not the codec (4.2.1: its 0x1a holds 0x6a at every level).
 - Not yet: the D1755's button wake path (debt 6), a USB host port for regress's keyboard checks (debt 9).
 
 ## iOS 5.1.1 (9B206)
@@ -230,6 +231,7 @@ offsets at 0x80000000).
 | I2C0, I2C2 | `s5l8930.i2c`, IRQs 0x13/0x11 | as the iPad | R |
 | PMU D1755 | the S5L8720's Dialog model (`pcf50633`): `event-count=4` (events 0x01-0x04, status 0x05, masks 0x09-0x0c), `shutdown-reg=0x0d`, `adc-reg=0x30`, `rtc-reg=0x4c`; IRQ to GPIO 0x9d | variant | H |
 | Codec, Mikey, accelerometer | `cs42l58` 0x4a, `cd3272mikey` 0x3a, `lis302dl` i2c2 0x1d | shared | H |
+| Speaker amplifier | `lm48557` i2c2 0x6f (DT spkr-amp): iOS sets the speaker's volume here, applied to i2s0's output (`hw/arm/lm48557.c`) | new | H |
 | SPI0-1 | `ipodtouch.spi`; SPI1 with `tx-fifo-depth=65536` (the CDMA pushes the N1 firmware's 53196 bytes in one chain; the default 50000 dropped its tail) | variant | R |
 | Multi-touch | the Zephyr model, `mt_profile_n81` (the N81's N1F55 sensor), ATN on GPIO 0xb4; AppleMultitouchN1SPI downloads the N1F55 firmware from `Common.mtprops` over HBPP and reads frames with 0xEB; its 0xEE result-length/result-data reads are answered (`mt_n1_read`) | variant | H |
 | CLCD | the S5L8720's `ipodtouch.lcd` (M2 CLCD) at 0x85400000, IRQ 0x25; `fb-base` (iBoot's register state for kboot: window 1 320x480 32 bpp at the vram), scanout through dart0 (`ipod_lcd_set_iommu`; a frame not contiguous in PA is gathered page by page) | variant | R |

@@ -124,7 +124,7 @@ struct S5L8930I2SState {
     uint8_t port;                   /* property: i2s<port>, selects its NCO */
     Clock *lrclk;                   /* in: the codec's frame clock, followed while the port is the slave */
     CS42L58State *codec;            /* link: the codec this port feeds, whose output volume the host hears */
-    double (*gain)(void *opaque);   /* or another codec's output volume (s5l8930_i2s_set_gain_source) */
+    double (*gain)(void *opaque);   /* and/or an amplifier's or another codec's (s5l8930_i2s_set_gain_source) */
     void *gain_opaque;
     uint64_t nco_base;              /* property, S5L8920: the audio complex's NCO for MCLK */
     uint32_t nco_ref_hz;            /* property, S5L8920: that NCO's reference; 0 = the A4's PMGR NCO */
@@ -447,7 +447,7 @@ static void i2s_push(S5L8930I2SState *s, uint64_t value, unsigned size)
 static void i2s_out_cb(void *opaque, int free_bytes)
 {
     S5L8930I2SState *s = opaque;
-    double gain = s->codec ? cs42l58_output_gain(s->codec) : s->gain ? s->gain(s->gain_opaque) : 1.0;
+    double gain = (s->codec ? cs42l58_output_gain(s->codec) : 1.0) * (s->gain ? s->gain(s->gain_opaque) : 1.0);
     unsigned width = s->out_bytes == 4 ? 4 : 2;
     unsigned pad = s->mca && width == 4 ? MIN(s->regs[8 >> 2] & 0xff, 31) : 0;
     uint8_t scaled[4096];
