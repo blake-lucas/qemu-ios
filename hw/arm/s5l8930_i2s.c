@@ -124,7 +124,7 @@ struct S5L8930I2SState {
     uint8_t port;                   /* property: i2s<port>, selects its NCO */
     Clock *lrclk;                   /* in: the codec's frame clock, followed while the port is the slave */
     CS42L58State *codec;            /* link: the codec this port feeds, whose output volume the host hears */
-    double (*gain)(void *opaque);   /* or another codec's output volume (s5l8930_i2s_set_gain_source) */
+    double (*gain)(void *opaque);   /* and/or an amplifier's or another codec's (s5l8930_i2s_set_gain_source) */
     void *gain_opaque;
     uint64_t nco_base;              /* property, S5L8920: the audio complex's NCO for MCLK */
     uint32_t nco_ref_hz;            /* property, S5L8920: that NCO's reference; 0 = the A4's PMGR NCO */
@@ -438,11 +438,18 @@ static void i2s_push(S5L8930I2SState *s, uint64_t value, unsigned size)
  * The voice wants more data. The codec's output volume is applied on the way
  * out, as the codec applies it after the port: iOS sets the volume buttons'
  * level there (cs42l58_output_gain), and the PCM itself stays at full scale.
+ *
+ * An MCA port's 32-bit samples (i2s_sample_bytes) hold fewer bits, right-aligned: the low byte of +0x08 is the unused
+ * high bits. 14G61 sends the speaker 24-bit samples that way (0x1008, the top byte 0, not sign-extended) while a
+ * headphone is in the jack, and 16-bit ones (0x1010, S16) on the speaker route; played as they came, the 24-bit ones
+ * were 48 dB down with their negative half-waves folded up. They are shifted up to fill the S32 voice.
  */
 static void i2s_out_cb(void *opaque, int free_bytes)
 {
     S5L8930I2SState *s = opaque;
-    double gain = s->codec ? cs42l58_output_gain(s->codec) : s->gain ? s->gain(s->gain_opaque) : 1.0;
+    double gain = (s->codec ? cs42l58_output_gain(s->codec) : 1.0) * (s->gain ? s->gain(s->gain_opaque) : 1.0);
+    unsigned width = s->out_bytes == 4 ? 4 : 2;
+    unsigned pad = s->mca && width == 4 ? MIN(s->regs[8 >> 2] & 0xff, 31) : 0;
     uint8_t scaled[4096];
 
     while (free_bytes > 0 && s->level > 0) {
@@ -450,12 +457,18 @@ static void i2s_out_cb(void *opaque, int free_bytes)
                              I2S_RING - s->tail);
         const uint8_t *data = s->ring + s->tail;
 
-        if (gain != 1.0 && chunk >= 2) {
-            chunk = MIN(chunk, sizeof(scaled)) & ~1u;     /* whole S16 samples */
-            for (uint32_t i = 0; i < chunk; i += 2) {
-                long v = lrint((int16_t)lduw_le_p(data + i) * gain);
+        if ((gain != 1.0 || pad) && chunk >= width) {
+            chunk = MIN(chunk, sizeof(scaled)) / width * width;     /* whole samples */
+            for (uint32_t i = 0; i < chunk; i += width) {
+                if (width == 4) {
+                    int64_t v = llrint((int32_t)((uint32_t)ldl_le_p(data + i) << pad) * gain);
 
-                stw_le_p(scaled + i, CLAMP(v, INT16_MIN, INT16_MAX));
+                    stl_le_p(scaled + i, CLAMP(v, INT32_MIN, INT32_MAX));
+                } else {
+                    long v = lrint((int16_t)lduw_le_p(data + i) * gain);
+
+                    stw_le_p(scaled + i, CLAMP(v, INT16_MIN, INT16_MAX));
+                }
             }
             data = scaled;
         }
@@ -502,6 +515,11 @@ static void i2s_rx_changed(S5L8930I2SState *s, bool run)
     if (s->voice_in) {
         audio_be_set_active_in(s->audio_be, s->voice_in, run);
     }
+}
+
+bool s5l8930_i2s_out_running(DeviceState *port)
+{
+    return i2s_tx_running(S5L8930_I2S(port));
 }
 
 void s5l8930_i2s_set_gain_source(DeviceState *port, double (*gain)(void *opaque), void *opaque)

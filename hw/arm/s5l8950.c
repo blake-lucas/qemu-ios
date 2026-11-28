@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "migration/vmstate.h"
 #include "hw/arm/nand-image.h"
 #include "hw/arm/ios-boot-args.h"
 #include "qapi/error.h"
@@ -28,6 +29,7 @@
 #include "qapi/visitor.h"
 #include "hw/arm/ipod_touch_mipi_dsi.h"
 #include "hw/arm/ipod_touch_spi.h"
+#include "hw/arm/cs35l19.h"
 #include "hw/arm/cs42l65.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/arm/ipod_touch_usb_otg.h"
@@ -53,6 +55,7 @@
 #include "hw/misc/ios_vibrator.h"
 #include "qemu/guest-random.h"
 #include "target/arm/cpregs.h"
+#include "exec/cputlb.h"
 #include "target/arm/arm-powerctl.h"
 #include "chardev/char.h"
 #include "ui/console.h"
@@ -65,6 +68,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8950State, S5L8950_MACHINE)
 #define A6_RAM_SIZE 0x40000000ULL
 #define A6_IRQS 192
 #define A6_CDMA_CHANNELS 0x2c
+#define A6_SECURE_REGS 16
 
 /* N42.mtprops supplies C1F57,1 / firmware 0x0264. Sensor geometry below
  * describes the virtual panel; physical N42 electrode geometry is unmeasured.
@@ -252,6 +256,10 @@ struct S5L8950State {
         usb_host_probe;
     bool audio_ports_probe;
     bool headphones;                /* a plain headphone in the CS42L65's jack */
+    DeviceState *speaker;           /* MCA0, the speaker amplifier's port (audio_ports_probe) */
+    DeviceState *amp;               /* the CS35L19 on it */
+    DeviceState *jack_port;         /* i2s0, the CS42L65's headphone port */
+    DeviceState *codec;             /* the CS42L65 */
     bool camera;
     bool quiet_boot; /* omit -v in the RAM boot handoff */
     bool battery_probe;
@@ -288,6 +296,13 @@ struct S5L8950State {
     GuestPasteboard pb;
     IPodAgent *agent;
     uint64_t powerdown_sequence;
+    /* A save state's copy of the firmware windows (mapped, and the DRAM address each shows), made again from it
+     * (a6_post_load). */
+    bool vm_iop_fw, vm_ae2_fw;
+    uint32_t vm_iop_fw_base, vm_ae2_fw_entry;
+    /* A save state's copy of the IOP's and AE2's Secure cp15 bank (a6_secure_save): QEMU's register list carried
+     * DACR_S as 0 for these Cortex-A9 cores, which run their firmware in Secure state. */
+    uint64_t vm_secure[2][A6_SECURE_REGS];
 };
 
 /*
@@ -982,6 +997,26 @@ static uint64_t a6_iop_read(void *opaque, hwaddr off, unsigned size)
                   value, current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0);
     return value;
 }
+/* The IOP's firmware window: DRAM at base seen at the IOP's address 0 (set when its firmware starts, and again when a
+ * save state loads). */
+static void a6_unmap_iop_firmware(S5L8950State *s)
+{
+    if (s->iop_fw_mapped) {
+        memory_region_del_subregion(&s->iop_mem, &s->iop_fw);
+        object_unparent(OBJECT(&s->iop_fw));
+        s->iop_fw_mapped = false;
+    }
+}
+
+static void a6_map_iop_firmware(S5L8950State *s, uint32_t base)
+{
+    a6_unmap_iop_firmware(s);
+    memory_region_init_alias(&s->iop_fw, OBJECT(s), "a6.iop-firmware",
+                             &s->ram, base - A6_RAM_BASE, 0x100000);
+    memory_region_add_subregion_overlap(&s->iop_mem, 0, &s->iop_fw, 1);
+    s->iop_fw_mapped = true;
+}
+
 static void a6_iop_write(void *opaque, hwaddr off, uint64_t value,
                          unsigned size)
 {
@@ -1006,14 +1041,7 @@ static void a6_iop_write(void *opaque, hwaddr off, uint64_t value,
             error_report("A6 IOP firmware base outside DRAM");
             return;
         }
-        if (s->iop_fw_mapped) {
-            memory_region_del_subregion(&s->iop_mem, &s->iop_fw);
-            object_unparent(OBJECT(&s->iop_fw));
-        }
-        memory_region_init_alias(&s->iop_fw, OBJECT(s), "a6.iop-firmware",
-                                 &s->ram, base - A6_RAM_BASE, 0x100000);
-        memory_region_add_subregion_overlap(&s->iop_mem, 0, &s->iop_fw, 1);
-        s->iop_fw_mapped = true;
+        a6_map_iop_firmware(s, base);
         CPUState *cs = CPU(s->iop_cpu);
         cpu_reset(cs);
         s->iop_cpu->power_state = PSCI_ON;
@@ -1182,6 +1210,26 @@ static void a6_ae2_hold(S5L8950State *s)
     a6_irq(s, 97, 0);
 }
 
+/* AE2's firmware window: DRAM at entry seen at AE2's address 0 (set when its firmware starts, and again when a save
+ * state loads). */
+static void a6_unmap_ae2_firmware(S5L8950State *s)
+{
+    if (s->ae2_fw_mapped) {
+        memory_region_del_subregion(&s->ae2_mem, &s->ae2_low_ram);
+        object_unparent(OBJECT(&s->ae2_low_ram));
+        s->ae2_fw_mapped = false;
+    }
+}
+
+static void a6_map_ae2_firmware(S5L8950State *s, uint32_t entry)
+{
+    a6_unmap_ae2_firmware(s);
+    memory_region_init_alias(&s->ae2_low_ram, OBJECT(s), "a6.ae2-firmware",
+                             &s->ram, entry - A6_RAM_BASE, 0x100000);
+    memory_region_add_subregion(&s->ae2_mem, 0, &s->ae2_low_ram);
+    s->ae2_fw_mapped = true;
+}
+
 static void a6_ae2_control_write(void *opaque, hwaddr offset, uint64_t value,
                                  unsigned size)
 {
@@ -1217,14 +1265,7 @@ static void a6_ae2_control_write(void *opaque, hwaddr offset, uint64_t value,
             error_report("A6 AE2 firmware entry outside DRAM");
             return;
         }
-        if (s->ae2_fw_mapped) {
-            memory_region_del_subregion(&s->ae2_mem, &s->ae2_low_ram);
-            object_unparent(OBJECT(&s->ae2_low_ram));
-        }
-        memory_region_init_alias(&s->ae2_low_ram, OBJECT(s), "a6.ae2-firmware",
-                                 &s->ram, entry - A6_RAM_BASE, 0x100000);
-        memory_region_add_subregion(&s->ae2_mem, 0, &s->ae2_low_ram);
-        s->ae2_fw_mapped = true;
+        a6_map_ae2_firmware(s, entry);
         s->ae2_wfi_seen = false;
         CPUState *cpu = CPU(s->ae2_cpu);
         cpu_reset(cpu);
@@ -1593,6 +1634,8 @@ static void a6_reset(void *opaque)
     if (resume && a6_resume(s)) {
         return;
     }
+    /* A cold start, as the other boards': the old guest's GL contexts go (and the GL state joins save states). */
+    gles_host_reset();
     g_autofree char *data = NULL;
     gsize size;
     GError *error = NULL;
@@ -1752,6 +1795,171 @@ static void a6_uart_rxdma(void *opaque, int pin, int level)
         qemu_bh_schedule(opaque);
     }
 }
+
+/*
+ * What the host hears from the speaker port: the CS35L19's volume, which carries the Ringer's level on the speaker
+ * (cs35l19.c), except while the headphone port plays unmuted. With a headphone in, 14G61 rings through both, the
+ * headphones at their own level (cs42l65_output_gain), and the host hears the headphones, as on the iPhone 4 and the
+ * iPod touch 4G (cs42l58_output_gain). i2s0 streams silence between sounds while a headphone is in, so a sound iOS
+ * sent to the speaker alone would be muted too; none was seen with rings, texts and lock sounds.
+ */
+static double a6_speaker_gain(void *opaque)
+{
+    S5L8950State *s = opaque;
+
+    if (s->jack_port && s5l8930_i2s_out_running(s->jack_port) && cs42l65_output_gain(s->codec) > 0.0) {
+        return 0.0;
+    }
+    return s->amp ? cs35l19_output_gain(s->amp) : 1.0;
+}
+
+/*
+ * Save states: the SoC blocks this file models itself (the AIC, the IOP's control page and timer, AE2's interrupt and
+ * control registers, the PMGR, the AP local timers) and its timers. The CPUs, RAM and the devices made from other
+ * files carry their own. Host input (buttons held, the attitude) is not machine state, and the firmware windows are
+ * made again from their saved bases.
+ */
+/* The Secure bank of a Cortex-A9 core's cp15, as one array (save) and back (load). */
+static uint64_t *a6_secure_reg(CPUARMState *env, unsigned i)
+{
+    uint64_t *regs[A6_SECURE_REGS] = {
+        &env->cp15.csselr_s, &env->cp15.sctlr_s, &env->cp15.ttbr0_s, &env->cp15.ttbr1_s, &env->cp15.tcr_el[3],
+        &env->cp15.dacr_s, &env->cp15.ifsr_s, &env->cp15.dfsr_s, &env->cp15.far_el[3], &env->cp15.par_s,
+        &env->cp15.mair_el[3], &env->cp15.vbar_s, &env->cp15.contextidr_s, &env->cp15.tpidrurw_s,
+        &env->cp15.tpidrprw_s, &env->cp15.tpidruro_s,
+    };
+    return regs[i];
+}
+
+static void a6_secure_save(S5L8950State *s)
+{
+    ARMCPU *cores[2] = { s->iop_cpu, s->ae2_cpu };
+
+    for (unsigned k = 0; k < 2; k++) {
+        for (unsigned i = 0; i < A6_SECURE_REGS; i++) {
+            s->vm_secure[k][i] = cores[k] ? *a6_secure_reg(&cores[k]->env, i) : 0;
+        }
+    }
+}
+
+static void a6_secure_load(S5L8950State *s)
+{
+    ARMCPU *cores[2] = { s->iop_cpu, s->ae2_cpu };
+
+    for (unsigned k = 0; k < 2; k++) {
+        if (!cores[k]) {
+            continue;
+        }
+        for (unsigned i = 0; i < A6_SECURE_REGS; i++) {
+            uint64_t *reg = a6_secure_reg(&cores[k]->env, i);
+            *reg = s->vm_secure[k][i];
+        }
+        arm_rebuild_hflags(&cores[k]->env);
+        tlb_flush(CPU(cores[k]));
+    }
+}
+
+static int a6_pre_save(void *opaque)
+{
+    S5L8950State *s = opaque;
+
+    s->vm_iop_fw = s->iop_fw_mapped;
+    s->vm_ae2_fw = s->ae2_fw_mapped;
+    s->vm_iop_fw_base = s->iop_fw_mapped ? A6_RAM_BASE + s->iop_fw.alias_offset : 0;
+    s->vm_ae2_fw_entry = s->ae2_fw_mapped ? A6_RAM_BASE + s->ae2_low_ram.alias_offset : 0;
+    a6_secure_save(s);
+    return 0;
+}
+
+static int a6_post_load(void *opaque, int version_id)
+{
+    S5L8950State *s = opaque;
+    uint32_t iop_base = s->vm_iop_fw_base, ae2_entry = s->vm_ae2_fw_entry;
+
+    if ((s->vm_iop_fw && (iop_base < A6_RAM_BASE || (uint64_t)iop_base + 0x100000 > A6_RAM_BASE + A6_RAM_SIZE)) ||
+        (s->vm_ae2_fw && (ae2_entry < A6_RAM_BASE ||
+                          (uint64_t)ae2_entry + 0x100000 > A6_RAM_BASE + A6_RAM_SIZE))) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i < A6_IRQS; i++) {
+        a6_set_destination(s, i, s->destination[i]);     /* the per-target words follow from it */
+    }
+    if (s->vm_iop_fw) {
+        a6_map_iop_firmware(s, iop_base);
+    } else {
+        a6_unmap_iop_firmware(s);
+    }
+    if (s->vm_ae2_fw) {
+        a6_map_ae2_firmware(s, ae2_entry);
+    } else {
+        a6_unmap_ae2_firmware(s);
+    }
+    a6_secure_load(s);
+    /*
+     * The AP cores' generic timers: ISTATUS, the timer's output and its QEMUTimer follow from CTL, CVAL and the
+     * counter, so work them out again, as a register write would. A save can catch a core whose enabled timer has
+     * no QEMUTimer pending; restored that way, the core never took its timer interrupt again, its timer callouts
+     * stopped and iOS's UI with them (some of the iPhone 5's saves). This runs after the cores and their timer
+     * OR gates are loaded, so the FIQ line ends up as the timer says.
+     */
+    for (unsigned i = 0; i < 2; i++) {
+        if (s->cpu[i] && s->cpu[i]->gt_timer[GTIMER_PHYS]) {
+            arm_gt_ptimer_cb(s->cpu[i]);
+            arm_gt_vtimer_cb(s->cpu[i]);
+        }
+    }
+    qemu_set_irq(s->vibrator, s->vibrator_enable && s->vibrator_pwm);
+    a6_irq_update(s);
+    a6_ae2_irq_update(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_a6 = {
+    .name = "iPhone-5",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = a6_pre_save,
+    .post_load = a6_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(iop_regs, S5L8950State, 0x1000 / 4),
+        VMSTATE_UINT32_2DARRAY(local_timer, S5L8950State, 2, 3),
+        VMSTATE_TIMER_PTR(iop_timer, S5L8950State),
+        VMSTATE_INT64(iop_timer_deadline, S5L8950State),
+        VMSTATE_UINT32(iop_timer_control, S5L8950State),
+        VMSTATE_UINT32(iop_timer_reload, S5L8950State),
+        VMSTATE_UINT32(iop_timer_status, S5L8950State),
+        VMSTATE_UINT32(iop_other_mask, S5L8950State),
+        VMSTATE_UINT32(nand_dll_control, S5L8950State),
+        VMSTATE_BOOL(vm_iop_fw, S5L8950State),
+        VMSTATE_UINT32(vm_iop_fw_base, S5L8950State),
+        VMSTATE_UINT32(ae2_pending, S5L8950State),
+        VMSTATE_UINT32(ae2_irq_enable, S5L8950State),
+        VMSTATE_UINT32(ae2_fiq_enable, S5L8950State),
+        VMSTATE_UINT32(ae2_host_pending, S5L8950State),
+        VMSTATE_BOOL(ae2_wfi_seen, S5L8950State),
+        VMSTATE_TIMER_PTR(ae2_wfi_timer, S5L8950State),
+        VMSTATE_BOOL(ae2_wfi_parked, S5L8950State),
+        VMSTATE_UINT32_ARRAY(ae2_regs, S5L8950State, 0x2000 / 4),
+        VMSTATE_BOOL(vm_ae2_fw, S5L8950State),
+        VMSTATE_UINT32(vm_ae2_fw_entry, S5L8950State),
+        VMSTATE_TIMER_PTR(ap_off_timer, S5L8950State),
+        VMSTATE_BOOL(resume_boot, S5L8950State),
+        VMSTATE_BOOL(vibrator_enable, S5L8950State),
+        VMSTATE_BOOL(vibrator_pwm, S5L8950State),
+        VMSTATE_UINT32_ARRAY(level, S5L8950State, 6),
+        VMSTATE_UINT32_ARRAY(software, S5L8950State, 6),
+        VMSTATE_UINT32_ARRAY(mask, S5L8950State, 6),
+        VMSTATE_UINT32_ARRAY(destination, S5L8950State, A6_IRQS),
+        VMSTATE_UINT32(global_config, S5L8950State),
+        VMSTATE_UINT32_ARRAY(ipi, S5L8950State, 2),
+        VMSTATE_UINT32_ARRAY(ipi_mask, S5L8950State, 2),
+        VMSTATE_UINT32_ARRAY(pmgr, S5L8950State, 0x7000 / 4),
+        VMSTATE_UINT64(pmgr_transition_done, S5L8950State),
+        VMSTATE_BOOL(pmgr_transition_pending, S5L8950State),
+        VMSTATE_UINT64_2DARRAY(vm_secure, S5L8950State, 2, A6_SECURE_REGS),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static void a6_init(MachineState *machine)
 {
@@ -1919,6 +2127,8 @@ static void a6_init(MachineState *machine)
             if (i == 0 && codec) {
                 qdev_connect_clock_in(port, "lrclk", qdev_get_clock_out(codec, "lrclk"));
                 s5l8930_i2s_set_gain_source(port, cs42l65_output_gain, codec);
+                s->jack_port = port;
+                s->codec = codec;
             }
             sysbus_realize_and_unref(SYS_BUS_DEVICE(port), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(port), 0, 0x34190000 + i * 0x1000);
@@ -1937,6 +2147,9 @@ static void a6_init(MachineState *machine)
             qdev_prop_set_uint8(port, "port", 6 + i);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(port), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(port), 0, 0x34196000 + i * 0x1000);
+            if (i == 0) {
+                s->speaker = port;
+            }
         }
     }
     for (int i = 0; i < 3; i++) {
@@ -1961,9 +2174,11 @@ static void a6_init(MachineState *machine)
         i2c_slave_realize_and_unref(backlight, s->i2c[0]->bus, &error_fatal);
     }
     if (s->audio_ports_probe) {
-        I2CSlave *amp = i2c_slave_new("cs35l19", 0x40);
+        I2CSlave *amp = i2c_slave_new(TYPE_CS35L19, 0x40);
         qdev_prop_set_bit(DEVICE(amp), "trace-regs", true);
         i2c_slave_realize_and_unref(amp, s->i2c[0]->bus, &error_fatal);
+        s->amp = DEVICE(amp);
+        s5l8930_i2s_set_gain_source(s->speaker, a6_speaker_gain, s);
     }
     if (s->tristar_probe) {
         /* Original N42 DT: i2c0/tristar reg=0x1a. */
@@ -2287,6 +2502,7 @@ static void a6_init(MachineState *machine)
         qemu_console_resize(s->console, 640, 1136);
     }
     qemu_register_reset(a6_reset, s);
+    vmstate_register(NULL, 0, &vmstate_a6, s);
     qemu_register_powerdown_notifier(&a6_powerdown_notifier);
 }
 
@@ -2932,6 +3148,36 @@ static void a6_pmu_finalize(Object *obj)
 {
     timer_free(((A6PMU *)obj)->adc_timer);
 }
+static int a6_pmu_post_load(void *opaque, int version_id)
+{
+    A6PMU *s = opaque;
+
+    for (unsigned i = 0; i < 12; i++) {
+        uint8_t data = s->regs[0x68 + i];
+        qemu_set_irq(s->gpio[i], (data & 0x60) == 0x60 || (data & 2));
+    }
+    a6_pmu_irq_update(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_a6_pmu = {
+    .name = "a6.d1972-registers",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = a6_pmu_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, A6PMU),
+        VMSTATE_UINT8_ARRAY(regs, A6PMU, 256),
+        VMSTATE_UINT8(reg, A6PMU),
+        VMSTATE_BOOL(address, A6PMU),
+        VMSTATE_UINT32(rtc_latch, A6PMU),
+        VMSTATE_BOOL(ap_off, A6PMU),
+        VMSTATE_BOOL(ap_waking, A6PMU),
+        VMSTATE_TIMER_PTR(adc_timer, A6PMU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const Property a6_pmu_properties[] = {
     DEFINE_PROP_BOOL("adc-probe", A6PMU, adc_probe, false),
     DEFINE_PROP_BOOL("thermal-sensors", A6PMU, thermal_sensors, true),
@@ -2947,6 +3193,7 @@ static void a6_pmu_class_init(ObjectClass *klass, const void *data)
     sc->recv = a6_pmu_recv;
     device_class_set_props(DEVICE_CLASS(klass), a6_pmu_properties);
     device_class_set_legacy_reset(DEVICE_CLASS(klass), a6_pmu_reset);
+    DEVICE_CLASS(klass)->vmsd = &vmstate_a6_pmu;
 }
 static const TypeInfo a6_pmu_type = {
     .name = "a6.d1972-registers",
@@ -3058,8 +3305,33 @@ static void a6_tristar_reset(DeviceState *dev)
     s->address = false;
 }
 
+/* The interrupt line is high while status 0D holds the connection change it announced. */
+static int a6_tristar_post_load(void *opaque, int version_id)
+{
+    A6TriStar *s = opaque;
+
+    qemu_set_irq(s->irq, s->regs[0x0d] != 0);
+    return 0;
+}
+
+static const VMStateDescription vmstate_a6_tristar = {
+    .name = "a6.tristar-registers",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = a6_tristar_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, A6TriStar),
+        VMSTATE_UINT8_ARRAY(regs, A6TriStar, 256),
+        VMSTATE_UINT8(reg, A6TriStar),
+        VMSTATE_BOOL(address, A6TriStar),
+        VMSTATE_BOOL(attached_notified, A6TriStar),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void a6_tristar_class_init(ObjectClass *klass, const void *data)
 {
+    DEVICE_CLASS(klass)->vmsd = &vmstate_a6_tristar;
     I2CSlaveClass *sc = I2C_SLAVE_CLASS(klass);
     sc->event = a6_tristar_event;
     sc->send = a6_tristar_send;
@@ -3133,8 +3405,22 @@ static void a6_backlight_reset(DeviceState *dev)
     s->log_count = 0;
 }
 
+static const VMStateDescription vmstate_a6_backlight = {
+    .name = "a6.backlight-registers",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, A6Backlight),
+        VMSTATE_UINT8_ARRAY(regs, A6Backlight, 256),
+        VMSTATE_UINT8(reg, A6Backlight),
+        VMSTATE_BOOL(address, A6Backlight),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void a6_backlight_class_init(ObjectClass *klass, const void *data)
 {
+    DEVICE_CLASS(klass)->vmsd = &vmstate_a6_backlight;
     I2CSlaveClass *sc = I2C_SLAVE_CLASS(klass);
     sc->event = a6_backlight_event;
     sc->send = a6_backlight_send;
@@ -3157,11 +3443,46 @@ static void a6_i2c_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
+static int a6_i2c_post_load(void *opaque, int version_id)
+{
+    A6I2C *s = opaque;
+
+    if (s->count > sizeof(s->rx) || s->pos > s->count) {
+        return -EINVAL;
+    }
+    a6_i2c_irq(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_a6_i2c = {
+    .name = "a6.i2c",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = a6_i2c_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(status, A6I2C),
+        VMSTATE_UINT32(imask, A6I2C),
+        VMSTATE_UINT32(ctl, A6I2C),
+        VMSTATE_UINT32(timing, A6I2C),
+        VMSTATE_UINT8_ARRAY(rx, A6I2C, 256),
+        VMSTATE_UINT32(count, A6I2C),
+        VMSTATE_UINT32(pos, A6I2C),
+        VMSTATE_BOOL(nack, A6I2C),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void a6_i2c_class_init(ObjectClass *klass, const void *data)
+{
+    DEVICE_CLASS(klass)->vmsd = &vmstate_a6_i2c;
+}
+
 static const TypeInfo a6_i2c_type = {
     .name = "a6.i2c",
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(A6I2C),
     .instance_init = a6_i2c_init,
+    .class_init = a6_i2c_class_init,
 };
 static void a6_register_types(void)
 {

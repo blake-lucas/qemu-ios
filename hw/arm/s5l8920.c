@@ -37,6 +37,7 @@
 #include "hw/arm/ipod_touch_buttons.h"
 #include "hw/arm/ipod_touch_usb_otg.h"
 #include "hw/arm/ipod_touch_usb_phys.h"
+#include "hw/arm/lm48557.h"
 #include "hw/arm/ipod_touch_pcf50633_pmu.h"
 #include "hw/arm/ipod_touch_lis302dl.h"
 #include "hw/arm/ipod_touch_cs42l58.h"
@@ -200,6 +201,7 @@ static const S5L8920Board s5l8920_n18 = {
         { 0, 0x4a, TYPE_CS42L58 },
         { 0, 0x3a, TYPE_CD3272MIKEY },
         { 2, 0x1d, TYPE_LIS302DL },       /* its DT interrupt (0xa2) is not driven */
+        { 2, 0x6f, TYPE_LM48557 },        /* spkr-amp: the speaker's volume (lm48557_output_gain) */
     },
     .accel_dt = "04000000",
     .pwroff_knob = { 57, 67, 240 },      /* off a 4.2.1 screendump of the sheet */
@@ -282,6 +284,7 @@ struct S5L8920MachineState {
     DeviceState *vic[S5L8920_VIC_COUNT];
     DeviceState *gpio;
     DeviceState *codec;                  /* the CS42L58 on i2s0 (the 3GS's CS42L61 as its register file) */
+    DeviceState *amp;                    /* the iPod's LM48557 speaker amplifier after it (i2s0's volume) */
     DeviceState *iopcore;
     IPodTouchMultitouchState *mt;
     synopsys_usb_state *usb_otg;
@@ -542,6 +545,9 @@ static void s5l8920_i2c_create(S5L8920MachineState *s, int n)
         slave = i2c_slave_new(d->type, d->addr);
         if (object_dynamic_cast(OBJECT(slave), TYPE_S5L8930_TSL2581)) {
             object_property_add_child(OBJECT(s), "lightsensor", OBJECT(slave));   /* qom-set its lux */
+        }
+        if (!strcmp(d->type, TYPE_LM48557)) {
+            s->amp = DEVICE(slave);
         }
         if (!strcmp(d->type, TYPE_LIS302DL)) {
             qdev_prop_set_string(DEVICE(slave), "dt-orientation", s->board->accel_dt);
@@ -1167,6 +1173,10 @@ static void s5l8920_init(MachineState *machine)
         object_property_set_link(OBJECT(dev), "codec", OBJECT(s->codec), &error_fatal);
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    if (s->amp) {
+        /* The iPod's speaker volume is in its amplifier, not the codec (hw/arm/lm48557.c). */
+        s5l8930_i2s_set_gain_source(dev, lm48557_output_gain, s->amp);
+    }
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, S5L8920_I2S0_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, S5L8920_I2S0_FIFO);
 

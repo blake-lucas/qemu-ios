@@ -10,6 +10,7 @@
 #include "migration/vmstate.h"
 #include "monitor/monitor.h"
 #include "trace.h"
+#include "desc.h"
 #include "qemu/cutils.h"
 
 static void usb_bus_dev_print(Monitor *mon, DeviceState *qdev, int indent);
@@ -51,6 +52,12 @@ static const TypeInfo usb_bus_info = {
 static int next_usb_bus = 0;
 static QTAILQ_HEAD(, USBBus) busses = QTAILQ_HEAD_INITIALIZER(busses);
 
+static int usb_device_pre_load(void *opaque)
+{
+    ((USBDevice *)opaque)->vm_config_loaded = false;
+    return 0;
+}
+
 static int usb_device_post_load(void *opaque, int version_id)
 {
     USBDevice *dev = opaque;
@@ -60,13 +67,63 @@ static int usb_device_post_load(void *opaque, int version_id)
     } else {
         dev->attached = true;
     }
+    if (dev->vm_config_loaded && usb_device_get_usb_desc(dev) &&
+        usb_desc_restore(dev, dev->vm_speed, dev->vm_configuration, dev->vm_altsetting) < 0) {
+        return -EINVAL;
+    }
     return 0;
 }
+
+/*
+ * The configuration the guest chose, and each interface's alternate setting (LightTouch's save states load into a
+ * fresh process, where nothing has configured the device). A device whose descriptors change at run time (the
+ * iPhone 5's modem) has them current again before this loads.
+ */
+static bool usb_device_config_needed(void *opaque)
+{
+    USBDevice *dev = opaque;
+
+    return dev->configuration != 0 && usb_device_get_usb_desc(dev);
+}
+
+static int usb_device_config_pre_save(void *opaque)
+{
+    USBDevice *dev = opaque;
+
+    dev->vm_speed = dev->speed;
+    dev->vm_configuration = dev->configuration;
+    for (int i = 0; i < USB_MAX_INTERFACES; i++) {
+        dev->vm_altsetting[i] = dev->altsetting[i];
+    }
+    return 0;
+}
+
+static int usb_device_config_post_load(void *opaque, int version_id)
+{
+    ((USBDevice *)opaque)->vm_config_loaded = true;
+    return 0;
+}
+
+static const VMStateDescription vmstate_usb_device_config = {
+    .name = "USBDevice/config",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = usb_device_config_needed,
+    .pre_save = usb_device_config_pre_save,
+    .post_load = usb_device_config_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT32(vm_speed, USBDevice),
+        VMSTATE_INT32(vm_configuration, USBDevice),
+        VMSTATE_INT32_ARRAY(vm_altsetting, USBDevice, USB_MAX_INTERFACES),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 const VMStateDescription vmstate_usb_device = {
     .name = "USBDevice",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = usb_device_pre_load,
     .post_load = usb_device_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(addr, USBDevice),
@@ -77,6 +134,10 @@ const VMStateDescription vmstate_usb_device = {
         VMSTATE_INT32(setup_index, USBDevice),
         VMSTATE_UINT8_ARRAY(setup_buf, USBDevice, 8),
         VMSTATE_END_OF_LIST(),
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_usb_device_config,
+        NULL
     }
 };
 

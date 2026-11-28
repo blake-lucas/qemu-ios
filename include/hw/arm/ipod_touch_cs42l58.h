@@ -28,6 +28,7 @@ typedef struct CS42L58State {
 	uint8_t hp_status;   /* pending interrupt status 0x3a (read clears) */
 	qemu_irq irq;        /* the codec's interrupt line, 1 = asserted */
 	uint8_t volume;      /* CS42L58_VOLUME_*: how cs42l58_output_gain reads the output volume */
+	bool ringer;         /* property: a phone's, whose speaker plays a ringtone at 0x21's level (the iPhone 4) */
 } CS42L58State;
 
 enum {

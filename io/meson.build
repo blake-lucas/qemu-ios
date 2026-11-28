@@ -1,6 +1,7 @@
 io_ss.add(genh)
 io_ss.add(files(
   'channel-buffer.c',
+  'channel-callback.c',
   'channel-command.c',
   'channel-file.c',
   'channel-null.c',

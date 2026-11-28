@@ -19,6 +19,8 @@
 #include "hw/usb/mdm9x15.h"
 #include "desc.h"
 #include "trace.h"
+#include "migration/vmstate.h"
+#include "migration/qemu-file-types.h"
 
 #define TYPE_MDM9X15 "usb-mdm9x15"
 #define MDM_INTERFACES 13
@@ -288,6 +290,7 @@ struct MDM9x15State {
     qemu_irq device_ready;
     qemu_irq reset_detect;
     qemu_irq remote_wake;
+    bool vm_runtime_desc;   /* a save state's: the runtime descriptors are the device's */
 };
 
 typedef struct MdmChardev {
@@ -4132,6 +4135,565 @@ static char *mdm_get_boot_status(Object *obj, Error **errp)
         s->bsp_files[3].committed ? s->bsp_files[3].committed->len : 0,
         s->bsp_files[4].committed ? s->bsp_files[4].committed->len : 0);
 }
+/*
+ * Save states: the whole modem as the guest left it -- its USB transport (queued frames, the QMI clients and their
+ * events), the boot loader's progress while the firmware loads, the carrier configuration files and the AT router.
+ * Bounded as the guest bounds them, so a damaged state is refused rather than trusted.
+ */
+#define VMSTATE_MDM_RAW(_f, _info, _type) {                                    \
+    .name = (stringify(_f)),                                                \
+    .num = sizeof_field(MDM9x15State, _f) / sizeof(_type),                  \
+    .info = &(_info),                                                       \
+    .size = sizeof(_type),                                                  \
+    .flags = VMS_ARRAY,                                                     \
+    .offset = offsetof(MDM9x15State, _f),                                   \
+}
+
+/* A whole field (an array of queues, buffers or files) through one VMStateInfo. */
+#define VMSTATE_MDM_WHOLE(_f, _info) {                                       \
+    .name = (stringify(_f)),                                                \
+    .info = &(_info),                                                       \
+    .size = sizeof_field(MDM9x15State, _f),                                 \
+    .flags = VMS_SINGLE,                                                    \
+    .offset = offsetof(MDM9x15State, _f),                                   \
+}
+
+static void mdm_put_bytes(QEMUFile *f, const void *data, uint32_t len)
+{
+    qemu_put_be32(f, len);
+    if (len) {
+        qemu_put_buffer(f, data, len);
+    }
+}
+
+/* A length-prefixed run into a new GByteArray (NULL for a missing one when allowed). */
+static int mdm_get_array(QEMUFile *f, GByteArray **out, uint32_t limit)
+{
+    uint32_t len = qemu_get_be32(f);
+
+    if (len > limit) {
+        return -EINVAL;
+    }
+    g_clear_pointer(out, g_byte_array_unref);
+    *out = g_byte_array_sized_new(len);
+    g_byte_array_set_size(*out, len);
+    if (len && qemu_get_buffer(f, (*out)->data, len) != len) {
+        return -EIO;
+    }
+    return 0;
+}
+
+/* rx[]: each interface's frames for the host, as GBytes. */
+static int mdm_put_rx(QEMUFile *f, void *pv, size_t size, const VMStateField *field, JSONWriter *vmdesc)
+{
+    GQueue *rx = pv;
+
+    for (unsigned i = 0; i < MDM_INTERFACES; i++) {
+        if (rx[i].length > 64) {
+            return -E2BIG;
+        }
+        qemu_put_be32(f, rx[i].length);
+        for (GList *item = rx[i].head; item; item = item->next) {
+            gsize len;
+            const uint8_t *data = g_bytes_get_data(item->data, &len);
+
+            if (len > MDM_MAX_FRAME) {
+                return -E2BIG;
+            }
+            mdm_put_bytes(f, data, len);
+        }
+    }
+    return qemu_file_get_error(f);
+}
+
+static int mdm_get_rx(QEMUFile *f, void *pv, size_t size, const VMStateField *field)
+{
+    GQueue *rx = pv;
+
+    for (unsigned i = 0; i < MDM_INTERFACES; i++) {
+        uint32_t count = qemu_get_be32(f);
+
+        if (count > 64) {
+            return -EINVAL;
+        }
+        g_queue_clear_full(&rx[i], (GDestroyNotify)g_bytes_unref);
+        for (uint32_t k = 0; k < count; k++) {
+            uint32_t len = qemu_get_be32(f);
+            uint8_t *data;
+
+            if (len > MDM_MAX_FRAME) {
+                return -EINVAL;
+            }
+            data = g_malloc(len);
+            if (len && qemu_get_buffer(f, data, len) != len) {
+                g_free(data);
+                return -EIO;
+            }
+            g_queue_push_tail(&rx[i], g_bytes_new_take(data, len));
+        }
+    }
+    return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_mdm_rx = { .name = "mdm9x15-rx", .get = mdm_get_rx, .put = mdm_put_rx };
+
+/* tx[]: each interface's partial frame from the host. */
+static int mdm_put_tx(QEMUFile *f, void *pv, size_t size, const VMStateField *field, JSONWriter *vmdesc)
+{
+    GByteArray **tx = pv;
+
+    for (unsigned i = 0; i < MDM_INTERFACES; i++) {
+        if (tx[i]->len > MDM_MAX_FRAME) {
+            return -E2BIG;
+        }
+        mdm_put_bytes(f, tx[i]->data, tx[i]->len);
+    }
+    return qemu_file_get_error(f);
+}
+
+static int mdm_get_tx(QEMUFile *f, void *pv, size_t size, const VMStateField *field)
+{
+    GByteArray **tx = pv;
+
+    for (unsigned i = 0; i < MDM_INTERFACES; i++) {
+        int ret = mdm_get_array(f, &tx[i], MDM_MAX_FRAME);
+
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_mdm_tx = { .name = "mdm9x15-tx", .get = mdm_get_tx, .put = mdm_put_tx };
+
+/* qmi_power_filter[][]: the few indication filters the guest set, as (interface, service, bytes). */
+static int mdm_put_filters(QEMUFile *f, void *pv, size_t size, const VMStateField *field, JSONWriter *vmdesc)
+{
+    GBytes *(*filter)[256] = pv;
+    uint32_t count = 0;
+
+    for (unsigned i = 0; i <= MDM_INTERFACES; i++) {
+        for (unsigned k = 0; k < 256; k++) {
+            count += filter[i][k] != NULL;
+        }
+    }
+    qemu_put_be32(f, count);
+    for (unsigned i = 0; i <= MDM_INTERFACES; i++) {
+        for (unsigned k = 0; k < 256; k++) {
+            if (filter[i][k]) {
+                gsize len;
+                const uint8_t *data = g_bytes_get_data(filter[i][k], &len);
+
+                if (len > MDM_MAX_FRAME) {
+                    return -E2BIG;
+                }
+                qemu_put_byte(f, i);
+                qemu_put_byte(f, k);
+                mdm_put_bytes(f, data, len);
+            }
+        }
+    }
+    return qemu_file_get_error(f);
+}
+
+static int mdm_get_filters(QEMUFile *f, void *pv, size_t size, const VMStateField *field)
+{
+    GBytes *(*filter)[256] = pv;
+    uint32_t count = qemu_get_be32(f);
+
+    if (count > (MDM_INTERFACES + 1) * 256) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i <= MDM_INTERFACES; i++) {
+        for (unsigned k = 0; k < 256; k++) {
+            g_clear_pointer(&filter[i][k], g_bytes_unref);
+        }
+    }
+    for (uint32_t n = 0; n < count; n++) {
+        unsigned i = qemu_get_byte(f), k = qemu_get_byte(f);
+        uint32_t len = qemu_get_be32(f);
+        uint8_t *data;
+
+        if (i > MDM_INTERFACES || len > MDM_MAX_FRAME || filter[i][k]) {
+            return -EINVAL;
+        }
+        data = g_malloc(len);
+        if (len && qemu_get_buffer(f, data, len) != len) {
+            g_free(data);
+            return -EIO;
+        }
+        filter[i][k] = g_bytes_new_take(data, len);
+    }
+    return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_mdm_filters = {
+    .name = "mdm9x15-filters", .get = mdm_get_filters, .put = mdm_put_filters
+};
+
+/* bsp_files[]: the carrier configuration files the guest wrote, staged and committed. */
+static int mdm_put_bsp(QEMUFile *f, void *pv, size_t size, const VMStateField *field, JSONWriter *vmdesc)
+{
+    MdmBspFile *files = pv;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(((MDM9x15State *)0)->bsp_files); i++) {
+        MdmBspFile *b = &files[i];
+
+        if ((b->staging && b->staging->len > MDM_MAX_IMAGE) || (b->committed && b->committed->len > MDM_MAX_IMAGE) ||
+            b->last_offset > MDM_MAX_IMAGE || b->last_size > MDM_MAX_IMAGE) {
+            return -E2BIG;
+        }
+        qemu_put_byte(f, (b->staging ? 1 : 0) | (b->committed ? 2 : 0));
+        if (b->staging) {
+            mdm_put_bytes(f, b->staging->data, b->staging->len);
+        }
+        if (b->committed) {
+            mdm_put_bytes(f, b->committed->data, b->committed->len);
+        }
+        qemu_put_be16(f, b->count);
+        qemu_put_be16(f, b->next);
+        qemu_put_be32(f, b->last_offset);
+        qemu_put_be32(f, b->last_size);
+        qemu_put_byte(f, b->iface);
+        qemu_put_byte(f, b->cid);
+        qemu_put_byte(f, b->pending);
+        qemu_put_byte(f, b->pri_valid);
+        for (unsigned k = 0; k < 3; k++) {
+            qemu_put_be16(f, b->pri[k]);
+        }
+    }
+    return qemu_file_get_error(f);
+}
+
+static int mdm_get_bsp(QEMUFile *f, void *pv, size_t size, const VMStateField *field)
+{
+    MdmBspFile *files = pv;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(((MDM9x15State *)0)->bsp_files); i++) {
+        MdmBspFile *b = &files[i];
+        uint8_t present = qemu_get_byte(f);
+        int ret;
+
+        g_clear_pointer(&b->staging, g_byte_array_unref);
+        g_clear_pointer(&b->committed, g_byte_array_unref);
+        if ((present & 1) && (ret = mdm_get_array(f, &b->staging, MDM_MAX_IMAGE)) < 0) {
+            return ret;
+        }
+        if ((present & 2) && (ret = mdm_get_array(f, &b->committed, MDM_MAX_IMAGE)) < 0) {
+            return ret;
+        }
+        b->count = qemu_get_be16(f);
+        b->next = qemu_get_be16(f);
+        b->last_offset = qemu_get_be32(f);
+        b->last_size = qemu_get_be32(f);
+        b->iface = qemu_get_byte(f);
+        b->cid = qemu_get_byte(f);
+        b->pending = qemu_get_byte(f);
+        b->pri_valid = qemu_get_byte(f);
+        for (unsigned k = 0; k < 3; k++) {
+            b->pri[k] = qemu_get_be16(f);
+        }
+        if (b->last_offset > MDM_MAX_IMAGE || b->last_size > MDM_MAX_IMAGE) {
+            return -EINVAL;
+        }
+    }
+    return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_mdm_bsp = { .name = "mdm9x15-bsp", .get = mdm_get_bsp, .put = mdm_put_bsp };
+
+/* download: the boot loader's state while the firmware loads (and its result afterwards), or none. */
+static int mdm_put_download(QEMUFile *f, void *pv, size_t size, const VMStateField *field, JSONWriter *vmdesc)
+{
+    MdmDownloadState *d = *(MdmDownloadState **)pv;
+
+    qemu_put_byte(f, d != NULL);
+    if (!d) {
+        return qemu_file_get_error(f);
+    }
+    if ((d->image && d->image->len > MDM_MAX_IMAGE) || d->dsp_count > ARRAY_SIZE(d->dsp_entries)) {
+        return -E2BIG;
+    }
+    qemu_put_buffer(f, d->ram, sizeof(d->ram));
+    qemu_put_buffer(f, d->valid, sizeof(d->valid));
+    qemu_put_byte(f, d->loader_started);
+    qemu_put_byte(f, d->hello_accepted);
+    qemu_put_byte(f, d->image != NULL);
+    if (d->image) {
+        mdm_put_bytes(f, d->image->data, d->image->len);
+    }
+    qemu_put_be32(f, d->image_total);
+    qemu_put_be32(f, d->image_pending);
+    qemu_put_byte(f, d->image_complete);
+    qemu_put_be32(f, d->image_index);
+    qemu_put_byte(f, d->image_size_known);
+    qemu_put_byte(f, d->image_elf);
+    qemu_put_be32(f, d->image_phoff);
+    qemu_put_be16(f, d->image_phnum);
+    qemu_put_be32(f, d->loaded_roles);
+    for (unsigned k = 0; k < ARRAY_SIZE(d->dsp_entries); k++) {
+        qemu_put_be32(f, d->dsp_entries[k]);
+    }
+    qemu_put_be32(f, d->dsp_count);
+    qemu_put_byte(f, d->runtime);
+    return qemu_file_get_error(f);
+}
+
+static int mdm_get_download(QEMUFile *f, void *pv, size_t size, const VMStateField *field)
+{
+    MdmDownloadState **out = pv, *d;
+    int ret;
+
+    g_clear_pointer(out, mdm_download_free);
+    if (!qemu_get_byte(f)) {
+        return qemu_file_get_error(f);
+    }
+    d = *out = g_new0(MdmDownloadState, 1);
+    qemu_get_buffer(f, d->ram, sizeof(d->ram));
+    qemu_get_buffer(f, d->valid, sizeof(d->valid));
+    d->loader_started = qemu_get_byte(f);
+    d->hello_accepted = qemu_get_byte(f);
+    if (qemu_get_byte(f) && (ret = mdm_get_array(f, &d->image, MDM_MAX_IMAGE)) < 0) {
+        return ret;
+    }
+    d->image_total = qemu_get_be32(f);
+    d->image_pending = qemu_get_be32(f);
+    d->image_complete = qemu_get_byte(f);
+    d->image_index = qemu_get_be32(f);
+    d->image_size_known = qemu_get_byte(f);
+    d->image_elf = qemu_get_byte(f);
+    d->image_phoff = qemu_get_be32(f);
+    d->image_phnum = qemu_get_be16(f);
+    d->loaded_roles = qemu_get_be32(f);
+    for (unsigned k = 0; k < ARRAY_SIZE(d->dsp_entries); k++) {
+        d->dsp_entries[k] = qemu_get_be32(f);
+    }
+    d->dsp_count = qemu_get_be32(f);
+    d->runtime = qemu_get_byte(f);
+    if (d->dsp_count > ARRAY_SIZE(d->dsp_entries) || d->image_total > MDM_MAX_IMAGE ||
+        d->image_pending > MDM_MAX_IMAGE) {
+        return -EINVAL;
+    }
+    return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_mdm_download = {
+    .name = "mdm9x15-download", .get = mdm_get_download, .put = mdm_put_download
+};
+
+/* serial: the AT router's framing and its partial frames (its chardev is the host's). */
+static int mdm_put_serial(QEMUFile *f, void *pv, size_t size, const VMStateField *field, JSONWriter *vmdesc)
+{
+    MdmSerial *serial = *(MdmSerial **)pv;
+
+    if (serial->rx->len > MDM_MAX_FRAME || serial->tx->len > MDM_MAX_FRAME || serial->qmux->len > MDM_MAX_FRAME) {
+        return -E2BIG;
+    }
+    mdm_put_bytes(f, serial->rx->data, serial->rx->len);
+    mdm_put_bytes(f, serial->tx->data, serial->tx->len);
+    mdm_put_bytes(f, serial->qmux->data, serial->qmux->len);
+    qemu_put_byte(f, serial->escaped);
+    qemu_put_byte(f, serial->discard);
+    qemu_put_byte(f, serial->h5);
+    qemu_put_byte(f, serial->router_version_negotiated);
+    qemu_put_be32(f, serial->inactivity_timer);
+    qemu_put_buffer(f, serial->routes, sizeof(serial->routes));
+    timer_put(f, serial->timer);
+    return qemu_file_get_error(f);
+}
+
+static int mdm_get_serial(QEMUFile *f, void *pv, size_t size, const VMStateField *field)
+{
+    MdmSerial *serial = *(MdmSerial **)pv;
+    int ret;
+
+    if ((ret = mdm_get_array(f, &serial->rx, MDM_MAX_FRAME)) < 0 ||
+        (ret = mdm_get_array(f, &serial->tx, MDM_MAX_FRAME)) < 0 ||
+        (ret = mdm_get_array(f, &serial->qmux, MDM_MAX_FRAME)) < 0) {
+        return ret;
+    }
+    serial->escaped = qemu_get_byte(f);
+    serial->discard = qemu_get_byte(f);
+    serial->h5 = qemu_get_byte(f);
+    serial->router_version_negotiated = qemu_get_byte(f);
+    serial->inactivity_timer = qemu_get_be32(f);
+    qemu_get_buffer(f, serial->routes, sizeof(serial->routes));
+    timer_get(f, serial->timer);
+    return qemu_file_get_error(f);
+}
+
+static const VMStateInfo vmstate_mdm_serial = {
+    .name = "mdm9x15-serial", .get = mdm_get_serial, .put = mdm_put_serial
+};
+
+static const VMStateDescription vmstate_mdm_wds = {
+    .name = "mdm9x15/wds",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(family, MdmWdsClient),
+        VMSTATE_UINT16(events, MdmWdsClient),
+        VMSTATE_BOOL(extended_ip_events, MdmWdsClient),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+#define VMSTATE_NAS_CHARS(_f, _n) {                                         \
+    .name = (stringify(_f)),                                                \
+    .num = (_n),                                                            \
+    .info = &vmstate_info_uint8,                                            \
+    .size = 1,                                                              \
+    .flags = VMS_ARRAY,                                                     \
+    .offset = offsetof(MdmNasClient, _f),                                   \
+}
+
+static const VMStateDescription vmstate_mdm_nas = {
+    .name = "mdm9x15/nas",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(used, MdmNasClient),
+        VMSTATE_BOOL(notified, MdmNasClient),
+        VMSTATE_BOOL(attached, MdmNasClient),
+        VMSTATE_UINT8(iface, MdmNasClient),
+        VMSTATE_UINT8(cid, MdmNasClient),
+        VMSTATE_UINT32(mask, MdmNasClient),
+        VMSTATE_UINT32(lac, MdmNasClient),
+        VMSTATE_UINT32(ci, MdmNasClient),
+        VMSTATE_NAS_CHARS(plmn, 7),
+        VMSTATE_NAS_CHARS(operator_long, 33),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_mdm_wms_inbox = {
+    .name = "mdm9x15/wms-inbox",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_2DARRAY(pending, MdmWmsInbox, MDM_INTERFACES + 1, 256),
+        VMSTATE_UINT8_2DARRAY(awaiting_ack, MdmWmsInbox, MDM_INTERFACES + 1, 256),
+        VMSTATE_UINT32(next_transaction, MdmWmsInbox),
+        VMSTATE_UINT32_ARRAY(transaction, MdmWmsInbox, IOS_BB_SMS_STORE),
+        VMSTATE_UINT8_ARRAY(route, MdmWmsInbox, IOS_BB_SMS_STORE),
+        VMSTATE_UINT8_ARRAY(storage, MdmWmsInbox, IOS_BB_SMS_STORE),
+        VMSTATE_BOOL_ARRAY(valid, MdmWmsInbox, IOS_BB_SMS_STORE),
+        VMSTATE_BOOL_ARRAY(read, MdmWmsInbox, IOS_BB_SMS_STORE),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int mdm_pre_save(void *opaque)
+{
+    MDM9x15State *s = opaque;
+
+    s->vm_runtime_desc = USB_DEVICE(s)->usb_desc == &mdm_runtime_desc;
+    return 0;
+}
+
+/* Before the USB device's own state loads (it makes the saved configuration current): the descriptors it chose
+ * from. */
+static bool mdm_descriptors_loaded(void *opaque, int version_id)
+{
+    MDM9x15State *s = opaque;
+
+    USB_DEVICE(s)->usb_desc = s->vm_runtime_desc ? &mdm_runtime_desc : &mdm_desc;
+    return true;
+}
+
+static int mdm_post_load(void *opaque, int version_id)
+{
+    MDM9x15State *s = opaque;
+
+    if (s->uim_last_len > sizeof(s->uim_last_status) || s->wms_routes_len > sizeof(s->wms_routes)) {
+        return -EINVAL;
+    }
+    qemu_set_irq(s->device_ready, s->ready && !s->reconnect_detached && (!s->link_started || s->host_ready));
+    qemu_set_irq(s->reset_detect, !s->ready);
+    return 0;
+}
+
+static const VMStateDescription vmstate_mdm9x15 = {
+    .name = TYPE_MDM9X15,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = mdm_pre_save,
+    .post_load = mdm_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(vm_runtime_desc, MDM9x15State),
+        VMSTATE_VALIDATE("descriptors", mdm_descriptors_loaded),
+        VMSTATE_USB_DEVICE(parent_obj, MDM9x15State),
+        VMSTATE_MDM_WHOLE(bsp_files, vmstate_mdm_bsp),
+        VMSTATE_MDM_WHOLE(rx, vmstate_mdm_rx),
+        VMSTATE_MDM_WHOLE(tx, vmstate_mdm_tx),
+        VMSTATE_MDM_RAW(next_cid, vmstate_info_uint8, uint8_t),
+        VMSTATE_STRUCT_2DARRAY(wds, MDM9x15State, MDM_INTERFACES + 1, 256, 1, vmstate_mdm_wds, MdmWdsClient),
+        VMSTATE_MDM_RAW(qmi_protocol, vmstate_info_uint16, uint16_t),
+        VMSTATE_MDM_RAW(qmi_power_save, vmstate_info_uint32, uint32_t),
+        VMSTATE_MDM_WHOLE(qmi_power_filter, vmstate_mdm_filters),
+        VMSTATE_MDM_RAW(qmi_uim_events, vmstate_info_uint32, uint32_t),
+        VMSTATE_MDM_RAW(uim_client, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(uim_dirty, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(uim_last_status, vmstate_info_uint8, uint8_t),
+        VMSTATE_UINT8(uim_last_len, MDM9x15State),
+        VMSTATE_STRUCT_ARRAY(nas, MDM9x15State, MDM_NAS_CLIENTS, 1, vmstate_mdm_nas, MdmNasClient),
+        VMSTATE_TIMER_PTR(qmi_event_timer, MDM9x15State),
+        VMSTATE_MDM_RAW(voice_events, vmstate_info_uint16, uint16_t),
+        VMSTATE_MDM_RAW(voice_client, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(voice_dirty, vmstate_info_bool, bool),
+        VMSTATE_STRUCT_ARRAY(voice_ended, MDM9x15State, IOS_BB_MAX_CALLS, 1, vmstate_ios_bb_call, IosBbCall),
+        VMSTATE_MDM_RAW(dms_mode_events, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(dms_mode_notified, vmstate_info_bool, bool),
+        VMSTATE_UINT8(dms_last_mode, MDM9x15State),
+        VMSTATE_BOOL(pds_force_off, MDM9x15State),
+        VMSTATE_BOOL(pds_enabled, MDM9x15State),
+        VMSTATE_BOOL(pds_autotracking, MDM9x15State),
+        VMSTATE_MDM_RAW(pds_nmea, vmstate_info_uint8, uint8_t),
+        VMSTATE_MDM_RAW(pds_tracking_config, vmstate_info_uint8, uint8_t),
+        VMSTATE_UINT8(pds_report_mode, MDM9x15State),
+        VMSTATE_MDM_RAW(pds_xtra_auto, vmstate_info_uint8, uint8_t),
+        VMSTATE_MDM_RAW(pds_xtra_embedded, vmstate_info_uint8, uint8_t),
+        VMSTATE_BOOL(pds_xtra_pending, MDM9x15State),
+        VMSTATE_BOOL(pds_dpo, MDM9x15State),
+        VMSTATE_BOOL(pds_dpo_persistent, MDM9x15State),
+        VMSTATE_UINT32(pds_cell_database, MDM9x15State),
+        VMSTATE_MDM_RAW(pds_navigation, vmstate_info_uint32, uint32_t),
+        VMSTATE_UINT32(pds_navigation_mask, MDM9x15State),
+        VMSTATE_MDM_RAW(pds_events, vmstate_info_uint32, uint32_t),
+        VMSTATE_MDM_RAW(pds_client, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(pds_dirty, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(pds_last_state, vmstate_info_uint8, uint8_t),
+        VMSTATE_MDM_RAW(pds_fix_due, vmstate_info_int64, int64_t),
+        VMSTATE_STRUCT(wms_inbox, MDM9x15State, 1, vmstate_mdm_wms_inbox, MdmWmsInbox),
+        VMSTATE_MDM_RAW(wms_events, vmstate_info_uint8, uint8_t),
+        VMSTATE_MDM_RAW(wms_notify, vmstate_info_uint8, uint8_t),
+        VMSTATE_MDM_RAW(wms_client, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(wms_smsc_sent, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(wms_last_smsc, vmstate_info_uint8, char),
+        VMSTATE_UINT8(wms_registration, MDM9x15State),
+        VMSTATE_MDM_RAW(wms_routes, vmstate_info_uint8, uint8_t),
+        VMSTATE_UINT16(wms_routes_len, MDM9x15State),
+        VMSTATE_BOOL(wms_status_reports, MDM9x15State),
+        VMSTATE_MDM_RAW(wms_broadcast, vmstate_info_bool, bool),
+        VMSTATE_MDM_RAW(wms_timers, vmstate_info_uint32, uint32_t),
+        VMSTATE_BOOL(managed_power, MDM9x15State),
+        VMSTATE_BOOL(powered, MDM9x15State),
+        VMSTATE_BOOL(reset_asserted, MDM9x15State),
+        VMSTATE_BOOL(ready, MDM9x15State),
+        VMSTATE_BOOL(host_ready, MDM9x15State),
+        VMSTATE_BOOL(link_started, MDM9x15State),
+        VMSTATE_TIMER_PTR(link_timer, MDM9x15State),
+        VMSTATE_SINGLE(download, MDM9x15State, 1, vmstate_mdm_download, MdmDownloadState *),
+        VMSTATE_TIMER_PTR(reconnect_timer, MDM9x15State),
+        VMSTATE_BOOL(reconnect_pending, MDM9x15State),
+        VMSTATE_BOOL(reconnect_detached, MDM9x15State),
+        VMSTATE_BOOL(qmi_ready_sent, MDM9x15State),
+        VMSTATE_SINGLE(serial, MDM9x15State, 1, vmstate_mdm_serial, MdmSerial *),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void mdm_class_init(ObjectClass *klass, const void *data)
 {
     object_class_property_add_str(klass, "boot-status", mdm_get_boot_status,
@@ -4146,6 +4708,7 @@ static void mdm_class_init(ObjectClass *klass, const void *data)
     uc->handle_reset = mdm_reset;
     uc->handle_control = mdm_control;
     uc->handle_data = mdm_data;
+    DEVICE_CLASS(klass)->vmsd = &vmstate_mdm9x15;
 }
 static const TypeInfo mdm_type = {.name = TYPE_MDM9X15,
                                   .parent = TYPE_USB_DEVICE,

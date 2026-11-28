@@ -642,7 +642,7 @@ static const VMStateDescription vmstate_ios_bb_call_emergency = {
     }
 };
 
-static const VMStateDescription vmstate_ios_bb_call = {
+const VMStateDescription vmstate_ios_bb_call = {
     .name = "ios-baseband/call",
     .version_id = 1,
     .minimum_version_id = 1,

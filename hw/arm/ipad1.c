@@ -1263,6 +1263,10 @@ static void ipad1_i2c_create(IPad1MachineState *s, int n)
 
             qdev_prop_set_bit(dev, "headphones", e ? strcmp(e, "0") != 0 : s->headphones);
         }
+        if (!strcmp(d->type, TYPE_CS42L58) && s->board->bb_ifx) {
+            /* a phone's codec: the iPhone 4 sets its ringtone's level in the speaker's volume */
+            qdev_prop_set_bit(dev, "ringer", true);
+        }
         if (!strcmp(d->type, TYPE_S5L8930_D1815)) {
             /* the PMU's clock and the agent's time sync agree on a pinned date */
             qdev_prop_set_uint64(dev, "rtc-epoch", s->rtc_epoch);

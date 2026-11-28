@@ -10,15 +10,38 @@
 #include <stdio.h>
 #if defined(__ANDROID__) && defined(GLES_HOST_EGL_ES)
 #include "gles-host-driver.c.inc"
+#elif defined(GLES_HOST_EGL_ES)
+/* A desktop build of the native ES backend (a test rig for Android's): one GL provider, called directly. */
+#define GLES_DRIVER_RAW(name) name
 #endif
+
+/*
+ * A texture level as it was specified, for save states (gles-host-snapshot.c.inc): ES has no query for a level's
+ * size or format and no glGetTexImage. An RGB or RGBA level is read back through a framebuffer; for the others
+ * (alpha, luminance, red/green, float) shadow keeps the bytes it was given, tightly packed.
+ */
+typedef struct GLESEGLLevel {
+    unsigned width, height;
+    GLenum internal, format, type;
+    bool generated;     /* made by glGenerateMipmap from level 0, so made again rather than kept */
+    void *shadow;
+} GLESEGLLevel;
+#define GLES_EGL_LEVELS 13
 
 typedef struct GLESEGLTexture {
     unsigned name, native_name, width, height, target, refs;
     bool deleted, hidden;
     /* EXT_texture_filter_anisotropic's value where the host has no such state (gles_native_anisotropy_kept); 0: 1. */
     GLfloat max_anisotropy;
+    GLESEGLLevel level[GLES_EGL_LEVELS];
     struct GLESEGLTexture *next;
 } GLESEGLTexture;
+
+static void gles_egl_texture_free(GLESEGLTexture *texture)
+{
+    for (unsigned i = 0; i < GLES_EGL_LEVELS; i++) free(texture->level[i].shadow);
+    free(texture);
+}
 typedef struct GLESEGLTextures {
     unsigned refs;
     GLESEGLTexture *head;
@@ -131,7 +154,7 @@ static void CGLReleaseContext(CGLContextObj c)
     eglDestroySurface(gles_egl_display, c->surface);
     if (!--c->textures->refs) {
         GLESEGLTexture *texture=c->textures->head;
-        while (texture) { GLESEGLTexture *next=texture->next; free(texture); texture=next; }
+        while (texture) { GLESEGLTexture *next=texture->next; gles_egl_texture_free(texture); texture=next; }
         free(c->textures);
     }
     free(c);
