@@ -798,6 +798,16 @@ static void ipad1_cpu_reset(void *opaque)
         a4_dt_unmatch((uint8_t *)data, image_len, load_pa, bootargs_pa, "isp");
     }
     /*
+     * No video encoder model (DT venc, 0x88000000): H3H264VideoEncoderDriver
+     * powers it on, waits for its firmware's interrupt, which never comes, and
+     * holds the caller in the kernel. mediaserverd does that for any app that
+     * asks for the compressor's properties (Dino Jump's launch, issue 23):
+     * its fig RPC timed out, mediaserverd was killed and the app's launch
+     * stalled past the launch watchdog on a phone. Unmatched, the board has
+     * no hardware encoder and the query answers at once.
+     */
+    a4_dt_unmatch((uint8_t *)data, image_len, load_pa, bootargs_pa, "venc");
+    /*
      * iBoot fills the gyro's and the accelerometer's sensitivity matrices (9
      * words, 16.16) from the unit's syscfg; the IPSW DT reserves them zeroed,
      * AppleAP3GDL refuses a singular one and 6.x's AppleLIS331DLH fails its

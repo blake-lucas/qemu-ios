@@ -1965,6 +1965,29 @@ static bool gles_pointer_ok(GLenum client_state, uint32_t size, GLenum type)
     }
 }
 
+/*
+ * What the guest sees glIsEnabled say about a client array: its own enable state, not the host's. With the array
+ * cache the host's flags change only at a draw (gles_array_enable), so between the guest's glDisableClientState and
+ * the next draw the host still says enabled, and a game that saves the state and enables what it finds off drew
+ * nothing: Dino Jump (GitHub issue 23) disables its arrays, asks glIsEnabled, read "enabled", skipped its own
+ * glEnableClientState and then drew its frame's full-screen quad into the screen with no vertex array, so the
+ * picture stayed on the level's first frame while the game ran. The point-size array, which desktop GL has no
+ * flag for, was refused as an unknown capability the same way. false: not a client array.
+ */
+static bool gles_client_array_enabled(uint32_t cap, bool *enabled)
+{
+    switch (cap) {
+    case GL_VERTEX_ARRAY:           *enabled = gh.vertex.enabled; return true;
+    case GL_COLOR_ARRAY:            *enabled = gh.color.enabled; return true;
+    case GL_NORMAL_ARRAY:           *enabled = gh.normal.enabled; return true;
+    case GL_TEXTURE_COORD_ARRAY:    *enabled = gh.texcoord[gh.client_active_unit].enabled; return true;
+    case GL_POINT_SIZE_ARRAY_OES:   *enabled = gh.pointsize.enabled; return true;
+    case GL_WEIGHT_ARRAY_OES:       *enabled = gh.weight.enabled; return true;
+    case GL_MATRIX_INDEX_ARRAY_OES: *enabled = gh.matrix_index.enabled; return true;
+    default:                        return false;
+    }
+}
+
 static void gles_client_active(unsigned unit)
 {
     if (!gles_array_cache || gh.host_client_active_unit != unit) {
@@ -3126,6 +3149,7 @@ static unsigned gles_query_count(uint32_t pname)
     case GL_TEXTURE_COORD_ARRAY_TYPE:
     case GL_TEXTURE_STACK_DEPTH:
     case GL_UNPACK_ALIGNMENT:
+    case 0x8A16:                        /* UNPACK_ROW_BYTES_APPLE */
     case GL_VERTEX_ARRAY:
     case GL_VERTEX_ARRAY_SIZE:
     case GL_VERTEX_ARRAY_STRIDE:
@@ -10515,6 +10539,9 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         case GL_UNPACK_ALIGNMENT:
             v.i[0] = gles_unpack();
             break;
+        case 0x8A16:    /* UNPACK_ROW_BYTES_APPLE: recorded at glPixelStorei, never forwarded */
+            v.i[0] = gh.unpack_row_bytes;
+            break;
         case GL_ARRAY_BUFFER_BINDING:
             v.i[0] = gh.array_buffer ? gh.array_buffer->name : 0;
             break;
@@ -10841,15 +10868,21 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         glCopyTexSubImage2D(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
         gles_surface_forget(a[0]);
         return 0;
-    case GLES_SLOT_IS_ENABLED:
+    case GLES_SLOT_IS_ENABLED: {
+        bool array_on;
+
         if (a[0] == GL_MATRIX_PALETTE_OES && gh.api_version != 2) {
             return gh.palette_on;
+        }
+        if (gh.api_version != 2 && gles_client_array_enabled(a[0], &array_on)) {
+            return array_on;
         }
 #if !defined(GLES_HOST_EAGL) && !defined(GLES_HOST_ANGLE)
         if (gh.api_version == 2 && a[0] >= 0x3000 && a[0] < 0x3008)
             return !!(gh.clip_enabled & (1u << (a[0]-0x3000)));
 #endif
         return glIsEnabled(a[0]);
+    }
     case GLES_SLOT_IS_TEXTURE:
         return gles_guest_name_ok(a[0]) && glIsTexture(a[0]);
     case GLES_SLOT_LIGHT_MODELF:                /* pname, param */
@@ -12371,9 +12404,18 @@ static int64_t gles_host_call_impl(CPUState *cpu, uint32_t slot, uint32_t ctx,
  * the first flush, then 5 s in a row under 1 MB/s, sampled at presents -- a second flush packs the
  * steady-state code together. Poco F3, Jetpack Joyride, 30 s of play, interleaved pairs, a fixed-time
  * flush in the menu after loading or in play: 29.3 -> 31.4 fps. Gives up 120 s after the first flush.
+ *
+ * The first-frame flush itself now waits for the same moment (LT_FLUSH_DEFER=off flushes at the
+ * first frame again): an app's first frame often comes in the middle of its launch (Unity's splash,
+ * a launch image), and retranslating everything there slowed the launch that iOS's 20 s watchdog
+ * times. Boomblastica on a desktop slowed to about half speed: launch to its OpenFeint start 15-17 s
+ * and one watchdog kill in six launches, against 11-16 s and none without that flush (issue 24). The
+ * settle flush empties the cache again anyway, so the steady state is the same. A deferred flush that
+ * never sees translation settle still empties the cache when it gives up.
  */
 static struct {
     bool pending;
+    bool deferred;          /* the first-frame flush is still to come: flush on giving up too */
     int64_t start, next;
     size_t base, last;
     int quiet;
@@ -12393,7 +12435,7 @@ static void gles_flush_code_settle(CPUState *cpu, int64_t now)
         log = getenv("LT_FLUSH_SETTLE_LOG") != NULL;
         min_growth = (mb ? atoi(mb) : 16) * MiB;
     }
-    if (!on || !gles_settle.pending || now < gles_settle.next) {
+    if ((!on && !gles_settle.deferred) || !gles_settle.pending || now < gles_settle.next) {
         return;
     }
     gles_settle.next = now + NANOSECONDS_PER_SECOND;
@@ -12411,25 +12453,33 @@ static void gles_flush_code_settle(CPUState *cpu, int64_t now)
     gles_settle.last = size;
     if (gles_settle.quiet >= 5) {
         gles_settle.pending = false;
-        info_report("gles: the app has loaded: emptying the code cache again (%zu MB, %.0f s after "
-                    "its first frame)", size / MiB, (now - gles_settle.start) / 1e9);
+        info_report("gles: the app has loaded: emptying the code cache%s (%zu MB, %.0f s after "
+                    "its first frame)", gles_settle.deferred ? "" : " again", size / MiB,
+                    (now - gles_settle.start) / 1e9);
         queue_tb_flush(cpu);
     } else if (now - gles_settle.start > 120 * NANOSECONDS_PER_SECOND) {
         gles_settle.pending = false;
+        if (gles_settle.deferred) {
+            info_report("gles: the app never settled: emptying the code cache %.0f s after its "
+                        "first frame (%zu MB)", (now - gles_settle.start) / 1e9, size / MiB);
+            queue_tb_flush(cpu);
+        }
     }
 }
 
 static void gles_flush_code_on_app(CPUState *cpu, uint32_t ctx)
 {
-    static int on = -1;
+    static int on = -1, defer;
     static uint32_t last_ctx;
     static int64_t last_ns;
     int64_t now;
 
     if (on < 0) {
         const char *v = getenv("LT_FLUSH_ON_APP");
+        const char *d = getenv("LT_FLUSH_DEFER");
 
         on = tcg_enabled() && (!v || (strcmp(v, "0") && strcmp(v, "off")));
+        defer = !d || (strcmp(d, "0") && strcmp(d, "off"));
     }
     if (!on) {
         return;
@@ -12444,14 +12494,22 @@ static void gles_flush_code_on_app(CPUState *cpu, uint32_t ctx)
         return;
     }
     last_ns = now;
+    gles_settle.pending = true;
+    gles_settle.deferred = defer;
+    gles_settle.start = now;
+    gles_settle.next = now + NANOSECONDS_PER_SECOND;
+    gles_settle.quiet = 0;
+    if (defer) {
+        /* Settled = LT_FLUSH_SETTLE_MB translated since now, then quiet. */
+        gles_settle.base = gles_settle.last = tcg_code_size();
+        info_report("gles: a new app's first frame: the code cache (%zu MB) is emptied once it "
+                    "has loaded", tcg_code_size() / MiB);
+        return;
+    }
     info_report("gles: a new app's first frame: emptying the code cache (%zu MB)",
                 tcg_code_size() / MiB);
     queue_tb_flush(cpu);
-    gles_settle.pending = true;
-    gles_settle.start = now;
-    gles_settle.next = now + NANOSECONDS_PER_SECOND;
     gles_settle.base = gles_settle.last = 0;
-    gles_settle.quiet = 0;
 }
 
 #include "gles-host-queue.c.inc"
